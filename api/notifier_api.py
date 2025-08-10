@@ -10,7 +10,7 @@ import os
 import time
 
 from config import PROFILES_NOTIFIER, ALARMS_NOTIFIER
-from notifier.indicator_registry import REGISTERED, SIMPLE_SIGNALS  
+from notifier.indicator_registry import REGISTERED, SIMPLE_SIGNALS
 
 
 router = APIRouter()
@@ -21,18 +21,17 @@ router = APIRouter()
 PROFILES_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
 ALARMS_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
 
-# Zusätzliche Debug-Info
 print(f"[DEBUG] Profiles path: {PROFILES_NOTIFIER}")
 print(f"[DEBUG] Alarms path:   {ALARMS_NOTIFIER}")
 
 # ─────────────────────────────────────────────────────────────
-# Models
+# Models (wie früher – bewusst simpel/locker)
 # ─────────────────────────────────────────────────────────────
 class Condition(BaseModel):
     left: str
     op: Literal["eq", "ne", "gt", "gte", "lt", "lte"]
     right: str = ""
-    right_absolut: Optional[float] = None  # Beibehaltener Feldname
+    right_absolut: Optional[float] = None
     right_change: Optional[float] = None
     right_symbol: str = ""
     right_interval: str = ""
@@ -44,11 +43,9 @@ class Group(BaseModel):
     symbols: List[str]
     interval: str = ""
     exchange: str = ""
-    # neu:
-    name: str = ""                # Gruppenname
-    telegram_bot_id: str = ""     # Telegram Bot ID
-    description: str = ""         # Freitext-Beschreibung
-
+    name: str = ""
+    telegram_bot_id: str = ""
+    description: str = ""
 
 class ProfileBase(BaseModel):
     name: str
@@ -56,11 +53,9 @@ class ProfileBase(BaseModel):
     condition_groups: List[Group]
 
 class ProfileCreate(ProfileBase):
-    # id optional beim Create
     id: Optional[str] = None
 
 class ProfileUpdate(ProfileBase):
-    # id wird im Update-Body ignoriert; Quelle ist URL-Pfad
     pass
 
 class ProfileRead(ProfileBase):
@@ -76,22 +71,15 @@ class Alarm(BaseModel):
     value_right: float
 
 # ─────────────────────────────────────────────────────────────
-# Utils
+# Utils (simple Lock, keine .bak)
 # ─────────────────────────────────────────────────────────────
-
 def model_to_dict(m: BaseModel) -> dict:
-    # v1/v2 kompatibel
-    if hasattr(m, "model_dump"):
-        return m.model_dump()
-    return m.dict()
+    return m.model_dump() if hasattr(m, "model_dump") else m.dict()
 
 def _lock_path(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".lock")
 
 class FileLock:
-    """Einfacher plattformkompatibler Lock über Lock-Datei (exclusive create).
-    Release ist robust, Timeout verhindert Hänger.
-    """
     def __init__(self, path: Path, timeout: float = 10.0, poll: float = 0.1):
         self.lockfile = _lock_path(path)
         self.timeout = timeout
@@ -105,7 +93,6 @@ class FileLock:
                 fd = os.open(str(self.lockfile), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 os.close(fd)
                 self._acquired = True
-                # Debug
                 print(f"[DEBUG] Acquired lock {self.lockfile}")
                 return
             except FileExistsError:
@@ -131,7 +118,6 @@ class FileLock:
         self.release()
 
 def load_json(path: Path, fallback: list) -> list:
-    # Bestehender Kommentar bleibt: (keine Änderung)
     if not path.exists():
         print(f"[DEBUG] load_json -> {path} not found; returning fallback ({len(fallback)} items)")
         return fallback
@@ -145,7 +131,6 @@ def load_json(path: Path, fallback: list) -> list:
         return fallback
 
 def save_json(path: Path, data: list):
-    # Bestehender Kommentar bleibt: (keine Änderung)
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
         payload = json.dumps(data, indent=2, ensure_ascii=False)
@@ -158,7 +143,6 @@ def save_json(path: Path, data: list):
         print(f"[DEBUG] save_json -> {path} ({len(data)} items)")
     except Exception as e:
         print(f"💥 Fehler beim Schreiben {path}: {e}")
-        # tmp aufräumen, falls vorhanden
         try:
             if tmp.exists():
                 tmp.unlink()
@@ -167,42 +151,113 @@ def save_json(path: Path, data: list):
         raise
 
 # ─────────────────────────────────────────────────────────────
+# Sanitize/Migration (tolerant & deterministisch)
+# ─────────────────────────────────────────────────────────────
+def _sanitize_condition(c: dict) -> dict:
+    # Felder sicherstellen
+    c.setdefault("left", "")
+    c.setdefault("op", "gt")
+    c.setdefault("right", "")
+    c.setdefault("right_absolut", None)
+    c.setdefault("right_change", None)
+    c.setdefault("right_symbol", "")
+    c.setdefault("right_interval", "")
+    c.setdefault("logic", "and")
+
+    # Genau EIN right* – deterministische Priorität
+    flags = [
+        ("right_absolut", c.get("right_absolut") is not None),
+        ("right", bool(str(c.get("right") or "").strip())),
+        ("right_change", c.get("right_change") is not None),
+    ]
+    n_set = sum(1 for _, ok in flags if ok)
+    if n_set == 0:
+        c["right"] = ""
+    elif n_set > 1:
+        # Priorität: right_absolut > right > right_change
+        keep = None
+        if c.get("right_absolut") is not None:
+            keep = "right_absolut"
+        elif str(c.get("right") or "").strip():
+            keep = "right"
+        else:
+            keep = "right_change"
+        if keep != "right_absolut":
+            c["right_absolut"] = None
+        if keep != "right":
+            c["right"] = ""
+        if keep != "right_change":
+            c["right_change"] = None
+
+    # Symbollogik: wenn right_symbol gesetzt, sollte right (Output-Key) existieren (zur Sicherheit leer erlauben)
+    if c.get("right_symbol") and c.get("right") is None:
+        c["right"] = ""
+
+    return c
+
+def _sanitize_group(g: dict) -> dict:
+    g.setdefault("conditions", [])
+    g.setdefault("active", True)
+    g.setdefault("symbols", [])
+    g.setdefault("interval", "")
+    g.setdefault("exchange", "")
+    g.setdefault("name", "")
+    g.setdefault("telegram_bot_id", "")
+    g.setdefault("description", "")
+
+    if not isinstance(g["symbols"], list):
+        g["symbols"] = []
+
+    # Conditions normalisieren
+    conds = []
+    for raw in g["conditions"] or []:
+        if isinstance(raw, dict):
+            conds.append(_sanitize_condition(raw))
+    g["conditions"] = conds
+    return g
+
+def _sanitize_profiles(data: list) -> list:
+    out = []
+    for p in data or []:
+        if not isinstance(p, dict):
+            continue
+        p.setdefault("name", "Unnamed")
+        p.setdefault("enabled", True)
+        p.setdefault("condition_groups", [])
+        # id als str
+        if not p.get("id"):
+            p["id"] = str(uuid.uuid4())
+        else:
+            p["id"] = str(p["id"])
+
+        groups = []
+        for g in p.get("condition_groups") or []:
+            if isinstance(g, dict):
+                groups.append(_sanitize_group(g))
+        p["condition_groups"] = groups
+        out.append(p)
+    return out
+
+# ─────────────────────────────────────────────────────────────
 # Endpunkte
 # ─────────────────────────────────────────────────────────────
-
 @router.get("/profiles", response_model=List[ProfileRead])
 def get_profiles():
     data = load_json(PROFILES_NOTIFIER, [])
+    data = _sanitize_profiles(data)
 
-    # Migration/Normalisierung: fehlende Group-Felder auffüllen
-    changed = False
-    for p in data:
-        groups = p.get("condition_groups") or []
-        for g in groups:
-            if "name" not in g:
-                g["name"] = ""
-                changed = True
-            if "telegram_bot_id" not in g:
-                g["telegram_bot_id"] = ""
-                changed = True
-            if "description" not in g:
-                g["description"] = ""
-                changed = True
-
-    if changed:
-        print("[DEBUG] get_profiles -> normalized missing group fields; saving back")
-        save_json(PROFILES_NOTIFIER, data)
-
+    # fehlende Group-Felder waren oben schon ergänzt; nur speichern, wenn sich was geändert haben könnte
+    save_json(PROFILES_NOTIFIER, data)
     return data
-
 
 @router.post("/profiles", response_model=dict)
 def add_profile(p: ProfileCreate):
     profs = load_json(PROFILES_NOTIFIER, [])
     new_profile = model_to_dict(p)
-    # ID generieren, falls leer
     pid = new_profile.get("id") or str(uuid.uuid4())
     new_profile["id"] = pid
+    # defensive sanitize
+    new_profile = _sanitize_profiles([new_profile])[0]
     profs.append(new_profile)
     save_json(PROFILES_NOTIFIER, profs)
     print(f"[DEBUG] add_profile -> created id={pid}")
@@ -213,9 +268,10 @@ def update_profile(pid: str, p: ProfileUpdate):
     profs = load_json(PROFILES_NOTIFIER, [])
     updated = False
     for i, item in enumerate(profs):
-        if item.get("id") == pid:
+        if str(item.get("id")) == str(pid):
             updated_item = model_to_dict(p)
-            updated_item["id"] = pid  # URL ist Quelle der Wahrheit
+            updated_item["id"] = str(pid)
+            updated_item = _sanitize_profiles([updated_item])[0]
             profs[i] = updated_item
             updated = True
             break
@@ -229,21 +285,18 @@ def update_profile(pid: str, p: ProfileUpdate):
 def delete_profile(pid: str):
     profs = load_json(PROFILES_NOTIFIER, [])
     before = len(profs)
-    profs = [p for p in profs if p.get("id") != pid]
+    profs = [p for p in profs if str(p.get("id")) != str(pid)]
     after = len(profs)
     if before == after:
-        # Optional: 404 statt silent success
         print(f"[DEBUG] delete_profile -> id={pid} not found (no-op)")
     else:
         print(f"[DEBUG] delete_profile -> removed id={pid}")
     save_json(PROFILES_NOTIFIER, profs)
     return {"status": "deleted", "id": pid}
 
-
 # ─────────────────────────────────────────────────────────────
 # Registry-Endpoints (Indikatoren & Simple Signals)
 # ─────────────────────────────────────────────────────────────
-
 @router.get("/registry/indicators")
 def registry_indicators(
     scope: Optional[str] = Query(None, description="Filter: notifier|chart|backtest"),
@@ -251,17 +304,10 @@ def registry_indicators(
     include_hidden: bool = Query(False, description="Auch ui_hidden liefern"),
     expand_presets: bool = Query(False, description="Presets zu flachen UI-Einträgen expandieren"),
 ):
-    """
-    Liefert rohe Specs aus der Registry (optional gefiltert) oder – falls expand_presets=True –
-    flache Preset-Einträge (display_name, base, params, locked_params, outputs).
-    """
     items = []
-
     if not expand_presets:
-        # Rohe Specs zurückgeben (defensive Kopie)
         for key, spec in REGISTERED.items():
             s = deepcopy(spec)
-            # Filter anwenden
             if not s.get("enabled", True):
                 continue
             if scope is not None and scope not in (s.get("scopes") or []):
@@ -274,7 +320,6 @@ def registry_indicators(
         print(f"[DEBUG] /registry/indicators -> {len(items)} raw specs")
         return items
 
-    # Presets expandieren
     for key, spec in REGISTERED.items():
         s = spec
         if not s.get("enabled", True):
@@ -300,15 +345,11 @@ def registry_indicators(
     print(f"[DEBUG] /registry/indicators (expanded) -> {len(items)} presets")
     return items
 
-
 @router.get("/notifier/indicators")
 def notifier_indicators(
     include_deprecated: bool = Query(False),
     include_hidden: bool = Query(False),
 ):
-    """
-    UI-fertige Liste NUR für den Notifier-Scope, Presets expandiert.
-    """
     items = []
     for key, spec in REGISTERED.items():
         s = spec
@@ -327,8 +368,8 @@ def notifier_indicators(
             if not isinstance(label, str) or not label:
                 continue
             items.append({
-                "display_name": label,                  # z.B. EMA_14
-                "base": s.get("name"),                  # z.B. ema
+                "display_name": label,
+                "base": s.get("name"),
                 "params": deepcopy(p.get("params", {})),
                 "locked_params": list(p.get("locked_params", [])),
                 "outputs": list(s.get("outputs", [])),
@@ -336,13 +377,8 @@ def notifier_indicators(
     print(f"[DEBUG] /notifier/indicators -> {len(items)} items (presets)")
     return items
 
-
 @router.get("/registry/simple-signals", response_model=List[str])
 def registry_simple_signals():
-    """
-    Liefert die einfachen (parameterlosen) Signale wie golden_cross, death_cross, ...
-    """
     out = list(SIMPLE_SIGNALS or [])
     print(f"[DEBUG] /registry/simple-signals -> {len(out)} items")
     return out
-
