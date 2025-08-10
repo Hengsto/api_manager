@@ -73,8 +73,21 @@ class Alarm(BaseModel):
 # ─────────────────────────────────────────────────────────────
 # Utils (simple Lock, keine .bak)
 # ─────────────────────────────────────────────────────────────
-def model_to_dict(m: BaseModel) -> dict:
-    return m.model_dump() if hasattr(m, "model_dump") else m.dict()
+def model_to_dict(m: BaseModel | dict | list | Any) -> dict | list | Any:
+    """
+    Erzwingt einen vollständigen Dump inkl. Defaults/None und
+    konvertiert rekursiv verschachtelte Pydantic-Modelle.
+    """
+    if isinstance(m, BaseModel):
+        if hasattr(m, "model_dump"):
+            return m.model_dump(exclude_unset=False, exclude_none=False)
+        return m.dict(exclude_unset=False)
+    if isinstance(m, list):
+        return [model_to_dict(x) for x in m]
+    if isinstance(m, dict):
+        return {k: model_to_dict(v) for k, v in m.items()}
+    return m
+
 
 def _lock_path(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".lock")
@@ -244,42 +257,151 @@ def _sanitize_profiles(data: list) -> list:
 @router.get("/profiles", response_model=List[ProfileRead])
 def get_profiles():
     data = load_json(PROFILES_NOTIFIER, [])
-    data = _sanitize_profiles(data)
+    changed = False
 
-    # fehlende Group-Felder waren oben schon ergänzt; nur speichern, wenn sich was geändert haben könnte
-    save_json(PROFILES_NOTIFIER, data)
+    for p in data:
+        groups = p.get("condition_groups") or []
+        for g in groups:
+            # Gruppe: Pflichtfelder sicherstellen
+            if "name" not in g:                 g["name"] = ""; changed = True
+            if "telegram_bot_id" not in g:      g["telegram_bot_id"] = ""; changed = True
+            if "description" not in g:          g["description"] = ""; changed = True
+            if "interval" not in g:             g["interval"] = ""; changed = True
+            if "exchange" not in g:             g["exchange"] = ""; changed = True
+            if "symbols" not in g or g["symbols"] is None:
+                g["symbols"] = []; changed = True
+            if "active" not in g:
+                g["active"] = True; changed = True
+
+            # Conditions normalisieren
+            conds = g.get("conditions") or []
+            for c in conds:
+                if "right_interval" not in c:   c["right_interval"] = ""; changed = True
+                if "right_symbol" not in c:     c["right_symbol"] = ""; changed = True
+                if "right" not in c:            c["right"] = ""; changed = True
+                if "right_absolut" not in c:    c["right_absolut"] = None; changed = True
+                if "right_change" not in c:     c["right_change"] = None; changed = True
+                if "logic" not in c:            c["logic"] = "and"; changed = True
+
+                # Typcasting
+                try:
+                    if c["right_change"] == "":
+                        c["right_change"] = None
+                    elif c["right_change"] is not None:
+                        c["right_change"] = float(c["right_change"])
+                except Exception:
+                    c["right_change"] = None
+                    changed = True
+
+                try:
+                    if c["right_absolut"] == "":
+                        c["right_absolut"] = None
+                    elif c["right_absolut"] is not None:
+                        c["right_absolut"] = float(c["right_absolut"])
+                except Exception:
+                    c["right_absolut"] = None
+                    changed = True
+
+    if changed:
+        print("[DEBUG] get_profiles -> normalized/migrated; saving back")
+        save_json(PROFILES_NOTIFIER, data)
+
+    print(f"[DEBUG] get_profiles -> returning {len(data)} profiles")
     return data
+
 
 @router.post("/profiles", response_model=dict)
 def add_profile(p: ProfileCreate):
     profs = load_json(PROFILES_NOTIFIER, [])
     new_profile = model_to_dict(p)
+
+    # ID fixieren
     pid = new_profile.get("id") or str(uuid.uuid4())
     new_profile["id"] = pid
-    # defensive sanitize
-    new_profile = _sanitize_profiles([new_profile])[0]
+
+    # Hard-Normalisierung (stellt sicher, dass %change/Intervalle nie verschwinden)
+    for g in new_profile.get("condition_groups", []):
+        g["interval"] = g.get("interval", "") or ""
+        g["exchange"] = g.get("exchange", "") or ""
+        g["name"] = g.get("name", "") or ""
+        g["telegram_bot_id"] = g.get("telegram_bot_id", "") or ""
+        g["description"] = g.get("description", "") or ""
+        g["symbols"] = g.get("symbols") or []
+        if "active" not in g: g["active"] = True
+
+        for c in g.get("conditions", []):
+            c["right_interval"] = c.get("right_interval", "") or ""
+            c["right_symbol"] = c.get("right_symbol", "") or ""
+            c["right"] = c.get("right", "") or ""
+            c["logic"] = c.get("logic", "and") or "and"
+
+            # Typcast %change/absolut
+            rc = c.get("right_change", None)
+            ra = c.get("right_absolut", None)
+            try:
+                c["right_change"] = None if rc in ("", None) else float(rc)
+            except Exception:
+                c["right_change"] = None
+            try:
+                c["right_absolut"] = None if ra in ("", None) else float(ra)
+            except Exception:
+                c["right_absolut"] = None
+
+    print(f"[DEBUG] add_profile <- payload_normalized: {json.dumps(new_profile, ensure_ascii=False)[:400]}...")
     profs.append(new_profile)
     save_json(PROFILES_NOTIFIER, profs)
-    print(f"[DEBUG] add_profile -> created id={pid}")
+    print(f"[DEBUG] add_profile -> created id={pid} (total={len(profs)})")
     return {"status": "ok", "id": pid}
+
 
 @router.put("/profiles/{pid}", response_model=dict)
 def update_profile(pid: str, p: ProfileUpdate):
     profs = load_json(PROFILES_NOTIFIER, [])
     updated = False
+    incoming = model_to_dict(p)
+
+    # gleiche Normalisierung wie im Create
+    for g in incoming.get("condition_groups", []):
+        g["interval"] = g.get("interval", "") or ""
+        g["exchange"] = g.get("exchange", "") or ""
+        g["name"] = g.get("name", "") or ""
+        g["telegram_bot_id"] = g.get("telegram_bot_id", "") or ""
+        g["description"] = g.get("description", "") or ""
+        g["symbols"] = g.get("symbols") or []
+        if "active" not in g: g["active"] = True
+
+        for c in g.get("conditions", []):
+            c["right_interval"] = c.get("right_interval", "") or ""
+            c["right_symbol"] = c.get("right_symbol", "") or ""
+            c["right"] = c.get("right", "") or ""
+            c["logic"] = c.get("logic", "and") or "and"
+
+            rc = c.get("right_change", None)
+            ra = c.get("right_absolut", None)
+            try:
+                c["right_change"] = None if rc in ("", None) else float(rc)
+            except Exception:
+                c["right_change"] = None
+            try:
+                c["right_absolut"] = None if ra in ("", None) else float(ra)
+            except Exception:
+                c["right_absolut"] = None
+
     for i, item in enumerate(profs):
-        if str(item.get("id")) == str(pid):
-            updated_item = model_to_dict(p)
-            updated_item["id"] = str(pid)
-            updated_item = _sanitize_profiles([updated_item])[0]
-            profs[i] = updated_item
+        if item.get("id") == pid:
+            incoming["id"] = pid
+            profs[i] = incoming
             updated = True
             break
+
     if not updated:
         raise HTTPException(status_code=404, detail="Profil nicht gefunden")
+
+    print(f"[DEBUG] update_profile <- payload_normalized: {json.dumps(incoming, ensure_ascii=False)[:400]}...")
     save_json(PROFILES_NOTIFIER, profs)
     print(f"[DEBUG] update_profile -> updated id={pid}")
     return {"status": "updated", "id": pid}
+
 
 @router.delete("/profiles/{pid}", response_model=dict)
 def delete_profile(pid: str):
