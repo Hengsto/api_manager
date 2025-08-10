@@ -1,0 +1,10 @@
+openai
+pydantic
+python-dotenv
+websockets
+aiohttp
+rapidfuzz
+fastapi
+uvicorn
+pydantic
+pandas

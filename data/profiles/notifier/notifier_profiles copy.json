@@ -1,0 +1,115 @@
+[
+  {
+    "id": "211ec88e-2a1d-4bb1-a951-cfbb8990394e",
+    "name": "1",
+    "condition_groups": [
+      {
+        "conditions": [
+          {
+            "left": "golden_cross",
+            "op": "eq",
+            "right": "momentum",
+            "right_absolut": 1.0,
+            "right_symbol": "XRPUSDT",
+            "right_interval": "1h",
+            "right_change": 2.0,
+            "logic": "and"
+          },
+          {
+            "left": "macd_divergence",
+            "op": "gt",
+            "right": "macd_divergence",
+            "right_absolut": 5.0,
+            "right_symbol": "",
+            "right_interval": "",
+            "right_change": 6.0,
+            "logic": "or"
+          }
+        ],
+        "active": true,
+        "symbols": [
+          "IOTAUSDT"
+        ],
+        "interval": "15m",
+        "exchange": "BINANCE"
+      }
+    ],
+    "enabled": true
+  },
+  {
+    "id": "25110c51-52d4-4621-ad32-3318ca7dad9d",
+    "name": "2",
+    "condition_groups": [
+      {
+        "conditions": [
+          {
+            "left": "momentum",
+            "op": "gt",
+            "right": "rsi",
+            "right_absolut": 15623.0,
+            "right_symbol": "",
+            "right_interval": "",
+            "right_change": 5.0,
+            "logic": "and"
+          },
+          {
+            "left": "golden_cross",
+            "op": "gt",
+            "right": "macd_divergence",
+            "right_absolut": 1.0,
+            "right_symbol": "",
+            "right_interval": "",
+            "right_change": 2.0,
+            "logic": "or"
+          },
+          {
+            "left": "momentum",
+            "op": "gt",
+            "right": "",
+            "right_absolut": null,
+            "right_symbol": "",
+            "right_interval": "",
+            "right_change": 100.0,
+            "logic": "or"
+          },
+          {
+            "left": "rsi_divergence",
+            "op": "gt",
+            "right": "rsi_divergence",
+            "right_absolut": 99.0,
+            "right_symbol": "BTCUSDT",
+            "right_interval": "4h",
+            "right_change": 88.0,
+            "logic": "or"
+          }
+        ],
+        "active": true,
+        "symbols": [
+          "BTCUSDT",
+          "SOLUSDT"
+        ],
+        "interval": "15m",
+        "exchange": "BYBIT"
+      },
+      {
+        "conditions": [
+          {
+            "left": "momentum",
+            "op": "gt",
+            "right": "momentum",
+            "right_absolut": null,
+            "right_symbol": "ETHUSDT",
+            "right_interval": "",
+            "right_change": null,
+            "logic": "and"
+          }
+        ],
+        "active": true,
+        "symbols": [],
+        "interval": "",
+        "exchange": "KRAKEN"
+      }
+    ],
+    "enabled": true
+  }
+]

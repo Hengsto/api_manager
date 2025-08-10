@@ -1,0 +1,215 @@
+[
+  {
+    "id": "211ec88e-2a1d-4bb1-a951-cfbb8990394e",
+    "name": "1",
+    "condition_groups": [
+      {
+        "conditions": [
+          {
+            "left": "golden_cross",
+            "op": "eq",
+            "right": "momentum",
+            "right_absolut": 1.0,
+            "right_symbol": "XRPUSDT",
+            "right_interval": "1h",
+            "right_change": 2.0,
+            "logic": "and"
+          },
+          {
+            "left": "macd_divergence",
+            "op": "gt",
+            "right": "macd_divergence",
+            "right_absolut": 5.0,
+            "right_symbol": "",
+            "right_interval": "",
+            "right_change": 6.0,
+            "logic": "or"
+          }
+        ],
+        "active": true,
+        "symbols": [
+          "IOTAUSDT"
+        ],
+        "interval": "15m",
+        "exchange": "BINANCE",
+        "name": "",
+        "telegram_bot_id": "",
+        "description": ""
+      }
+    ],
+    "enabled": true
+  },
+  {
+    "name": "2",
+    "enabled": true,
+    "condition_groups": [
+      {
+        "conditions": [
+          {
+            "left": "momentum",
+            "op": "gt",
+            "right": "rsi",
+            "right_absolut": 15623.0,
+            "right_change": 5.0,
+            "right_symbol": "",
+            "right_interval": "",
+            "logic": "and"
+          },
+          {
+            "left": "golden_cross",
+            "op": "gt",
+            "right": "macd_divergence",
+            "right_absolut": 1.0,
+            "right_change": 2.0,
+            "right_symbol": "",
+            "right_interval": "",
+            "logic": "or"
+          },
+          {
+            "left": "momentum",
+            "op": "gt",
+            "right": "",
+            "right_absolut": null,
+            "right_change": 100.0,
+            "right_symbol": "",
+            "right_interval": "",
+            "logic": "or"
+          },
+          {
+            "left": "rsi_divergence",
+            "op": "gt",
+            "right": "rsi_divergence",
+            "right_absolut": 99.0,
+            "right_change": 88.0,
+            "right_symbol": "BTCUSDT",
+            "right_interval": "4h",
+            "logic": "or"
+          }
+        ],
+        "active": true,
+        "symbols": [
+          "BTCUSDT",
+          "SOLUSDT"
+        ],
+        "interval": "15m",
+        "exchange": "BYBIT",
+        "name": "Beispiel",
+        "telegram_bot_id": "88",
+        "description": "Elena wird gemolken"
+      }
+    ],
+    "id": "25110c51-52d4-4621-ad32-3318ca7dad9d"
+  },
+  {
+    "name": "fette elena",
+    "enabled": true,
+    "condition_groups": [
+      {
+        "conditions": [
+          {
+            "left": "rsi",
+            "op": "gt",
+            "right": "rsi",
+            "right_absolut": null,
+            "right_change": null,
+            "right_symbol": "BTCUSDT",
+            "right_interval": "15m",
+            "logic": "and"
+          },
+          {
+            "left": "momentum",
+            "op": "eq",
+            "right": "golden_cross",
+            "right_absolut": null,
+            "right_change": null,
+            "right_symbol": "ETHUSDT",
+            "right_interval": "30m",
+            "logic": "and"
+          },
+          {
+            "left": "ema50_weekly",
+            "op": "gt",
+            "right": "",
+            "right_absolut": 55.0,
+            "right_change": 99.0,
+            "right_symbol": "",
+            "right_interval": "",
+            "logic": "or"
+          }
+        ],
+        "active": true,
+        "symbols": [
+          "DAIUSDT"
+        ],
+        "interval": "15m",
+        "exchange": "BYBIT",
+        "name": "",
+        "telegram_bot_id": "",
+        "description": ""
+      },
+      {
+        "conditions": [
+          {
+            "left": "momentum",
+            "op": "gt",
+            "right": "",
+            "right_absolut": null,
+            "right_change": null,
+            "right_symbol": "",
+            "right_interval": "",
+            "logic": "and"
+          }
+        ],
+        "active": true,
+        "symbols": [],
+        "interval": "",
+        "exchange": "",
+        "name": "",
+        "telegram_bot_id": "",
+        "description": ""
+      }
+    ],
+    "id": "73e4d150-20d9-4bcd-baa0-2cb05a921bd6"
+  },
+  {
+    "name": "neu",
+    "enabled": true,
+    "condition_groups": [
+      {
+        "conditions": [
+          {
+            "left": "momentum",
+            "op": "eq",
+            "right": "golden_cross",
+            "right_absolut": null,
+            "right_change": null,
+            "right_symbol": "BTCUSDT",
+            "right_interval": "5m",
+            "logic": "and"
+          },
+          {
+            "left": "ema50_weekly",
+            "op": "gt",
+            "right": "",
+            "right_absolut": 55.0,
+            "right_change": 99.0,
+            "right_symbol": "",
+            "right_interval": "",
+            "logic": "or"
+          }
+        ],
+        "active": true,
+        "symbols": [
+          "ETHUSDT",
+          "DOGEUSDT"
+        ],
+        "interval": "1d",
+        "exchange": "BINANCE",
+        "name": "Beispiel Elena",
+        "telegram_bot_id": "88",
+        "description": "Alles verkaufen"
+      }
+    ],
+    "id": "48b570be-4482-4ce4-804c-6ea0637a6ebe"
+  }
+]
