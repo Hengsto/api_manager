@@ -21,7 +21,7 @@ PROFILE_PATH = DATA_DIR / "profiles"
 # API / Netzwerk
 # ─────────────────────────────────────────────────────────────
 MAIN_IP            = os.getenv("MAIN_IP", "127.0.0.1")
-NOTIFIER_ENDPOINT  = f"http://{MAIN_IP}:8000/notifier"
+NOTIFIER_ENDPOINT  = f"http://{MAIN_IP}:8099/notifier"
 
 # ─────────────────────────────────────────────────────────────
 # JSON-Dateien

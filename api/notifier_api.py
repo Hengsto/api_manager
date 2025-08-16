@@ -25,9 +25,30 @@ print(f"[DEBUG] Profiles path: {PROFILES_NOTIFIER}")
 print(f"[DEBUG] Alarms path:   {ALARMS_NOTIFIER}")
 
 # ─────────────────────────────────────────────────────────────
-# Models (wie früher – bewusst simpel/locker)
+# Models (wie früher – bewusst simpel/locker) – v1/v2 kompatibel
 # ─────────────────────────────────────────────────────────────
-class Condition(BaseModel):
+from typing import Dict, Any, Optional, List, Literal
+from pydantic import BaseModel, Field
+
+# v1/v2-kompatibles Basismodell: extra="allow"
+try:
+    from pydantic import ConfigDict
+    _IS_PYDANTIC_V2 = True
+except Exception:
+    ConfigDict = None
+    _IS_PYDANTIC_V2 = False
+
+class ApiModel(BaseModel):
+    if _IS_PYDANTIC_V2:
+        model_config = ConfigDict(extra="allow")
+    else:
+        class Config:
+            extra = "allow"
+
+
+
+
+class Condition(ApiModel):
     left: str
     op: Literal["eq", "ne", "gt", "gte", "lt", "lte"]
     right: str = ""
@@ -37,7 +58,15 @@ class Condition(BaseModel):
     right_interval: str = ""
     logic: Literal["and", "or"] = "and"
 
-class Group(BaseModel):
+    # Parameter werden 1:1 durchgereicht
+    left_params: Dict[str, Any] = Field(default_factory=dict)
+    right_params: Dict[str, Any] = Field(default_factory=dict)
+
+
+
+
+class Group(ApiModel):
+
     conditions: List[Condition]
     active: bool
     symbols: List[str]
@@ -47,7 +76,8 @@ class Group(BaseModel):
     telegram_bot_id: str = ""
     description: str = ""
 
-class ProfileBase(BaseModel):
+class ProfileBase(ApiModel):
+
     name: str
     enabled: bool = True
     condition_groups: List[Group]
@@ -61,7 +91,8 @@ class ProfileUpdate(ProfileBase):
 class ProfileRead(ProfileBase):
     id: str
 
-class Alarm(BaseModel):
+class Alarm(ApiModel):
+
     ts: str
     profile_id: str
     profile_name: str
@@ -176,6 +207,15 @@ def _sanitize_condition(c: dict) -> dict:
     c.setdefault("right_symbol", "")
     c.setdefault("right_interval", "")
     c.setdefault("logic", "and")
+    c.setdefault("left_params", {})
+    c.setdefault("right_params", {})
+
+    
+    # Dict erzwingen
+    if not isinstance(c["left_params"], dict):
+        c["left_params"] = {}
+    if not isinstance(c["right_params"], dict):
+        c["right_params"] = {}
 
     # Genau EIN right* – deterministische Priorität
     flags = [
