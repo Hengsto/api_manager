@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
-from typing import List, Literal, Optional, Any
+from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Literal, Optional
 from pathlib import Path
 from copy import deepcopy
 
@@ -25,18 +25,15 @@ print(f"[DEBUG] Profiles path: {PROFILES_NOTIFIER}")
 print(f"[DEBUG] Alarms path:   {ALARMS_NOTIFIER}")
 
 # ─────────────────────────────────────────────────────────────
-# Models (wie früher – bewusst simpel/locker) – v1/v2 kompatibel
+# Models (v1/v2-kompatibel, extra="allow")
 # ─────────────────────────────────────────────────────────────
-from typing import Dict, Any, Optional, List, Literal
-from pydantic import BaseModel, Field
-
-# v1/v2-kompatibles Basismodell: extra="allow"
 try:
     from pydantic import ConfigDict
     _IS_PYDANTIC_V2 = True
 except Exception:
     ConfigDict = None
     _IS_PYDANTIC_V2 = False
+
 
 class ApiModel(BaseModel):
     if _IS_PYDANTIC_V2:
@@ -46,27 +43,20 @@ class ApiModel(BaseModel):
             extra = "allow"
 
 
-
-
 class Condition(ApiModel):
     left: str
     op: Literal["eq", "ne", "gt", "gte", "lt", "lte"]
-    right: str = ""
-    right_absolut: Optional[float] = None
-    right_change: Optional[float] = None
-    right_symbol: str = ""
-    right_interval: str = ""
+    right: str = ""            # Zahl ODER Indikatorname
+    right_symbol: str = ""     # optional anderes Symbol
+    right_interval: str = ""   # optional anderes Intervall
+    left_output: str = ""      # optional z.B. "signal"
+    right_output: str = ""     # optional z.B. "signal"
     logic: Literal["and", "or"] = "and"
-
-    # Parameter werden 1:1 durchgereicht
     left_params: Dict[str, Any] = Field(default_factory=dict)
     right_params: Dict[str, Any] = Field(default_factory=dict)
 
 
-
-
 class Group(ApiModel):
-
     conditions: List[Condition]
     active: bool
     symbols: List[str]
@@ -76,23 +66,26 @@ class Group(ApiModel):
     telegram_bot_id: str = ""
     description: str = ""
 
-class ProfileBase(ApiModel):
 
+class ProfileBase(ApiModel):
     name: str
     enabled: bool = True
     condition_groups: List[Group]
 
+
 class ProfileCreate(ProfileBase):
     id: Optional[str] = None
+
 
 class ProfileUpdate(ProfileBase):
     pass
 
+
 class ProfileRead(ProfileBase):
     id: str
 
-class Alarm(ApiModel):
 
+class Alarm(ApiModel):
     ts: str
     profile_id: str
     profile_name: str
@@ -122,6 +115,7 @@ def model_to_dict(m: BaseModel | dict | list | Any) -> dict | list | Any:
 
 def _lock_path(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".lock")
+
 
 class FileLock:
     def __init__(self, path: Path, timeout: float = 10.0, poll: float = 0.1):
@@ -161,6 +155,7 @@ class FileLock:
     def __exit__(self, exc_type, exc, tb):
         self.release()
 
+
 def load_json(path: Path, fallback: list) -> list:
     if not path.exists():
         print(f"[DEBUG] load_json -> {path} not found; returning fallback ({len(fallback)} items)")
@@ -173,6 +168,7 @@ def load_json(path: Path, fallback: list) -> list:
     except Exception as e:
         print(f"⚠️ Fehler beim Lesen {path}: {e}")
         return fallback
+
 
 def save_json(path: Path, data: list):
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -198,55 +194,33 @@ def save_json(path: Path, data: list):
 # Sanitize/Migration (tolerant & deterministisch)
 # ─────────────────────────────────────────────────────────────
 def _sanitize_condition(c: dict) -> dict:
-    # Felder sicherstellen
+    """
+    Entfernt Legacy-Keys (right_absolut/right_change) und
+    stellt neue Felder bereit (left_output/right_output).
+    """
     c.setdefault("left", "")
     c.setdefault("op", "gt")
     c.setdefault("right", "")
-    c.setdefault("right_absolut", None)
-    c.setdefault("right_change", None)
     c.setdefault("right_symbol", "")
     c.setdefault("right_interval", "")
+    c.setdefault("left_output", "")
+    c.setdefault("right_output", "")
     c.setdefault("logic", "and")
     c.setdefault("left_params", {})
     c.setdefault("right_params", {})
 
-    
-    # Dict erzwingen
     if not isinstance(c["left_params"], dict):
         c["left_params"] = {}
     if not isinstance(c["right_params"], dict):
         c["right_params"] = {}
 
-    # Genau EIN right* – deterministische Priorität
-    flags = [
-        ("right_absolut", c.get("right_absolut") is not None),
-        ("right", bool(str(c.get("right") or "").strip())),
-        ("right_change", c.get("right_change") is not None),
-    ]
-    n_set = sum(1 for _, ok in flags if ok)
-    if n_set == 0:
-        c["right"] = ""
-    elif n_set > 1:
-        # Priorität: right_absolut > right > right_change
-        keep = None
-        if c.get("right_absolut") is not None:
-            keep = "right_absolut"
-        elif str(c.get("right") or "").strip():
-            keep = "right"
-        else:
-            keep = "right_change"
-        if keep != "right_absolut":
-            c["right_absolut"] = None
-        if keep != "right":
-            c["right"] = ""
-        if keep != "right_change":
-            c["right_change"] = None
-
-    # Symbollogik: wenn right_symbol gesetzt, sollte right (Output-Key) existieren (zur Sicherheit leer erlauben)
-    if c.get("right_symbol") and c.get("right") is None:
-        c["right"] = ""
+    # 🔥 Legacy-Keys hart entfernen
+    for k in ("right_absolut", "right_absolute", "right_change"):
+        if k in c:
+            c.pop(k, None)
 
     return c
+
 
 def _sanitize_group(g: dict) -> dict:
     g.setdefault("conditions", [])
@@ -263,11 +237,12 @@ def _sanitize_group(g: dict) -> dict:
 
     # Conditions normalisieren
     conds = []
-    for raw in g["conditions"] or []:
+    for raw in g.get("conditions") or []:
         if isinstance(raw, dict):
             conds.append(_sanitize_condition(raw))
     g["conditions"] = conds
     return g
+
 
 def _sanitize_profiles(data: list) -> list:
     out = []
@@ -297,57 +272,16 @@ def _sanitize_profiles(data: list) -> list:
 @router.get("/profiles", response_model=List[ProfileRead])
 def get_profiles():
     data = load_json(PROFILES_NOTIFIER, [])
-    changed = False
+    # Vollständige, deterministische Sanitisierung
+    sanitized = _sanitize_profiles(data)
 
-    for p in data:
-        groups = p.get("condition_groups") or []
-        for g in groups:
-            # Gruppe: Pflichtfelder sicherstellen
-            if "name" not in g:                 g["name"] = ""; changed = True
-            if "telegram_bot_id" not in g:      g["telegram_bot_id"] = ""; changed = True
-            if "description" not in g:          g["description"] = ""; changed = True
-            if "interval" not in g:             g["interval"] = ""; changed = True
-            if "exchange" not in g:             g["exchange"] = ""; changed = True
-            if "symbols" not in g or g["symbols"] is None:
-                g["symbols"] = []; changed = True
-            if "active" not in g:
-                g["active"] = True; changed = True
-
-            # Conditions normalisieren
-            conds = g.get("conditions") or []
-            for c in conds:
-                if "right_interval" not in c:   c["right_interval"] = ""; changed = True
-                if "right_symbol" not in c:     c["right_symbol"] = ""; changed = True
-                if "right" not in c:            c["right"] = ""; changed = True
-                if "right_absolut" not in c:    c["right_absolut"] = None; changed = True
-                if "right_change" not in c:     c["right_change"] = None; changed = True
-                if "logic" not in c:            c["logic"] = "and"; changed = True
-
-                # Typcasting
-                try:
-                    if c["right_change"] == "":
-                        c["right_change"] = None
-                    elif c["right_change"] is not None:
-                        c["right_change"] = float(c["right_change"])
-                except Exception:
-                    c["right_change"] = None
-                    changed = True
-
-                try:
-                    if c["right_absolut"] == "":
-                        c["right_absolut"] = None
-                    elif c["right_absolut"] is not None:
-                        c["right_absolut"] = float(c["right_absolut"])
-                except Exception:
-                    c["right_absolut"] = None
-                    changed = True
-
-    if changed:
+    # Nur speichern, wenn sich etwas geändert hat (inkl. Legacy-Entfernung)
+    if json.dumps(sanitized, sort_keys=True, ensure_ascii=False) != json.dumps(data, sort_keys=True, ensure_ascii=False):
         print("[DEBUG] get_profiles -> normalized/migrated; saving back")
-        save_json(PROFILES_NOTIFIER, data)
+        save_json(PROFILES_NOTIFIER, sanitized)
 
-    print(f"[DEBUG] get_profiles -> returning {len(data)} profiles")
-    return data
+    print(f"[DEBUG] get_profiles -> returning {len(sanitized)} profiles")
+    return sanitized
 
 
 @router.post("/profiles", response_model=dict)
@@ -359,33 +293,12 @@ def add_profile(p: ProfileCreate):
     pid = new_profile.get("id") or str(uuid.uuid4())
     new_profile["id"] = pid
 
-    # Hard-Normalisierung (stellt sicher, dass %change/Intervalle nie verschwinden)
-    for g in new_profile.get("condition_groups", []):
-        g["interval"] = g.get("interval", "") or ""
-        g["exchange"] = g.get("exchange", "") or ""
-        g["name"] = g.get("name", "") or ""
-        g["telegram_bot_id"] = g.get("telegram_bot_id", "") or ""
-        g["description"] = g.get("description", "") or ""
-        g["symbols"] = g.get("symbols") or []
-        if "active" not in g: g["active"] = True
-
-        for c in g.get("conditions", []):
-            c["right_interval"] = c.get("right_interval", "") or ""
-            c["right_symbol"] = c.get("right_symbol", "") or ""
-            c["right"] = c.get("right", "") or ""
-            c["logic"] = c.get("logic", "and") or "and"
-
-            # Typcast %change/absolut
-            rc = c.get("right_change", None)
-            ra = c.get("right_absolut", None)
-            try:
-                c["right_change"] = None if rc in ("", None) else float(rc)
-            except Exception:
-                c["right_change"] = None
-            try:
-                c["right_absolut"] = None if ra in ("", None) else float(ra)
-            except Exception:
-                c["right_absolut"] = None
+    # Gruppen & Conditions sanitisieren (Legacy raus, Defaults setzen)
+    new_groups = []
+    for g in new_profile.get("condition_groups", []) or []:
+        if isinstance(g, dict):
+            new_groups.append(_sanitize_group(g))
+    new_profile["condition_groups"] = new_groups
 
     print(f"[DEBUG] add_profile <- payload_normalized: {json.dumps(new_profile, ensure_ascii=False)[:400]}...")
     profs.append(new_profile)
@@ -400,32 +313,12 @@ def update_profile(pid: str, p: ProfileUpdate):
     updated = False
     incoming = model_to_dict(p)
 
-    # gleiche Normalisierung wie im Create
-    for g in incoming.get("condition_groups", []):
-        g["interval"] = g.get("interval", "") or ""
-        g["exchange"] = g.get("exchange", "") or ""
-        g["name"] = g.get("name", "") or ""
-        g["telegram_bot_id"] = g.get("telegram_bot_id", "") or ""
-        g["description"] = g.get("description", "") or ""
-        g["symbols"] = g.get("symbols") or []
-        if "active" not in g: g["active"] = True
-
-        for c in g.get("conditions", []):
-            c["right_interval"] = c.get("right_interval", "") or ""
-            c["right_symbol"] = c.get("right_symbol", "") or ""
-            c["right"] = c.get("right", "") or ""
-            c["logic"] = c.get("logic", "and") or "and"
-
-            rc = c.get("right_change", None)
-            ra = c.get("right_absolut", None)
-            try:
-                c["right_change"] = None if rc in ("", None) else float(rc)
-            except Exception:
-                c["right_change"] = None
-            try:
-                c["right_absolut"] = None if ra in ("", None) else float(ra)
-            except Exception:
-                c["right_absolut"] = None
+    # Gruppen & Conditions sanitisieren (Legacy raus, Defaults setzen)
+    new_groups = []
+    for g in incoming.get("condition_groups", []) or []:
+        if isinstance(g, dict):
+            new_groups.append(_sanitize_group(g))
+    incoming["condition_groups"] = new_groups
 
     for i, item in enumerate(profs):
         if item.get("id") == pid:
@@ -507,6 +400,7 @@ def registry_indicators(
     print(f"[DEBUG] /registry/indicators (expanded) -> {len(items)} presets")
     return items
 
+
 @router.get("/notifier/indicators")
 def notifier_indicators(
     include_deprecated: bool = Query(False),
@@ -538,6 +432,7 @@ def notifier_indicators(
             })
     print(f"[DEBUG] /notifier/indicators -> {len(items)} items (presets)")
     return items
+
 
 @router.get("/registry/simple-signals", response_model=List[str])
 def registry_simple_signals():
