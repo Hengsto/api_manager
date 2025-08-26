@@ -10,12 +10,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# ⬇️ wichtig: Empfänger-Liste wie beim Watcher verwenden
+from notifier.telegram_client import recipients_from_config
 
 # -----------------------------------------------------------------------------
 # Einstellungen
 # -----------------------------------------------------------------------------
-DEFAULT_BOT_TOKEN: str = TELEGRAM_BOT_TOKEN
-DEFAULT_CHAT_ID: str = TELEGRAM_CHAT_ID
+DEFAULT_BOT_TOKEN: str | None = TELEGRAM_BOT_TOKEN
+DEFAULT_CHAT_ID_RAW = TELEGRAM_CHAT_ID  # kann int oder 0 sein
 
 PARSE_MODE: str = "Markdown"  # bewusst Legacy-Markdown, Escaping angepasst
 MAX_MSG_LEN: int = 4096       # Telegram Limit
@@ -51,7 +53,6 @@ def _save_state(state: Dict[str, float]) -> None:
             print(f"[DEBUG] State save failed: {e}")
 
 def _alarm_key(alarm: Dict[str, Any]) -> str:
-    # Key über stabile Kerneigenschaften
     payload = {
         "profile_id": alarm.get("profile_id"),
         "group_index": alarm.get("group_index"),
@@ -73,8 +74,6 @@ def _mark_sent(state: Dict[str, float], key: str, now: float) -> None:
 # Markdown Escaping (Legacy Markdown)
 # -----------------------------------------------------------------------------
 def _escape_markdown(text: str) -> str:
-    # Minimal-escaping für Telegram Markdown (nicht MarkdownV2!)
-    # Wir escapen die üblichen Meta-Symbole, lassen Emojis & Zahlen durch.
     if not isinstance(text, str):
         text = str(text)
     replacements = [
@@ -115,7 +114,6 @@ def _telegram_post(token: str, payload: Dict[str, Any], timeout: float = 10.0, m
                 print(f"[DEBUG] Telegram POST try {i+1}/{max_tries} → chat_id={payload.get('chat_id')} len(text)={len(str(payload.get('text','')))}")
             r = requests.post(url, json=payload, timeout=timeout)
             if r.status_code == 429:
-                # Too Many Requests – halte dich an Retry-After
                 retry_after = int(r.headers.get("Retry-After", "1"))
                 if DEBUG:
                     print(f"[DEBUG] 429 Too Many Requests. Retry-After={retry_after}")
@@ -139,28 +137,38 @@ def _telegram_post(token: str, payload: Dict[str, Any], timeout: float = 10.0, m
             time.sleep(0.5 * (i + 1))
     raise RuntimeError(f"Telegram POST failed after retries: {last_err}")
 
-def send_telegram_message(
+def _default_recipients() -> List[int]:
+    """
+    Fallback-Empfänger wie beim Watcher:
+    - TELEGRAM_CHAT_ID (falls != 0) ODER
+    - AUTHORIZED_USERS aus config (.env)
+    """
+    recips = recipients_from_config()  # kommt aus notifier.telegram_client
+    return recips
+
+def _send_tg_text(
     text: str,
-    chat_id: Optional[str] = None,
-    bot_token: Optional[str] = None,
+    recipients: List[int],
+    bot_token: Optional[str],
     disable_web_page_preview: bool = True,
 ) -> None:
     token = (bot_token or DEFAULT_BOT_TOKEN or "").strip()
-    cid = (chat_id or DEFAULT_CHAT_ID or "").strip()
-    if not token or not cid:
-        raise RuntimeError("Telegram credentials missing (token or chat_id).")
+    if not token:
+        raise RuntimeError("Telegram token missing.")
 
     txt = _escape_markdown(text)
     if len(txt) > MAX_MSG_LEN:
         txt = txt[: MAX_MSG_LEN - 50] + "\n… _gekürzt_"
 
-    payload = {
-        "chat_id": cid,
-        "text": txt,
-        "parse_mode": PARSE_MODE,
-        "disable_web_page_preview": disable_web_page_preview,
-    }
-    _telegram_post(token, payload)
+    for rid in recipients:
+        payload = {
+            "chat_id": str(rid),
+            "text": txt,
+            "parse_mode": PARSE_MODE,
+            "disable_web_page_preview": disable_web_page_preview,
+        }
+        _telegram_post(token, payload)
+        time.sleep(SEND_DELAY_SEC)
 
 # -----------------------------------------------------------------------------
 # Nachricht aus Evaluator-Payload bauen
@@ -170,7 +178,6 @@ def _fmt_value(v: Any) -> str:
         if v is None:
             return "—"
         if isinstance(v, float):
-            # knapper, aber lesbar
             return f"{v:.6g}"
         return str(v)
     except Exception:
@@ -194,7 +201,6 @@ def _fmt_cond_line(c: Dict[str, Any]) -> str:
     r_tag = f"{r_label}{'·'+str(r_out) if r_out else ''}"
 
     emoji = "✅" if ok else "❌"
-    # Code-Span nur für den Vergleichsteil, Rest normal escapen
     line = f"{emoji} `{l_tag} {op} {r_tag}`  →  {l_val} vs {r_val}"
     return line
 
@@ -209,7 +215,6 @@ def _derive_overrides(alarm: Dict[str, Any]) -> Tuple[Optional[str], Optional[st
     chat_id = alarm.get("telegram_chat_id")
     bot_token = alarm.get("telegram_bot_token")
 
-    # Gruppe aus UI: "telegram_bot_id" ist uneindeutig benannt → heuristisch
     group_field = alarm.get("telegram_bot_id")
     if group_field and not chat_id and not bot_token:
         s = str(group_field)
@@ -229,7 +234,16 @@ def format_alarm_message(alarm: Dict[str, Any]) -> str:
     desc    = alarm.get("description") or ""
     ts      = alarm.get("ts") or ""
 
-    header = f"🚨 *Alarm ausgelöst*\n*Profil:* {profile}\n*Gruppe:* {group}\n*Symbol:* {sym}  \n*Intervall:* {iv}{('  \n*Börse:* ' + exch) if exch else ''}{('  \n' + desc) if desc else ''}\n*Zeit:* {ts}"
+    header = (
+        "🚨 *Alarm ausgelöst*\n"
+        f"*Profil:* {profile}\n"
+        f"*Gruppe:* {group}\n"
+        f"*Symbol:* {sym}  \n"
+        f"*Intervall:* {iv}"
+        f"{('  \n*Börse:* ' + exch) if exch else ''}"
+        f"{('  \n' + desc) if desc else ''}\n"
+        f"*Zeit:* {ts}"
+    )
 
     lines: List[str] = []
     for c in (alarm.get("conditions") or []):
@@ -251,6 +265,8 @@ def run_alarm_checker(triggered: List[Dict[str, Any]]) -> None:
     """
     Nimmt die Liste ausgelöster Gruppen (vom Evaluator) und verschickt
     Telegram-Nachrichten. Dedupe/Cooldown verhindert Spam.
+    - Empfänger: per-Alarm Override > recipients_from_config()
+    - Token:     per-Alarm Override > TELEGRAM_BOT_TOKEN
     """
     n = len(triggered or [])
     print(f"🔔 {n} Alarm(e) prüfen...")
@@ -271,21 +287,37 @@ def run_alarm_checker(triggered: List[Dict[str, Any]]) -> None:
                 continue
 
             msg = format_alarm_message(alarm)
+
+            # Overrides?
             chat_override, token_override = _derive_overrides(alarm)
 
-            if DEBUG:
-                print(f"[DEBUG] sending → chat={chat_override or DEFAULT_CHAT_ID} "
-                      f"token={'<override>' if token_override else '<default>'} "
-                      f"len={len(msg)}")
+            # Empfänger bestimmen
+            if chat_override:
+                recipients = [chat_override]
+            else:
+                recipients = _default_recipients()
 
-            send_telegram_message(msg, chat_id=chat_override, bot_token=token_override)
+            if not recipients:
+                raise RuntimeError("No recipients configured (set AUTHORIZED_USERS or TELEGRAM_CHAT_ID).")
+
+            if DEBUG:
+                token_used = "<override>" if token_override else "<default>"
+                print(f"[DEBUG] sending → recips={recipients} token={token_used} len={len(msg)}")
+
+            _send_tg_text(
+                text=msg,
+                recipients=[int(r) for r in recipients],
+                bot_token=token_override or DEFAULT_BOT_TOKEN,
+            )
 
             _mark_sent(state, key, now)
             sent += 1
-            time.sleep(SEND_DELAY_SEC)
 
         except Exception as e:
             print("💥 Alarm send failed:", e)
+
+        # leichte Pause zwischen Alarms
+        time.sleep(SEND_DELAY_SEC)
 
     _save_state(state)
     print(f"✅ Versand fertig. {sent} / {n} Nachricht(en) verschickt.")

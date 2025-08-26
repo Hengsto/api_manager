@@ -1,3 +1,4 @@
+# notifier/evaluator.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -127,9 +128,6 @@ def _legacy_parse_label_if_needed(label: str) -> Optional[Tuple[str, Dict[str, A
 
 # -----------------------------------------------------------------------------
 # Spec-Resolver (neu): label + params -> (mode, name, params, preferred_output)
-# mode: "api"  => /indicator call
-#       "const"=> Konstante (z.B. value / change)
-#       "invalid"
 # -----------------------------------------------------------------------------
 def resolve_spec_and_params(
     label: str,
@@ -430,7 +428,6 @@ def evaluate_condition_for_symbol(
                 return False, {"error": "right_value_none"}
 
         # WICHTIG: bei right == "change" KEIN zusätzliches right_change (legacy %) anwenden
-        # (already encoded in right_val). Für andere rights darf right_pct_legacy optional drüber.
         if (right_label or "").strip().lower() != "change" and right_pct_legacy is not None and right_val is not None:
             if DEBUG_VALUES:
                 log.debug(f"[EVAL] apply legacy right_change%: base={right_val} pct={right_pct_legacy}")
@@ -438,10 +435,7 @@ def evaluate_condition_for_symbol(
 
     # --- Vergleich ----------------------------------------------------------
     try:
-        if op in ("eq", "ne"):
-            result = bool(OPS[op](float(left_val), float(right_val)))
-        else:
-            result = bool(OPS[op](float(left_val), float(right_val)))  # type: ignore[arg-type]
+        result = bool(OPS[op](float(left_val), float(right_val)))  # type: ignore[arg-type]
     except Exception as e:
         log.error(f"💥 Operator-Fehler: {left_val} {op} {right_val} -> {e}")
         return False, {"error": "operator_error", "exception": str(e)}

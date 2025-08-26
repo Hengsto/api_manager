@@ -47,4 +47,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 AUTHORIZED_USERS   = [int(u) for u in os.getenv("AUTHORIZED_USERS", "").split(",") if u]
 ENABLE_PROFILE_WATCH = "1"
+ENABLE_EVALUATOR = True
+EVALUATOR_INTERVAL = 60.0
+
 

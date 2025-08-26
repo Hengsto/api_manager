@@ -1,44 +1,110 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os, threading
-import uvicorn
-from fastapi import FastAPI
+import os
+import threading
+import time
+import tempfile
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
+from pathlib import Path
 
-from api.notifier_api import router as notifier_router
+import uvicorn
+from fastapi import FastAPI
+
 import config as cfg
 
-# Watcher import (entkoppelt von API)
-from notifier.watch_profiles import run as watch_run
+# ── Router optional laden ────────────────────────────────────────────────────
+notifier_router = None
+alarms_router = None
+try:
+    from api.notifier_api import router as notifier_router  # type: ignore
+    print("[DEBUG] notifier_api gefunden → /notifier wird gemountet.")
+except Exception:
+    print("[DEBUG] kein notifier_api gefunden (optional).")
 
-def _start_watcher_if_enabled():
-    enabled = str(getattr(cfg, "ENABLE_PROFILE_WATCH", os.getenv("ENABLE_PROFILE_WATCH","0"))).lower() in ("1","true","yes","on")
-    interval = float(getattr(cfg, "WATCH_INTERVAL", os.getenv("WATCH_INTERVAL","1.0")))
-    path = (getattr(cfg, "WATCH_PATH", os.getenv("WATCH_PATH","")).strip() or None)
+try:
+    from api.alarms_api import router as alarms_router  # type: ignore
+    print("[DEBUG] alarms_api gefunden → /alarms wird gemountet.")
+except Exception:
+    print("[DEBUG] kein alarms_api gefunden (optional).")
+
+# ── Notifier-Worker (Dateiwächter & Evaluator) ───────────────────────────────
+from notifier.watch_profiles import run as watch_profiles_run
+from notifier.evaluator import run_check as evaluator_run_check
+from alarm_checker import run_alarm_checker
+
+def _start_profile_watcher_if_enabled() -> None:
+    enabled = str(getattr(cfg, "ENABLE_PROFILE_WATCH", os.getenv("ENABLE_PROFILE_WATCH", "0"))).lower() in ("1", "true", "yes", "on")
+    interval = float(getattr(cfg, "WATCH_INTERVAL", os.getenv("WATCH_INTERVAL", "1.0")))
+    path = (getattr(cfg, "WATCH_PATH", os.getenv("WATCH_PATH", "")) or None)
     print(f"[WATCH] enabled={enabled} interval={interval} path={path or 'DEFAULT'}")
     if not enabled:
         return
-    t = threading.Thread(target=watch_run, kwargs={"interval_sec": interval, "path_override": path}, daemon=True)
+    t = threading.Thread(target=watch_profiles_run, kwargs={"interval_sec": interval, "path_override": path}, daemon=True)
     t.start()
 
+def _start_evaluator_loop_if_enabled() -> None:
+    enabled = str(getattr(cfg, "ENABLE_EVALUATOR", os.getenv("ENABLE_EVALUATOR", "0"))).lower() in ("1", "true", "yes", "on")
+    interval = float(getattr(cfg, "EVALUATOR_INTERVAL_SEC", os.getenv("EVALUATOR_INTERVAL_SEC", "60")))
+    print(f"[EVAL] enabled={enabled} interval={interval}s")
+    if not enabled:
+        return
+
+    def _loop():
+        print("[EVAL] Worker gestartet.")
+        while True:
+            try:
+                events = evaluator_run_check() or []
+                print(f"[EVAL] run_check → {len(events)} events")
+                if events:
+                    try:
+                        run_alarm_checker(events)
+                    except Exception as e:
+                        print(f"[EVAL] run_alarm_checker failed: {e}")
+            except Exception as e:
+                print(f"[EVAL] Loop-Fehler: {e}")
+            time.sleep(max(1.0, float(interval)))
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+
+# ── Utility: Debug-Pfade ausgeben (wie in deinem Log) ────────────────────────
+def _print_debug_paths() -> None:
+    try:
+        profiles_path = Path(getattr(cfg, "PROFILES_NOTIFIER"))
+        alarms_path = Path(getattr(cfg, "ALARMS_NOTIFIER"))
+        print(f"[DEBUG] Profiles path: {profiles_path}")
+        print(f"[DEBUG] Alarms   path: {alarms_path}")
+
+        # Warnung, falls im Projektbaum (Hot-Reload-Risiko)
+        cwd = Path.cwd().resolve()
+        if str(profiles_path.resolve()).startswith(str(cwd)) or str(alarms_path.resolve()).startswith(str(cwd)):
+            print("⚠️  WARN: JSONs liegen im Projektbaum → Hot-Reload-Risiko. Lege sie besser außerhalb ab.")
+
+        # Externes Lock-Verzeichnis anzeigen / setzen (optional)
+        lock_dir = getattr(cfg, "LOCK_DIR", None) or Path(tempfile.gettempdir()) / "notifier_locks"
+        Path(lock_dir).mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("NOTIFIER_LOCK_DIR", str(lock_dir))
+        print(f"[DEBUG] Using external lock dir: {lock_dir}")
+    except Exception as e:
+        print(f"[DEBUG] Pfad-Debugging fehlgeschlagen: {e}")
+
+# ── FastAPI App ──────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[DEBUG] Notifier API gestartet. Routen:")
-    for r in app.router.routes:
-        try:
-            methods = sorted(getattr(r, "methods", {"GET"}))
-            path = getattr(r, "path", getattr(r, "path_format", str(r)))
-            print(f"[DEBUG]  {methods} {path}")
-        except Exception:
-            pass
-    _start_watcher_if_enabled()
+    _print_debug_paths()
+    _start_profile_watcher_if_enabled()
+    _start_evaluator_loop_if_enabled()
     yield
     print("[DEBUG] Notifier API wird heruntergefahren.")
 
 app = FastAPI(title="Notifier API", version="1.0.0", lifespan=lifespan)
-app.include_router(notifier_router, prefix="/notifier")
+
+if notifier_router:
+    app.include_router(notifier_router, prefix="/notifier")
+if alarms_router:
+    app.include_router(alarms_router, prefix="/alarms")
 
 @app.get("/notifier/health")
 def health():
