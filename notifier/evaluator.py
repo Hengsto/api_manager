@@ -1,9 +1,9 @@
-# notifier/evaluator.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from datetime import datetime, timezone
@@ -27,11 +27,23 @@ DEBUG_HTTP = True
 DEBUG_VALUES = True
 
 # -----------------------------------------------------------------------------
-# Operator-Mapping
+# Operator-Mapping (mit Toleranz für eq/ne)
 # -----------------------------------------------------------------------------
+def _op_eq(a: float, b: float, rel_tol: float = 1e-6, abs_tol: float = 1e-9) -> bool:
+    try:
+        return math.isclose(a, b, rel_tol=rel_tol, abs_tol=abs_tol)
+    except Exception:
+        return False
+
+def _op_ne(a: float, b: float, rel_tol: float = 1e-6, abs_tol: float = 1e-9) -> bool:
+    try:
+        return not math.isclose(a, b, rel_tol=rel_tol, abs_tol=abs_tol)
+    except Exception:
+        return False
+
 OPS = {
-    "eq":  lambda a, b: a == b,
-    "ne":  lambda a, b: a != b,
+    "eq":  _op_eq,
+    "ne":  _op_ne,
     "gt":  lambda a, b: a > b,
     "gte": lambda a, b: a >= b,
     "lt":  lambda a, b: a < b,
@@ -114,19 +126,23 @@ def _legacy_parse_label_if_needed(label: str) -> Optional[Tuple[str, Dict[str, A
     return None
 
 # -----------------------------------------------------------------------------
-# Spec-Resolver (neu): label + params -> (mode, name, params)
+# Spec-Resolver (neu): label + params -> (mode, name, params, preferred_output)
 # mode: "api"  => /indicator call
-#       "const"=> Konstante (z.B. value/ change)
+#       "const"=> Konstante (z.B. value / change)
+#       "invalid"
 # -----------------------------------------------------------------------------
 def resolve_spec_and_params(
     label: str,
-    params: Optional[Dict[str, Any]] = None
-) -> Tuple[str, Optional[str], Dict[str, Any]]:
+    params: Optional[Dict[str, Any]] = None,
+    preferred_output: Optional[str] = None,
+) -> Tuple[str, Optional[str], Dict[str, Any], Optional[str]]:
     """
     - Neue Welt: label ist Spec-Name (z.B. "price","rsi","ema","bitcoin_ahr999", ...)
       -> mode="api", name=label.lower(), params=dict(params)
-    - Pseudo-Specs (ohne API): "value" -> params['target'] als Konstante
-                               "change"-> params['delta']  als Konstante
+    - Pseudo-Specs (ohne API):
+        "value"  -> params['target'] als Konstante
+        "change" -> **prozentual**: target = baseline * (1 + delta/100)
+                    baseline Pflicht (Alias 'source' ok), delta in %
       -> mode="const", name=None, params={"value": float}
     - Alte Welt (nur wenn keine params übergeben wurden): EMA_50 / RSI_14 / MACD_12_26_9
       -> mode="api" mit generierten params
@@ -134,49 +150,47 @@ def resolve_spec_and_params(
     p = dict(params or {})
     s = (label or "").strip()
     if not s:
-        return "invalid", None, {}
+        return "invalid", None, {}, None
 
     s_low = s.lower()
 
     # Pseudo-Specs
     if s_low == "value":
-        target = p.get("target", 0)
+        target = p.get("target", None)
         try:
             val = float(target)
         except Exception:
             raise RuntimeError(f"Ungültiger value.target: {target!r}")
-        return "const", None, {"value": val}
+        return "const", None, {"value": val, "target": val}, "value"
 
     if s_low == "change":
-        # Erwartet: p['source'] = Baseline (float), p['delta'] = Prozent (float)
-        if "source" not in p:
-            raise RuntimeError("change erfordert right_params.source (Baseline).")
+        # prozentuale Änderung: target = baseline * (1 + delta/100)
+        base = p.get("baseline", p.get("source", None))
+        if base is None:
+            raise RuntimeError("change erfordert right_params.baseline (oder 'source' als Alias).")
         try:
-            source = float(p.get("source"))
+            baseline = float(base)
         except Exception:
-            raise RuntimeError(f"Ungültiger change.source: {p.get('source')!r}")
+            raise RuntimeError(f"Ungültiger change.baseline/source: {base!r}")
         try:
             delta = float(p.get("delta", 0))
         except Exception:
             raise RuntimeError(f"Ungültiger change.delta: {p.get('delta')!r}")
-
-        target = source * (1.0 + (delta / 100.0))
-        # Wir geben eine Konstante zurück; params behalten Source/Delta/Target für Debug bei
-        return "const", None, {"value": target, "source": source, "delta": delta, "target": target}
-
+        target = baseline * (1.0 + (delta / 100.0))
+        return "const", None, {"value": target, "baseline": baseline, "delta": delta, "target": target}, "value"
 
     # Neue Welt: direkte Specs
     if params is not None:
-        return "api", s_low, p
+        return "api", s_low, p, preferred_output
 
     # Alte Labels (nur falls KEINE params kamen)
     legacy = _legacy_parse_label_if_needed(s)
     if legacy:
         name, gen = legacy
-        return "api", name, gen
+        return "api", name, gen, preferred_output
 
     # Fallback: treat label as direct spec (api) ohne params
-    return "api", s_low, {}
+    return "api", s_low, {}, preferred_output
 
 # -----------------------------------------------------------------------------
 # Indicator-Aufruf & Value-Extraktion
@@ -223,7 +237,7 @@ def _pick_value_from_row(
 ) -> Tuple[Optional[float], Optional[str]]:
     if preferred_cols:
         for c in preferred_cols:
-            if c in row and _is_number(row[c]):
+            if isinstance(c, str) and c in row and _is_number(row[c]):
                 return float(row[c]), c
     # Fallback: erste numerische Spalte (außer Timestamp_ISO)
     for k, v in row.items():
@@ -234,15 +248,14 @@ def _pick_value_from_row(
     return None, None
 
 def _default_output_priority_for(name: str) -> List[str]:
-    n = name.lower()
+    n = (name or "").lower()
     if n == "ema":
-        return ["EMA"]
+        return ["EMA", "ema", "Ema"]
     if n == "rsi":
-        return ["RSI"]
+        return ["RSI", "rsi"]
     if n == "macd":
-        return ["MACD", "Signal", "Histogram"]
+        return ["Histogram", "hist", "MACD", "Signal", "signal"]
     if n == "price":
-        # versuche erst "Price", dann "Close"
         return ["Price", "Close", "close"]
     if n in {"golden_cross", "death_cross", "macd_cross"}:
         return ["signal", "value"]
@@ -254,7 +267,8 @@ def _last_value_for_indicator(
     symbol: str,
     chart_interval: str,
     indicator_interval: str,
-    params: Dict[str, Any]
+    params: Dict[str, Any],
+    chosen_output: Optional[str] = None,
 ) -> Tuple[Optional[float], Optional[str], Optional[str]]:
     series = _fetch_indicator_series(name, symbol, chart_interval, indicator_interval, params)
     rows = series.get("data") or []
@@ -262,14 +276,26 @@ def _last_value_for_indicator(
         return None, None, None
 
     last = rows[-1]
-    pref = _default_output_priority_for(name)
+
+    # Prioritäten: 1) gewählter Output 2) spec.outputs 3) Default-Heuristik
+    pref: List[str] = []
+    if isinstance(chosen_output, str) and chosen_output:
+        pref.append(chosen_output)
 
     spec = meta.get(name.lower())
     if spec and isinstance(spec.get("outputs"), list) and spec["outputs"]:
-        mouts = [str(x) for x in spec["outputs"]]
-        pref = list(dict.fromkeys(mouts + pref))
+        pref += [str(x) for x in spec["outputs"] if isinstance(x, (str, int, float))]
+    pref += _default_output_priority_for(name)
 
-    val, col = _pick_value_from_row(last, pref)
+    # Dedupe
+    dedup = []
+    seen = set()
+    for x in pref:
+        if x not in seen:
+            dedup.append(x)
+            seen.add(x)
+
+    val, col = _pick_value_from_row(last, dedup)
     ts = last.get("Timestamp_ISO")
     return val, col, ts
 
@@ -308,22 +334,23 @@ def evaluate_condition_for_symbol(
         return False, {"error": f"unknown_operator:{op}"}
 
     # --- LEFT ---------------------------------------------------------------
-    left_label = cond.get("left") or ""
-    left_params = cond.get("left_params") or {}
-    mode_l, left_name, left_p = resolve_spec_and_params(left_label, left_params)
+    left_label   = cond.get("left") or ""
+    left_params  = cond.get("left_params") or {}
+    left_output  = (cond.get("left_output") or "").strip() or None
+
+    mode_l, left_name, left_p, left_out = resolve_spec_and_params(left_label, left_params, left_output)
 
     if mode_l == "invalid":
         log.warning(f"❓ Ungültiges left-Label: '{left_label}'")
         return False, {"error": "invalid_left_label", "left": left_label}
 
-    # Left kann theoretisch auch konstant sein (Pseudo-Spec) – supporten wir:
     left_val: Optional[float] = None
     left_col: Optional[str] = None
     left_ts: Optional[str] = None
     if mode_l == "const":
-        left_val = float(left_p.get("value"))
+        left_val = float((left_p or {}).get("value"))
         left_col = "CONST"
-        left_ts = None
+        left_ts  = None
     else:
         try:
             left_val, left_col, left_ts = _last_value_for_indicator(
@@ -332,7 +359,8 @@ def evaluate_condition_for_symbol(
                 symbol=main_symbol,
                 chart_interval=main_interval,
                 indicator_interval=main_interval,
-                params=left_p
+                params=left_p,
+                chosen_output=left_out,
             )
         except Exception as e:
             log.error(f"Left-Indikator-Fehler ({left_label}) [{main_symbol} {main_interval}]: {e}")
@@ -342,10 +370,13 @@ def evaluate_condition_for_symbol(
         return False, {"error": "left_value_none"}
 
     # --- RIGHT --------------------------------------------------------------
-    right_label = cond.get("right") or ""
-    right_params = cond.get("right_params") or {}
-    right_abs = _numeric_or_none(cond.get("right_absolut"))
-    right_pct = _numeric_or_none(cond.get("right_change"))
+    right_label   = cond.get("right") or ""
+    right_params  = cond.get("right_params") or {}
+    right_output  = (cond.get("right_output") or "").strip() or None
+
+    right_abs_legacy = _numeric_or_none(cond.get("right_absolut"))       # legacy
+    right_pct_legacy = _numeric_or_none(cond.get("right_change"))        # legacy (in %)
+
     r_symbol, r_interval = _resolve_right_side(cond, main_symbol, main_interval)
 
     right_val: Optional[float] = None
@@ -353,23 +384,33 @@ def evaluate_condition_for_symbol(
     right_ts: Optional[str] = None
 
     if right_label.strip() == "":
-        # alter Pfad: Absolutwert (falls gesetzt), sonst 0.0
-        if right_abs is not None:
-            right_val = right_abs
-            right_col = "ABS"
+        # Legacy: reine absolute Schwelle (selten sinnvoll)
+        base = right_abs_legacy if right_abs_legacy is not None else 0.0
+        if right_pct_legacy is not None:
+            right_val = base * (1.0 + (right_pct_legacy / 100.0))
+            right_col = "ABS% (legacy)"
         else:
-            right_val = 0.0
-            right_col = "ZERO"
+            right_val = base
+            right_col = "ABS (legacy)"
         right_ts = None
     else:
-        mode_r, right_name, right_p = resolve_spec_and_params(right_label, right_params)
+        mode_r, right_name, right_p, right_out = resolve_spec_and_params(right_label, right_params, right_output)
         if mode_r == "invalid":
             return False, {"error": "invalid_right_label", "right": right_label}
 
         if mode_r == "const":
-            right_val = float(right_p.get("value"))
+            right_val = float((right_p or {}).get("value"))
             right_col = "CONST"
-            right_ts = None
+            right_ts  = None
+            # Expliziter Debug für change-Prozent
+            if (right_label or "").strip().lower() == "change" and DEBUG_VALUES:
+                try:
+                    bl = right_p.get("baseline")
+                    dl = right_p.get("delta")
+                    tg = right_p.get("target")
+                    log.debug(f"[EVAL] change% resolved: baseline={bl}, delta%={dl}, target={tg}")
+                except Exception:
+                    pass
         else:
             try:
                 right_val, right_col, right_ts = _last_value_for_indicator(
@@ -378,7 +419,8 @@ def evaluate_condition_for_symbol(
                     symbol=r_symbol,
                     chart_interval=main_interval,      # immer auf Gruppen-Chart mappen
                     indicator_interval=r_interval,
-                    params=right_p
+                    params=right_p,
+                    chosen_output=right_out,
                 )
             except Exception as e:
                 log.error(f"Right-Indikator-Fehler ({right_label}) [{r_symbol} {r_interval} -> chart {main_interval}]: {e}")
@@ -387,35 +429,28 @@ def evaluate_condition_for_symbol(
             if right_val is None:
                 return False, {"error": "right_value_none"}
 
-
-    # Bei right == "change" NICHT zusätzlich right_change anwenden (bereits Prozentlogik enthalten)
-    apply_pct = (right_pct is not None) and not ((right_label or "").strip().lower() == "change")
-    if apply_pct and right_val is not None:
-        if DEBUG_VALUES:
-            log.debug(f"[EVAL] apply right_change: base={right_val} pct={right_pct}")
-        right_val = right_val * (1.0 + (right_pct / 100.0))
-    elif (right_label or "").strip().lower() == "change" and DEBUG_VALUES:
-        # Zusätzlicher Debug-Ausstoß für Transparenz bei change
-        try:
-            rp = right_p if isinstance(right_p, dict) else {}
-            log.debug(f"[EVAL] change target already computed "
-                      f"(source={rp.get('source')}, delta={rp.get('delta')}%, target={rp.get('target')})")
-        except Exception:
-            pass
-
+        # WICHTIG: bei right == "change" KEIN zusätzliches right_change (legacy %) anwenden
+        # (already encoded in right_val). Für andere rights darf right_pct_legacy optional drüber.
+        if (right_label or "").strip().lower() != "change" and right_pct_legacy is not None and right_val is not None:
+            if DEBUG_VALUES:
+                log.debug(f"[EVAL] apply legacy right_change%: base={right_val} pct={right_pct_legacy}")
+            right_val = right_val * (1.0 + (right_pct_legacy / 100.0))
 
     # --- Vergleich ----------------------------------------------------------
     try:
-        result = bool(OPS[op](left_val, right_val))  # type: ignore[arg-type]
+        if op in ("eq", "ne"):
+            result = bool(OPS[op](float(left_val), float(right_val)))
+        else:
+            result = bool(OPS[op](float(left_val), float(right_val)))  # type: ignore[arg-type]
     except Exception as e:
         log.error(f"💥 Operator-Fehler: {left_val} {op} {right_val} -> {e}")
         return False, {"error": "operator_error", "exception": str(e)}
 
     if DEBUG_VALUES:
         log.debug(
-            f"[EVAL] left={left_label}({left_name if mode_l=='api' else 'CONST'}.{left_col})={left_val} "
+            f"[EVAL] L {left_label}({(left_name or 'CONST')}.{left_col})={left_val} "
             f"[{main_symbol} {main_interval} @ {left_ts}]  "
-            f"{op}  right={right_label or right_abs}({right_col})={right_val} "
+            f"{op}  R {right_label or right_abs_legacy}({right_col})={right_val} "
             f"[{r_symbol if right_label else '-'} {r_interval if right_label else '-'} @ {right_ts or '-'}]  -> {result}"
         )
 
@@ -423,6 +458,7 @@ def evaluate_condition_for_symbol(
         "left": {
             "label": left_label,
             "spec": left_name if mode_l == "api" else None,
+            "output": left_out,
             "col": left_col,
             "value": left_val,
             "symbol": main_symbol if mode_l == "api" else None,
@@ -433,13 +469,14 @@ def evaluate_condition_for_symbol(
         "right": {
             "label": right_label,
             "spec": right_name if right_label and mode_r == "api" else None,
+            "output": right_out if right_label else None,
             "col": right_col,
             "value": right_val,
             "symbol": r_symbol if right_label and mode_r == "api" else None,
             "interval": r_interval if right_label and mode_r == "api" else None,
             "ts": right_ts,
-            "right_absolut": right_abs,
-            "right_change": right_pct,
+            "right_absolut": right_abs_legacy,
+            "right_change_legacy_pct": right_pct_legacy,
             "params": right_p if right_label else {},
         },
         "op": op,
@@ -475,10 +512,7 @@ def _eval_group_for_symbol(
             group_result = res
         else:
             logic = (cond.get("logic") or "and").strip().lower()
-            if logic == "or":
-                group_result = bool(group_result or res)
-            else:
-                group_result = bool(group_result and res)
+            group_result = (group_result or res) if logic == "or" else (group_result and res)
 
         log.debug(
             f"[GROUP] profile='{profile.get('name')}' group#{group_index} symbol={symbol} "
