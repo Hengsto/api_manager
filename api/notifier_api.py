@@ -17,16 +17,31 @@ import hashlib
 import random
 import string
 
-from config import PROFILES_NOTIFIER, ALARMS_NOTIFIER
+from config import PROFILES_NOTIFIER as _PROFILES_NOTIFIER_CFG, ALARMS_NOTIFIER as _ALARMS_NOTIFIER_CFG
 from notifier.indicator_registry import REGISTERED, SIMPLE_SIGNALS
 
-router = APIRouter()
+router = APIRouter(prefix="/notifier")
+
+
+# ─────────────────────────────────────────────────────────────
+# Pfade robust normalisieren (str → Path)
+# ─────────────────────────────────────────────────────────────
+def _to_path(p: Any) -> Path:
+    if isinstance(p, Path):
+        return p
+    return Path(str(p)).expanduser().resolve()
+
+PROFILES_NOTIFIER: Path = _to_path(_PROFILES_NOTIFIER_CFG)
+ALARMS_NOTIFIER:   Path = _to_path(_ALARMS_NOTIFIER_CFG)
 
 # ─────────────────────────────────────────────────────────────
 # Verzeichnisse
 # ─────────────────────────────────────────────────────────────
-PROFILES_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
-ALARMS_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
+try:
+    PROFILES_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
+    ALARMS_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
+except Exception as _mkerr:
+    print(f"💥 mkdir for JSON dirs failed: {_mkerr}")
 
 print(f"[DEBUG] Profiles path: {PROFILES_NOTIFIER}")
 print(f"[DEBUG] Alarms   path: {ALARMS_NOTIFIER}")
@@ -75,6 +90,9 @@ def _trim_str(x: Any, dash_to_empty: bool = True) -> str:
         return ""
     return s
 
+def _sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256(); h.update(b); return h.hexdigest()
+
 # Slope-Params: bp.* in base_params heben (bp.* hat Vorrang)
 def _normalize_slope_params_dict(p: Dict[str, Any] | None) -> Dict[str, Any]:
     if not isinstance(p, dict):
@@ -87,6 +105,31 @@ def _normalize_slope_params_dict(p: Dict[str, Any] | None) -> Dict[str, Any]:
         nested.update(bp)  # bp.* > base_params
         out["base_params"] = nested
     return out
+
+# ▼▼▼ NEU: Deactivate-Mode Normalisierung
+_ALLOWED_DEACT = {"true", "any_true"}
+
+def _normalize_deactivate_value(v: Any) -> Optional[str]:
+    """
+    Normalisiert UI/Legacy-Werte auf 'true' | 'any_true' | None.
+      - Strings: 'true'|'full'|'match' => 'true'
+                 'any_true'|'any'|'partial' => 'any_true'
+                 ''/None => None
+      - Bool: True => 'true', False/None => None
+      - Sonst: None
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return "true" if v else None
+    s = _trim_str(v).lower()
+    if not s:
+        return None
+    if s in {"true", "full", "match"}:
+        return "true"
+    if s in {"any_true", "any", "partial"}:
+        return "any_true"
+    return None
 
 # ─────────────────────────────────────────────────────────────
 # READ-Modelle (strikt) – enthalten gid/rid
@@ -117,6 +160,8 @@ class GroupOut(ApiModel):
     name: str = ""
     telegram_bot_id: str = ""
     description: str = ""
+    # ▼▼▼ NEU
+    deactivate_on: Optional[Literal["true","any_true"]] = None
 
 class ProfileBaseOut(ApiModel):
     name: str
@@ -155,6 +200,9 @@ class GroupIn(ApiModel):
     name: str = ""
     telegram_bot_id: str = ""
     description: str = ""
+    # ▼▼▼ NEU
+    deactivate_on: Optional[Literal["true","any_true"]] = None
+    auto_deactivate: Optional[bool] = None  # Legacy-Eingänge tolerieren
 
 class ProfileBaseIn(ApiModel):
     name: str
@@ -176,7 +224,12 @@ _LOCK_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[DEBUG] Using external lock dir: {_LOCK_DIR}")
 
 def _lock_path(path: Path) -> Path:
-    return _LOCK_DIR / (path.name + ".lock")
+    # defensiv, falls mal was anderes reinkommt
+    try:
+        name = Path(path).name
+    except Exception:
+        name = str(path)
+    return _LOCK_DIR / (name + ".lock")
 
 class FileLock:
     def __init__(self, path: Path, timeout: float = 10.0, poll: float = 0.1):
@@ -221,34 +274,46 @@ def model_to_dict(m: BaseModel | dict | list | Any) -> dict | list | Any:
         return {k: model_to_dict(v) for k, v in m.items()}
     return m
 
-def _sha256_bytes(b: bytes) -> str:
-    h = hashlib.sha256(); h.update(b); return h.hexdigest()
-
 def load_json(path: Path, fallback: list) -> list:
+    path = _to_path(path)
     if not path.exists():
         print(f"[DEBUG] load_json -> {path} not found; returning fallback ({len(fallback)} items)")
         return fallback
     try:
         txt = path.read_text(encoding="utf-8")
         data = json.loads(txt)
-        print(f"[DEBUG] load_json <- {path} ({len(data)} items)")
+        if not isinstance(data, list):
+            print(f"[DEBUG] load_json <- {path} (non-list root, coercing)")
+            data = []
+        else:
+            print(f"[DEBUG] load_json <- {path} ({len(data)} items)")
         return data
     except Exception as e:
         print(f"⚠️ Fehler beim Lesen {path}: {e}")
         return fallback
 
 def save_json(path: Path, data: list):
+    path = _to_path(path)
     payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
-    try:
-        if path.exists():
-            cur = path.read_bytes()
-            if len(cur) == len(payload) and _sha256_bytes(cur) == _sha256_bytes(payload):
-                print(f"[DEBUG] save_json -> SKIP (content unchanged) {path}")
-                return
-    except Exception as e:
-        print(f"[DEBUG] save_json compare failed ({e}); continue write")
     tmp = path.with_suffix(path.suffix + ".tmp")
+    # evtl. altes tmp wegräumen
     try:
+        if tmp.exists():
+            tmp.unlink()
+    except Exception as e:
+        print(f"[DEBUG] tmp unlink failed (pre): {e}")
+
+    try:
+        # Short-circuit bei identischem Inhalt
+        if path.exists():
+            try:
+                cur = path.read_bytes()
+                if len(cur) == len(payload) and _sha256_bytes(cur) == _sha256_bytes(payload):
+                    print(f"[DEBUG] save_json -> SKIP (content unchanged) {path}")
+                    return
+            except Exception as e:
+                print(f"[DEBUG] save_json compare failed ({e}); continue write")
+
         with FileLock(path):
             with open(tmp, "wb") as f:
                 f.write(payload); f.flush(); os.fsync(f.fileno())
@@ -344,6 +409,11 @@ def _sanitize_group(g: dict) -> dict:
     g.setdefault("name", "")
     g.setdefault("telegram_bot_id", "")
     g.setdefault("description", "")
+    # ▼▼▼ NEU: Defaults für neue/legacy Felder
+    if "deactivate_on" not in g:
+        g["deactivate_on"] = None
+    if "auto_deactivate" not in g:
+        g["auto_deactivate"] = None
 
     # Trim Strings
     for k in ("interval","exchange","name","telegram_bot_id","description"):
@@ -372,6 +442,26 @@ def _sanitize_group(g: dict) -> dict:
         if c["rid"] in seen:
             c["rid"] = _rand_id()
         seen.add(c["rid"])
+
+    # ▼▼▼ NEU: deactivate_on normalisieren (+ Legacy auto_deactivate)
+    before_deact = g.get("deactivate_on")
+    before_legacy = g.get("auto_deactivate")
+    norm = _normalize_deactivate_value(before_deact)
+    if norm is None:
+        norm = _normalize_deactivate_value(before_legacy)  # True => "true"
+        if before_legacy is not None:
+            print(f"[DEBUG] _sanitize_group: legacy auto_deactivate={before_legacy} -> deactivate_on={norm}")
+    if norm in _ALLOWED_DEACT:
+        if before_deact != norm:
+            print(f"[DEBUG] _sanitize_group: normalize deactivate_on '{before_deact}' -> '{norm}'")
+        g["deactivate_on"] = norm
+    else:
+        if before_deact not in (None, ""):
+            print(f"[DEBUG] _sanitize_group: drop invalid deactivate_on='{before_deact}'")
+        g.pop("deactivate_on", None)
+    # Legacy-Feld entfernen
+    if "auto_deactivate" in g:
+        g.pop("auto_deactivate", None)
 
     return g
 
@@ -505,7 +595,7 @@ def update_profile(pid: str, p: ProfileUpdate):
 
     if old_norm_json == new_norm_json:
         print(f"[DEBUG] update_profile -> NO CHANGE (skip save) id={pid}")
-        return {"status": "ok", "id": pid}  # <-- WICHTIG: 'ok' statt 'unchanged' für UI
+        return {"status": "ok", "id": pid}  # wichtig: 'ok' für UI
 
     profs[idx] = merged
     save_json(PROFILES_NOTIFIER, profs)
@@ -563,7 +653,7 @@ def registry_indicators(
     print(f"[DEBUG] /registry/indicators (expanded) -> {len(items)} presets")
     return items
 
-@router.get("/notifier/indicators")
+@router.get("/indicators")
 def notifier_indicators(include_deprecated: bool = Query(False), include_hidden: bool = Query(False)):
     items = []
     for key, spec in REGISTERED.items():
@@ -595,7 +685,7 @@ def registry_simple_signals():
 def health():
     def _stat(p: Path) -> dict:
         try:
-            st = p.stat(); return {"exists": True, "size": st.st_size, "mtime": st.st_mtime}
+            st = _to_path(p).stat(); return {"exists": True, "size": st.st_size, "mtime": st.st_mtime}
         except FileNotFoundError:
             return {"exists": False, "size": 0, "mtime": None}
     return {"profiles": _stat(PROFILES_NOTIFIER), "alarms": _stat(ALARMS_NOTIFIER), "lock_dir": str(_LOCK_DIR)}

@@ -102,13 +102,14 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Notifier API", version="1.0.0", lifespan=lifespan)
 
 if notifier_router:
-    app.include_router(notifier_router, prefix="/notifier")
+    app.include_router(notifier_router) 
+
 if alarms_router:
     app.include_router(alarms_router, prefix="/alarms")
 
-@app.get("/notifier/health")
-def health():
-    return {"status": "ok"}
+@app.get("/health")
+def health(): return {"status":"ok"}
+
 
 def _port_from_config(default: int = 8000) -> int:
     try:
