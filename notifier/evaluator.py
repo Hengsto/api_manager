@@ -2,17 +2,21 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import os
 import json
 import logging
 import math
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 import hashlib
 from pathlib import Path
+from collections import OrderedDict
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from config import NOTIFIER_ENDPOINT, PRICE_API_ENDPOINT
 # Optional: lokaler Profiles-Pfad, falls API-Write nicht geht
@@ -22,7 +26,7 @@ except Exception:
     PROFILES_NOTIFIER = None  # type: ignore[assignment]
 
 # -----------------------------------------------------------------------------
-# Logging
+# Logging & ENV
 # -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -30,8 +34,50 @@ logging.basicConfig(
 )
 log = logging.getLogger("notifier.evaluator")
 
-DEBUG_HTTP = True
-DEBUG_VALUES = True
+ENV = os.getenv
+def _bool_env(key: str, default: bool) -> bool:
+    v = ENV(key)
+    if v is None: return default
+    return str(v).strip().lower() in {"1","true","yes","y","on"}
+
+def _int_env(key: str, default: int) -> int:
+    try:
+        v = int(ENV(key, str(default)))
+        return v
+    except Exception:
+        return default
+
+DEBUG_HTTP   = _bool_env("EVAL_DEBUG_HTTP", True)
+DEBUG_VALUES = _bool_env("EVAL_DEBUG_VALUES", True)
+
+HTTP_TIMEOUT = float(_int_env("EVAL_HTTP_TIMEOUT", 15))
+HTTP_RETRIES = _int_env("EVAL_HTTP_RETRIES", 3)
+CACHE_MAX    = _int_env("EVAL_CACHE_MAX", 256)
+
+# -----------------------------------------------------------------------------
+# Global HTTP Session mit Retries
+# -----------------------------------------------------------------------------
+_SESSION: Optional[requests.Session] = None
+
+def _get_session() -> requests.Session:
+    global _SESSION
+    if _SESSION is not None:
+        return _SESSION
+    s = requests.Session()
+    retry = Retry(
+        total=HTTP_RETRIES,
+        read=HTTP_RETRIES,
+        connect=HTTP_RETRIES,
+        backoff_factor=0.3,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST", "PUT"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    _SESSION = s
+    return s
 
 # -----------------------------------------------------------------------------
 # Operatoren
@@ -57,35 +103,56 @@ OPS = {
     "lte": lambda a, b: a <= b,
 }
 
+ALIASES = {
+    "==": "eq",
+    "=":  "eq",
+    "!=": "ne",
+    "<>": "ne",
+    ">=": "gte",
+    "≤":  "lte",
+    "<=": "lte",
+    "≥":  "gte",
+}
+
+def _normalize_op(op: str) -> str:
+    s = (op or "").strip().lower()
+    return ALIASES.get(s, s)
+
 # -----------------------------------------------------------------------------
 # HTTP Utils
 # -----------------------------------------------------------------------------
-def _http_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: float = 15.0) -> Any:
-    tries = 2
+def _http_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: float = HTTP_TIMEOUT) -> Any:
+    tries = max(1, HTTP_RETRIES)
     last_err: Optional[Exception] = None
+    sess = _get_session()
     for i in range(tries):
         try:
             if DEBUG_HTTP:
                 log.debug(f"[HTTP] GET {url} params={params}")
-            r = requests.get(url, params=params, timeout=timeout)
+            r = sess.get(url, params=params, timeout=timeout)
             if DEBUG_HTTP:
                 log.debug(f"[HTTP] {r.status_code} {r.url}")
             r.raise_for_status()
-            return r.json()
+            try:
+                return r.json()
+            except Exception as je:
+                last_err = je
+                log.warning(f"[HTTP] JSON-Decode-Fehler bei GET {url}: {je} (try {i+1}/{tries})")
         except Exception as e:
             last_err = e
             log.warning(f"[HTTP] Fehler bei GET {url}: {e} (try {i+1}/{tries})")
-            time.sleep(0.25 * (i + 1))
+        time.sleep(0.25 * (i + 1))
     raise RuntimeError(f"HTTP GET fehlgeschlagen: {url} :: {last_err}")
 
-def _http_put_json(url: str, payload: Dict[str, Any], timeout: float = 15.0) -> Any:
-    tries = 2
+def _http_put_json(url: str, payload: Dict[str, Any], timeout: float = HTTP_TIMEOUT) -> Any:
+    tries = max(1, HTTP_RETRIES)
     last_err: Optional[Exception] = None
+    sess = _get_session()
     for i in range(tries):
         try:
             if DEBUG_HTTP:
                 log.debug(f"[HTTP] PUT {url} json_keys={list(payload.keys())}")
-            r = requests.put(url, json=payload, timeout=timeout)
+            r = sess.put(url, json=payload, timeout=timeout)
             if DEBUG_HTTP:
                 log.debug(f"[HTTP] {r.status_code} {r.url}")
             r.raise_for_status()
@@ -93,17 +160,18 @@ def _http_put_json(url: str, payload: Dict[str, Any], timeout: float = 15.0) -> 
         except Exception as e:
             last_err = e
             log.warning(f"[HTTP] Fehler bei PUT {url}: {e} (try {i+1}/{tries})")
-            time.sleep(0.25 * (i + 1))
+        time.sleep(0.25 * (i + 1))
     raise RuntimeError(f"HTTP PUT fehlgeschlagen: {url} :: {last_err}")
 
-def _http_post_json(url: str, payload: Dict[str, Any], timeout: float = 15.0) -> Any:
-    tries = 2
+def _http_post_json(url: str, payload: Dict[str, Any], timeout: float = HTTP_TIMEOUT) -> Any:
+    tries = max(1, HTTP_RETRIES)
     last_err: Optional[Exception] = None
+    sess = _get_session()
     for i in range(tries):
         try:
             if DEBUG_HTTP:
                 log.debug(f"[HTTP] POST {url} json_keys={list(payload.keys())}")
-            r = requests.post(url, json=payload, timeout=timeout)
+            r = sess.post(url, json=payload, timeout=timeout)
             if DEBUG_HTTP:
                 log.debug(f"[HTTP] {r.status_code} {r.url}")
             r.raise_for_status()
@@ -111,7 +179,7 @@ def _http_post_json(url: str, payload: Dict[str, Any], timeout: float = 15.0) ->
         except Exception as e:
             last_err = e
             log.warning(f"[HTTP] Fehler bei POST {url}: {e} (try {i+1}/{tries})")
-            time.sleep(0.25 * (i + 1))
+        time.sleep(0.25 * (i + 1))
     raise RuntimeError(f"HTTP POST fehlgeschlagen: {url} :: {last_err}")
 
 # -----------------------------------------------------------------------------
@@ -213,18 +281,32 @@ def resolve_spec_and_params(
     return "api", s_low, {}, preferred_output
 
 # -----------------------------------------------------------------------------
-# Indicator-Aufruf & Value-Extraktion
+# Indicator-Aufruf & Value-Extraktion (LRU-Cache)
 # -----------------------------------------------------------------------------
-_INDICATOR_CACHE: Dict[Tuple[str, str, str, str, str], Dict[str, Any]] = {}
+_INDICATOR_CACHE: "OrderedDict[Tuple[str, str, str, str, str], Dict[str, Any]]" = OrderedDict()
 
 def _indicator_cache_key(name: str, symbol: str, chart_interval: str, indicator_interval: str, params: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
     pkey = json.dumps(params or {}, sort_keys=True, separators=(",", ":"))
     return (name.lower(), symbol, chart_interval, indicator_interval, pkey)
 
+def _cache_get(key: Tuple[str, str, str, str, str]) -> Optional[Dict[str, Any]]:
+    val = _INDICATOR_CACHE.get(key)
+    if val is not None:
+        # move-to-end for LRU
+        _INDICATOR_CACHE.move_to_end(key)
+    return val
+
+def _cache_put(key: Tuple[str, str, str, str, str], value: Dict[str, Any]) -> None:
+    _INDICATOR_CACHE[key] = value
+    _INDICATOR_CACHE.move_to_end(key)
+    if len(_INDICATOR_CACHE) > max(8, CACHE_MAX):
+        _INDICATOR_CACHE.popitem(last=False)
+
 def _fetch_indicator_series(name: str, symbol: str, chart_interval: str, indicator_interval: str, params: Dict[str, Any]) -> Dict[str, Any]:
     key = _indicator_cache_key(name, symbol, chart_interval, indicator_interval, params)
-    if key in _INDICATOR_CACHE:
-        return _INDICATOR_CACHE[key]
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
 
     url = f"{PRICE_API_ENDPOINT}/indicator"
     query = {
@@ -236,10 +318,14 @@ def _fetch_indicator_series(name: str, symbol: str, chart_interval: str, indicat
     }
     if DEBUG_VALUES:
         log.debug(f"[FETCH] {name} sym={symbol} chart_iv={chart_interval} ind_iv={indicator_interval} params={params}")
+    t0 = time.perf_counter()
     data = _http_get_json(url, params=query)
+    dt = (time.perf_counter() - t0) * 1000
+    if DEBUG_VALUES:
+        log.debug(f"[FETCH] done {name} in {dt:.1f} ms")
     if not isinstance(data, dict) or "data" not in data:
         raise RuntimeError(f"/indicator lieferte kein dict mit 'data'. name={name}")
-    _INDICATOR_CACHE[key] = data
+    _cache_put(key, data)
     return data
 
 def _is_number(x: Any) -> bool:
@@ -260,16 +346,16 @@ def _pick_value_from_row(row: Dict[str, Any], preferred_cols: Optional[List[str]
 def _default_output_priority_for(name: str) -> List[str]:
     n = (name or "").lower()
     if n == "ema":
-        return ["EMA", "ema", "Ema"]
+        return ["EMA", "ema", "Ema", "value"]
     if n == "rsi":
-        return ["RSI", "rsi"]
+        return ["RSI", "rsi", "value"]
     if n == "macd":
-        return ["Histogram", "hist", "MACD", "Signal", "signal"]
+        return ["Histogram", "hist", "MACD", "Signal", "signal", "value"]
     if n == "price":
-        return ["Price", "Close", "close"]
+        return ["Price", "Close", "close", "value"]
     if n in {"golden_cross", "death_cross", "macd_cross"}:
         return ["signal", "value"]
-    return []
+    return ["value"]
 
 def _last_value_for_indicator(
     meta: Dict[str, Dict[str, Any]],
@@ -296,8 +382,8 @@ def _last_value_for_indicator(
         pref += [str(x) for x in spec["outputs"] if isinstance(x, (str, int, float))]
     pref += _default_output_priority_for(name)
 
-    dedup = []
-    seen = set()
+    dedup: List[str] = []
+    seen: Set[str] = set()
     for x in pref:
         if x not in seen:
             dedup.append(x)
@@ -331,6 +417,19 @@ def _stable_event_id(profile_id: Any, group_index: int, symbol: str, interval: s
     raw = _stable_event_key(profile_id, group_index, symbol, interval)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
+
+def _safe_max_iso(ts_list: List[Optional[str]], fallback: Optional[str] = None) -> Optional[str]:
+    vals = [t for t in ts_list if isinstance(t, str) and t]
+    if not vals:
+        return fallback
+    # ISO-8601 ist lexikographisch vergleichbar, wenn Format konsistent ist
+    try:
+        return max(vals)
+    except Exception:
+        return fallback
+
 # ---- Auto-Deactivate ---------------------------------------------------------
 def _normalize_deactivate_mode(group: Dict[str, Any]) -> Optional[str]:
     """
@@ -341,7 +440,6 @@ def _normalize_deactivate_mode(group: Dict[str, Any]) -> Optional[str]:
     """
     val = group.get("deactivate_on")
     if val is None:
-        # legacy boolean flag support: auto_deactivate: true  -> "true"
         if group.get("auto_deactivate") is True:
             return "true"
         return None
@@ -363,13 +461,6 @@ def _should_deactivate_group(group: Dict[str, Any], cond_details: List[Dict[str,
     return (True, "any_true") if any_true else (False, "")
 
 def _api_update_group_active(profile: Dict[str, Any], group_index: int, active: bool, reason: str) -> bool:
-    """
-    Versucht per API zu aktualisieren.
-    Strategie:
-      1) PUT /profiles/{id} mit komplettem Profile (bekannt aus _load_profiles())
-         (kompatibel zur üblichen CRUD-API)
-      2) Falls es eine spezielle Route gäbe (z.B. /profiles/{id}/deactivate), könnte man die hier einbauen.
-    """
     try:
         pid = profile.get("id")
         if not pid:
@@ -381,7 +472,7 @@ def _api_update_group_active(profile: Dict[str, Any], group_index: int, active: 
             return False
         g = groups[group_index]
         g["active"] = active
-        g["deactivated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
+        g["deactivated_at"] = _now_iso()
         g["deactivated_reason"] = reason
 
         url = f"{NOTIFIER_ENDPOINT}/profiles/{pid}"
@@ -413,7 +504,7 @@ def _local_file_update_group_active(profile_id: Any, group_index: int, active: b
                 if 0 <= group_index < len(groups):
                     g = groups[group_index]
                     g["active"] = active
-                    g["deactivated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
+                    g["deactivated_at"] = _now_iso()
                     g["deactivated_reason"] = reason
                     changed = True
                 break
@@ -429,7 +520,6 @@ def _local_file_update_group_active(profile_id: Any, group_index: int, active: b
         return False
 
 def _deactivate_group(profile: Dict[str, Any], group_index: int, reason: str) -> bool:
-    # bevorzugt API, dann lokal
     ok = _api_update_group_active(profile, group_index, active=False, reason=reason)
     if ok:
         log.info(f"[AUTO-DEACT] Gruppe deaktiviert (API): profile={profile.get('name')} group_index={group_index} reason={reason}")
@@ -450,9 +540,12 @@ def evaluate_condition_for_symbol(
     main_symbol: str,
     main_interval: str
 ) -> Tuple[bool, Dict[str, Any]]:
-    op = (cond.get("op") or "").lower()
+    t0 = time.perf_counter()
+
+    op_raw = (cond.get("op") or "")
+    op = _normalize_op(op_raw)
     if op not in OPS:
-        return False, {"error": f"unknown_operator:{op}"}
+        return False, {"error": f"unknown_operator:{op_raw}", "normalized": op}
 
     # LEFT
     left_label   = cond.get("left") or ""
@@ -482,7 +575,7 @@ def evaluate_condition_for_symbol(
                 chosen_output=left_out,
             )
         except Exception as e:
-            return False, {"error": "left_indicator_fetch_failed", "exception": str(e)}
+            return False, {"error": "left_indicator_fetch_failed", "exception": str(e), "left": left_label}
 
     if left_val is None:
         return False, {"error": "left_value_none"}
@@ -502,6 +595,9 @@ def evaluate_condition_for_symbol(
     right_ts: Optional[str] = None
 
     if right_label.strip() == "":
+        # Legacy-Modus
+        if right_pct_legacy is not None and right_abs_legacy is None:
+            return False, {"error": "right_change_without_base", "hint": "right_absolut erforderlich oder right_label='change' verwenden"}
         base = right_abs_legacy if right_abs_legacy is not None else 0.0
         if right_pct_legacy is not None:
             right_val = base * (1.0 + (right_pct_legacy / 100.0))
@@ -531,7 +627,7 @@ def evaluate_condition_for_symbol(
                     chosen_output=right_out,
                 )
             except Exception as e:
-                return False, {"error": "right_indicator_fetch_failed", "exception": str(e)}
+                return False, {"error": "right_indicator_fetch_failed", "exception": str(e), "right": right_label}
 
             if right_val is None:
                 return False, {"error": "right_value_none"}
@@ -544,6 +640,8 @@ def evaluate_condition_for_symbol(
         result = bool(OPS[op](float(left_val), float(right_val)))  # type: ignore[arg-type]
     except Exception as e:
         return False, {"error": "operator_error", "exception": str(e)}
+
+    dt = (time.perf_counter() - t0) * 1000.0
 
     details = {
         "left": {
@@ -571,8 +669,12 @@ def evaluate_condition_for_symbol(
             "params": right_p if right_label else {},
         },
         "op": (cond.get("op") or "").lower(),
+        "op_norm": op,
         "result": result,
+        "duration_ms": round(dt, 2),
     }
+    if DEBUG_VALUES:
+        log.debug(f"[EVAL] {main_symbol}@{main_interval} {left_label} {op} {right_label} -> {result} ({dt:.1f} ms)")
     return result, details
 
 # -----------------------------------------------------------------------------
@@ -585,6 +687,7 @@ def _eval_group_for_symbol(
     symbol: str,
     group_index: int
 ) -> Tuple[bool, List[Dict[str, Any]]]:
+    t0 = time.perf_counter()
     conditions: List[Dict[str, Any]] = group.get("conditions") or []
     main_interval = (group.get("interval") or "").strip()
     if not main_interval:
@@ -604,6 +707,10 @@ def _eval_group_for_symbol(
             logic = (cond.get("logic") or "and").strip().lower()
             group_result = (group_result or res) if logic == "or" else (group_result and res)
 
+    dt = (time.perf_counter() - t0) * 1000.0
+    if DEBUG_VALUES:
+        log.debug(f"[GROUP] {profile.get('name')}[{group_index}] {symbol}@{main_interval} -> {bool(group_result)} "
+                  f"(conds={len(conditions)}, {dt:.1f} ms)")
     return bool(group_result), per_details
 
 # -----------------------------------------------------------------------------
@@ -617,6 +724,7 @@ def run_check() -> List[Dict[str, Any]]:
     """
     _INDICATOR_CACHE.clear()
 
+    t_start = time.perf_counter()
     try:
         profiles = _load_profiles()
     except Exception as e:
@@ -630,8 +738,8 @@ def run_check() -> List[Dict[str, Any]]:
         return []
 
     triggered: List[Dict[str, Any]] = []
-    seen_run_keys: set[str] = set()
-    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
+    seen_run_keys: Set[str] = set()
+    now_iso = _now_iso()
 
     for p_idx, profile in enumerate(profiles):
         if not profile.get("enabled", True):
@@ -657,19 +765,18 @@ def run_check() -> List[Dict[str, Any]]:
                 group_ok, cond_details = _eval_group_for_symbol(meta, profile, group, sym, g_idx)
 
                 # Bar TS bestimmen
-                bar_ts: Optional[str] = None
+                ts_candidates: List[Optional[str]] = []
                 try:
                     left_ts = cond_details[0].get("left", {}).get("ts") if cond_details else None
-                    ts_candidates = [left_ts] if left_ts else []
+                    if left_ts:
+                        ts_candidates.append(left_ts)
                     for d in cond_details:
                         rts = d.get("right", {}).get("ts")
                         if rts:
                             ts_candidates.append(rts)
-                    bar_ts = max([t for t in ts_candidates if isinstance(t, str)], default=None)
                 except Exception:
-                    bar_ts = None
-                if not bar_ts:
-                    bar_ts = now_iso
+                    pass
+                bar_ts = _safe_max_iso(ts_candidates, fallback=now_iso) or now_iso
 
                 # Trigger handling
                 if group_ok:
@@ -705,12 +812,12 @@ def run_check() -> List[Dict[str, Any]]:
                 if should_deact:
                     ok = _deactivate_group(profile, g_idx, reason=reason)
                     if ok:
-                        group_deactivated = True  # abbrechen, keine weiteren Symbole
-                        # Bonus: kein weiterer Trigger für diese Gruppe/Symbolkombination
+                        group_deactivated = True
                     else:
                         log.warning(f"[AUTO-DEACT] Konnte Gruppe NICHT deaktivieren: profile={profile.get('name')} group_index={g_idx}")
 
-    log.info(f"Gesamt ausgelöste Gruppen (nach per-Run Dedupe): {len(triggered)}")
+    dt_total = (time.perf_counter() - t_start) * 1000.0
+    log.info(f"Gesamt ausgelöste Gruppen (nach per-Run Dedupe): {len(triggered)} — Laufzeit: {dt_total:.1f} ms")
     return triggered
 
 # -----------------------------------------------------------------------------

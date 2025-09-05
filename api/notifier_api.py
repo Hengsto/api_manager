@@ -22,7 +22,6 @@ from notifier.indicator_registry import REGISTERED, SIMPLE_SIGNALS
 
 router = APIRouter(prefix="/notifier")
 
-
 # ─────────────────────────────────────────────────────────────
 # Pfade robust normalisieren (str → Path)
 # ─────────────────────────────────────────────────────────────
@@ -106,29 +105,42 @@ def _normalize_slope_params_dict(p: Dict[str, Any] | None) -> Dict[str, Any]:
         out["base_params"] = nested
     return out
 
-# ▼▼▼ NEU: Deactivate-Mode Normalisierung
-_ALLOWED_DEACT = {"true", "any_true"}
+# ▼▼▼ Deactivate-Mode Normalisierung
+_ALLOWED_DEACT = {"always", "true", "any_true"}
 
 def _normalize_deactivate_value(v: Any) -> Optional[str]:
     """
-    Normalisiert UI/Legacy-Werte auf 'true' | 'any_true' | None.
-      - Strings: 'true'|'full'|'match' => 'true'
-                 'any_true'|'any'|'partial' => 'any_true'
-                 ''/None => None
-      - Bool: True => 'true', False/None => None
+    Normalisiert UI/Legacy-Werte auf 'always' | 'true' | 'any_true' | None.
+      - Strings:
+          'always'                   => 'always'
+          'true'|'full'|'match'      => 'true'
+          'any_true'|'any'|'partial' => 'any_true'
+          ''/None                    => None  (bewusst: keine Migration)
+      - Bool:
+          True  => 'true'
+          False => None
       - Sonst: None
     """
     if v is None:
         return None
     if isinstance(v, bool):
-        return "true" if v else None
+        out = "true" if v else None
+        print(f"[DEBUG] _normalize_deactivate_value(bool) -> {out}")
+        return out
     s = _trim_str(v).lower()
     if not s:
+        print(f"[DEBUG] _normalize_deactivate_value(empty) -> None")
         return None
+    if s == "always":
+        print(f"[DEBUG] _normalize_deactivate_value('always') -> 'always'")
+        return "always"
     if s in {"true", "full", "match"}:
+        print(f"[DEBUG] _normalize_deactivate_value('{s}') -> 'true'")
         return "true"
     if s in {"any_true", "any", "partial"}:
+        print(f"[DEBUG] _normalize_deactivate_value('{s}') -> 'any_true'")
         return "any_true"
+    print(f"[DEBUG] _normalize_deactivate_value('{s}') -> None (invalid)")
     return None
 
 # ─────────────────────────────────────────────────────────────
@@ -160,8 +172,8 @@ class GroupOut(ApiModel):
     name: str = ""
     telegram_bot_id: str = ""
     description: str = ""
-    # ▼▼▼ NEU
-    deactivate_on: Optional[Literal["true","any_true"]] = None
+    # unterstützt jetzt auch "always"
+    deactivate_on: Optional[Literal["always","true","any_true"]] = None
 
 class ProfileBaseOut(ApiModel):
     name: str
@@ -200,8 +212,8 @@ class GroupIn(ApiModel):
     name: str = ""
     telegram_bot_id: str = ""
     description: str = ""
-    # ▼▼▼ NEU
-    deactivate_on: Optional[Literal["true","any_true"]] = None
+    # unterstützt jetzt auch "always"
+    deactivate_on: Optional[Literal["always","true","any_true"]] = None
     auto_deactivate: Optional[bool] = None  # Legacy-Eingänge tolerieren
 
 class ProfileBaseIn(ApiModel):
@@ -224,7 +236,6 @@ _LOCK_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[DEBUG] Using external lock dir: {_LOCK_DIR}")
 
 def _lock_path(path: Path) -> Path:
-    # defensiv, falls mal was anderes reinkommt
     try:
         name = Path(path).name
     except Exception:
@@ -296,7 +307,6 @@ def save_json(path: Path, data: list):
     path = _to_path(path)
     payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
     tmp = path.with_suffix(path.suffix + ".tmp")
-    # evtl. altes tmp wegräumen
     try:
         if tmp.exists():
             tmp.unlink()
@@ -374,7 +384,7 @@ def _sanitize_condition(c: dict) -> dict:
             print(f"[DEBUG] sanitize_condition: drop legacy '{k}'")
             c.pop(k, None)
 
-    # right → String normieren (UI vergleicht Strings/Indicator-Namen)
+    # right → String normieren
     rv = c.get("right")
     if isinstance(rv, (int, float)):
         c["right"] = str(rv)
@@ -387,13 +397,12 @@ def _sanitize_condition(c: dict) -> dict:
     if not isinstance(c["left_params"], dict):  c["left_params"]  = {}
     if not isinstance(c["right_params"], dict): c["right_params"] = {}
 
-    # Slope-Params normalisieren (bp.* nach base_params, bp.* > base_params)
+    # Slope-Params normalisieren
     if _trim_str(c.get("left"), dash_to_empty=False).lower() == "slope":
         c["left_params"] = _normalize_slope_params_dict(c["left_params"])
     if _trim_str(c.get("right"), dash_to_empty=False).lower() == "slope":
         c["right_params"] = _normalize_slope_params_dict(c["right_params"])
 
-    # rid stabilisieren/kürzen
     rid = _trim_str(c.get("rid"))
     if not rid: rid = _rand_id()
     c["rid"] = rid
@@ -409,7 +418,7 @@ def _sanitize_group(g: dict) -> dict:
     g.setdefault("name", "")
     g.setdefault("telegram_bot_id", "")
     g.setdefault("description", "")
-    # ▼▼▼ NEU: Defaults für neue/legacy Felder
+    # ▼▼▼ Defaults für neue/legacy Felder
     if "deactivate_on" not in g:
         g["deactivate_on"] = None
     if "auto_deactivate" not in g:
@@ -443,7 +452,7 @@ def _sanitize_group(g: dict) -> dict:
             c["rid"] = _rand_id()
         seen.add(c["rid"])
 
-    # ▼▼▼ NEU: deactivate_on normalisieren (+ Legacy auto_deactivate)
+    # ▼▼▼ deactivate_on normalisieren (+ Legacy auto_deactivate)
     before_deact = g.get("deactivate_on")
     before_legacy = g.get("auto_deactivate")
     norm = _normalize_deactivate_value(before_deact)
@@ -530,7 +539,7 @@ def _merge_ids(old_p: dict, new_p: dict) -> dict:
     return new_p
 
 # ─────────────────────────────────────────────────────────────
-# Endpunkte
+# Endpunkte: PROFILES
 # ─────────────────────────────────────────────────────────────
 @router.get("/profiles", response_model=List[ProfileRead])
 def get_profiles():
@@ -615,7 +624,9 @@ def delete_profile(pid: str):
     save_json(PROFILES_NOTIFIER, profs)
     return {"status": "deleted", "id": pid}
 
-# Registry
+# ─────────────────────────────────────────────────────────────
+# Endpunkte: REGISTRY
+# ─────────────────────────────────────────────────────────────
 @router.get("/registry/indicators")
 def registry_indicators(
     scope: Optional[str] = Query(None, description="Filter: notifier|chart|backtest"),
@@ -689,3 +700,82 @@ def health():
         except FileNotFoundError:
             return {"exists": False, "size": 0, "mtime": None}
     return {"profiles": _stat(PROFILES_NOTIFIER), "alarms": _stat(ALARMS_NOTIFIER), "lock_dir": str(_LOCK_DIR)}
+
+# ─────────────────────────────────────────────────────────────
+# ALARMS: Modelle + Endpunkte (inkl. reason)
+# ─────────────────────────────────────────────────────────────
+class AlarmBase(ApiModel):
+    ts: str
+    profile_id: str
+    group_id: str
+    symbol: str
+    interval: str = ""
+    reason: str = ""
+    reason_code: str = ""
+    matched: List[Dict[str, Any]] = Field(default_factory=list)
+    deactivate_applied: Literal["", "true", "any_true"] = ""
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+class AlarmOut(AlarmBase):
+    id: str
+
+class AlarmIn(AlarmBase):
+    id: Optional[str] = None
+
+def _load_alarms() -> List[dict]:
+    data = load_json(ALARMS_NOTIFIER, [])
+    out = []
+    for a in data or []:
+        if not isinstance(a, dict):
+            continue
+        a.setdefault("id", _rand_id())
+        a.setdefault("ts", "")
+        a.setdefault("profile_id", "")
+        a.setdefault("group_id", "")
+        a.setdefault("symbol", "")
+        a.setdefault("interval", "")
+        a.setdefault("reason", "")
+        a.setdefault("reason_code", "")
+        a.setdefault("matched", [])
+        a.setdefault("deactivate_applied", "")
+        if a.get("deactivate_applied") not in {"", "true", "any_true"}:
+            a["deactivate_applied"] = ""
+        a.setdefault("meta", {})
+        out.append(a)
+    return out
+
+def _save_alarms(items: List[dict]) -> None:
+    save_json(ALARMS_NOTIFIER, items)
+
+@router.get("/alarms", response_model=List[AlarmOut])
+def list_alarms():
+    items = _load_alarms()
+    print(f"[DEBUG] GET /notifier/alarms -> {len(items)} items")
+    return items
+
+@router.post("/alarms", response_model=dict)
+def add_alarm(a: AlarmIn):
+    items = _load_alarms()
+    payload = model_to_dict(a)
+    aid = payload.get("id") or _rand_id()
+    payload["id"] = aid
+
+    # defensive Normalisierung
+    norm = _normalize_deactivate_value(payload.get("deactivate_applied"))
+    payload["deactivate_applied"] = norm if norm in {"", "true", "any_true"} else ""
+
+    print(f"[DEBUG] POST /notifier/alarms <- {json.dumps(payload, ensure_ascii=False)[:600]}...")
+    items.append(payload)
+    _save_alarms(items)
+    print(f"[DEBUG] POST /notifier/alarms -> saved id={aid} (total={len(items)})")
+    return {"status": "ok", "id": aid}
+
+@router.delete("/alarms/{aid}", response_model=dict)
+def delete_alarm(aid: str):
+    items = _load_alarms()
+    before = len(items)
+    items = [x for x in items if str(x.get("id")) != str(aid)]
+    _save_alarms(items)
+    after = len(items)
+    print(f"[DEBUG] DELETE /notifier/alarms/{aid} -> {(before-after)} removed")
+    return {"status": "deleted", "id": aid}
