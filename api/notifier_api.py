@@ -174,6 +174,8 @@ class GroupOut(ApiModel):
     description: str = ""
     # unterstützt jetzt auch "always"
     deactivate_on: Optional[Literal["always","true","any_true"]] = None
+    # ✨ NEU: Mindestanzahl konsekutiver True-Ticks bevor die Gruppe "feuert"
+    min_true_ticks: Optional[int] = None
 
 class ProfileBaseOut(ApiModel):
     name: str
@@ -215,6 +217,8 @@ class GroupIn(ApiModel):
     # unterstützt jetzt auch "always"
     deactivate_on: Optional[Literal["always","true","any_true"]] = None
     auto_deactivate: Optional[bool] = None  # Legacy-Eingänge tolerieren
+    # ✨ NEU: Mindestanzahl konsekutiver True-Ticks (optional)
+    min_true_ticks: Optional[int] = None
 
 class ProfileBaseIn(ApiModel):
     name: str
@@ -423,6 +427,9 @@ def _sanitize_group(g: dict) -> dict:
         g["deactivate_on"] = None
     if "auto_deactivate" not in g:
         g["auto_deactivate"] = None
+    # ✨ NEU: Default für min_true_ticks (Key immer vorhanden)
+    if "min_true_ticks" not in g:
+        g["min_true_ticks"] = None
 
     # Trim Strings
     for k in ("interval","exchange","name","telegram_bot_id","description"):
@@ -451,6 +458,21 @@ def _sanitize_group(g: dict) -> dict:
         if c["rid"] in seen:
             c["rid"] = _rand_id()
         seen.add(c["rid"])
+
+    # ✨ NEU: min_true_ticks robust normalisieren (Key IMMER behalten)
+    _raw_mtt = g.get("min_true_ticks", None)
+    _mtt: Optional[int] = None
+    try:
+        if _raw_mtt not in (None, "", "null"):
+            _mtt = int(_raw_mtt)
+    except Exception:
+        print(f"[DEBUG] _sanitize_group: invalid min_true_ticks={_raw_mtt!r} -> set None")
+        _mtt = None
+    if _mtt is not None and _mtt < 1:
+        print(f"[DEBUG] _sanitize_group: min_true_ticks={_mtt} < 1 -> set None")
+        _mtt = None
+    # WICHTIG: Key immer setzen, auch wenn None → erscheint in API
+    g["min_true_ticks"] = _mtt
 
     # ▼▼▼ deactivate_on normalisieren (+ Legacy auto_deactivate)
     before_deact = g.get("deactivate_on")
@@ -541,19 +563,40 @@ def _merge_ids(old_p: dict, new_p: dict) -> dict:
 # ─────────────────────────────────────────────────────────────
 # Endpunkte: PROFILES
 # ─────────────────────────────────────────────────────────────
-@router.get("/profiles", response_model=List[ProfileRead])
+@router.get(
+    "/profiles",
+    response_model=List[ProfileRead],
+    response_model_exclude_unset=False,
+    response_model_exclude_none=False
+)
 def get_profiles():
     data = load_json(PROFILES_NOTIFIER, [])
     sanitized = _sanitize_profiles(data)
     print(f"[DEBUG] get_profiles -> {len(sanitized)} profiles")
+    # Debug: zeig Keys der ersten Gruppe, falls vorhanden
+    try:
+        if sanitized and (sanitized[0].get("condition_groups") or []):
+            print(f"[DEBUG] get_profiles: first group keys -> {list((sanitized[0]['condition_groups'][0]).keys())}")
+    except Exception as e:
+        print(f"[DEBUG] get_profiles: keys debug failed: {e}")
     return sanitized
 
-@router.get("/profiles/{pid}", response_model=ProfileRead)
+@router.get(
+    "/profiles/{pid}",
+    response_model=ProfileRead,
+    response_model_exclude_unset=False,
+    response_model_exclude_none=False
+)
 def get_profile(pid: str):
     data = load_json(PROFILES_NOTIFIER, [])
     for p in _sanitize_profiles(data):
         if str(p.get("id")) == str(pid):
             print(f"[DEBUG] get_profile -> id={pid} found")
+            try:
+                if (p.get("condition_groups") or []):
+                    print(f"[DEBUG] get_profile: group keys -> {list((p['condition_groups'][0]).keys())}")
+            except Exception as e:
+                print(f"[DEBUG] get_profile: keys debug failed: {e}")
             return p
     print(f"[DEBUG] get_profile -> id={pid} not found")
     raise HTTPException(status_code=404, detail="Profil nicht gefunden")

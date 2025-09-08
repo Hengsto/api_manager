@@ -18,8 +18,12 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# WICHTIG: Gate importieren UND BENUTZEN
+from .gate import gate_and_build_triggers
+
+
 from config import NOTIFIER_ENDPOINT, PRICE_API_ENDPOINT
-# Optional: lokaler Profiles-Pfad, falls API-Write nicht geht
+# Optional: lokaler Profiles-Pfad, falls API-Write nicht geht (hier ungenutzt)
 try:
     from config import PROFILES_NOTIFIER  # type: ignore
 except Exception:
@@ -389,8 +393,11 @@ def _last_value_for_indicator(
             dedup.append(x)
             seen.add(x)
 
-    val, col = _pick_value_from_row(last, dedup)
+    # Timestamp holen, aber Wert aus "last"
     ts = last.get("Timestamp_ISO")
+
+    # Kolumnen nach Priorität durchsuchen
+    val, col = _pick_value_from_row(last, dedup)
     return val, col, ts
 
 # -----------------------------------------------------------------------------
@@ -409,14 +416,6 @@ def _numeric_or_none(x: Any) -> Optional[float]:
     except Exception:
         return None
 
-def _stable_event_key(profile_id: Any, group_index: int, symbol: str, interval: str) -> str:
-    payload = {"profile_id": profile_id, "group_index": group_index, "symbol": symbol, "interval": interval}
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
-
-def _stable_event_id(profile_id: Any, group_index: int, symbol: str, interval: str) -> str:
-    raw = _stable_event_key(profile_id, group_index, symbol, interval)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
 
@@ -424,112 +423,45 @@ def _safe_max_iso(ts_list: List[Optional[str]], fallback: Optional[str] = None) 
     vals = [t for t in ts_list if isinstance(t, str) and t]
     if not vals:
         return fallback
-    # ISO-8601 ist lexikographisch vergleichbar, wenn Format konsistent ist
     try:
         return max(vals)
     except Exception:
         return fallback
 
-# ---- Auto-Deactivate ---------------------------------------------------------
-def _normalize_deactivate_mode(group: Dict[str, Any]) -> Optional[str]:
+def _normalize_notify_mode(group: Dict[str, Any]) -> str:
     """
-    Returns: "true", "any_true", or None
-    Accepts aliases:
-      - true:  "true", "full", "match"
-      - any:   "any_true", "any", "partial"
+    Mappt UI-Feld deactivate_on auf Notify-Modus.
+    Semantik:
+      - "always"  => wie "true" behandeln (nur FULL zählt), aber Gruppe bleibt aktiv (wir deaktivieren nie)
+      - "true"    => nur FULL benachrichtigen
+      - "any_true"=> bereits bei PARTIAL (mind. 1 Bedingung) benachrichtigen
+    Rückgabe: "always" | "true" | "any_true"
     """
     val = group.get("deactivate_on")
     if val is None:
-        if group.get("auto_deactivate") is True:
+        # Legacy: auto_deactivate == True ⇒ "true", sonst "always"
+        if group.get("auto_deactivate"):
             return "true"
-        return None
+        return "always"
     s = str(val).strip().lower()
+    if s in {"always"}:
+        return "always"
     if s in {"true", "full", "match"}:
         return "true"
     if s in {"any_true", "any", "partial"}:
         return "any_true"
-    return None
+    # Fallback sicher: always
+    return "always"
 
-def _should_deactivate_group(group: Dict[str, Any], cond_details: List[Dict[str, Any]], group_ok: bool) -> Tuple[bool, str]:
-    mode = _normalize_deactivate_mode(group)
-    if not mode:
-        return False, ""
-    if mode == "true":
-        return (True, "group_true") if group_ok else (False, "")
-    # any_true
-    any_true = any(bool(c.get("result")) for c in cond_details)
-    return (True, "any_true") if any_true else (False, "")
-
-def _api_update_group_active(profile: Dict[str, Any], group_index: int, active: bool, reason: str) -> bool:
+def _min_true_ticks_of(group: Dict[str, Any]) -> Optional[int]:
+    v = group.get("min_true_ticks")
+    if v in (None, "", "null"):
+        return None
     try:
-        pid = profile.get("id")
-        if not pid:
-            return False
-        # Profil-Kopie modifizieren
-        p2 = json.loads(json.dumps(profile))
-        groups = p2.get("condition_groups") or []
-        if not (0 <= group_index < len(groups)):
-            return False
-        g = groups[group_index]
-        g["active"] = active
-        g["deactivated_at"] = _now_iso()
-        g["deactivated_reason"] = reason
-
-        url = f"{NOTIFIER_ENDPOINT}/profiles/{pid}"
-        _http_put_json(url, p2)
-        return True
-    except Exception as e:
-        log.debug(f"[AUTO-DEACT] API-Update fehlgeschlagen: {e}")
-        return False
-
-def _local_file_update_group_active(profile_id: Any, group_index: int, active: bool, reason: str) -> bool:
-    try:
-        path = PROFILES_NOTIFIER  # type: ignore[name-defined]
+        i = int(v)
+        return i if i >= 1 else 1
     except Exception:
-        path = None
-    if not path:
-        return False
-    path = Path(path)
-    if not path.exists():
-        return False
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            return False
-        changed = False
-        for p in data:
-            if p.get("id") == profile_id:
-                groups = p.get("condition_groups") or []
-                if 0 <= group_index < len(groups):
-                    g = groups[group_index]
-                    g["active"] = active
-                    g["deactivated_at"] = _now_iso()
-                    g["deactivated_reason"] = reason
-                    changed = True
-                break
-        if not changed:
-            return False
-        tmp = path.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        tmp.replace(path)
-        return True
-    except Exception as e:
-        log.debug(f"[AUTO-DEACT] Local file update failed: {e}")
-        return False
-
-def _deactivate_group(profile: Dict[str, Any], group_index: int, reason: str) -> bool:
-    ok = _api_update_group_active(profile, group_index, active=False, reason=reason)
-    if ok:
-        log.info(f"[AUTO-DEACT] Gruppe deaktiviert (API): profile={profile.get('name')} group_index={group_index} reason={reason}")
-        return True
-    ok = _local_file_update_group_active(profile.get("id"), group_index, active=False, reason=reason)
-    if ok:
-        log.info(f"[AUTO-DEACT] Gruppe deaktiviert (local file): profile={profile.get('name')} group_index={group_index} reason={reason}")
-        return True
-    log.warning(f"[AUTO-DEACT] Deaktivierung fehlgeschlagen: profile={profile.get('name')} group_index={group_index}")
-    return False
+        return None
 
 # -----------------------------------------------------------------------------
 # Condition-Evaluation
@@ -686,14 +618,21 @@ def _eval_group_for_symbol(
     group: Dict[str, Any],
     symbol: str,
     group_index: int
-) -> Tuple[bool, List[Dict[str, Any]]]:
+) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
+    """
+    Returns:
+      status ∈ {"FULL","PARTIAL","NONE"}
+      cond_details
+      bar_ts (max Timestamp_ISO aus den beteiligten Reihen)
+    """
     t0 = time.perf_counter()
     conditions: List[Dict[str, Any]] = group.get("conditions") or []
     main_interval = (group.get("interval") or "").strip()
     if not main_interval:
-        return False, []
+        return "NONE", [], None
 
     group_result: Optional[bool] = None
+    any_true: bool = False
     per_details: List[Dict[str, Any]] = []
 
     for idx, cond in enumerate(conditions):
@@ -701,26 +640,52 @@ def _eval_group_for_symbol(
         details["idx"] = idx
         per_details.append(details)
 
+        any_true = any_true or bool(res)
+
         if group_result is None:
             group_result = res
         else:
             logic = (cond.get("logic") or "and").strip().lower()
             group_result = (group_result or res) if logic == "or" else (group_result and res)
 
+    # Status ableiten
+    if bool(group_result):
+        status = "FULL"
+    elif any_true:
+        status = "PARTIAL"
+    else:
+        status = "NONE"
+
+    # Bar-TS aus Details ziehen
+    ts_candidates: List[Optional[str]] = []
+    try:
+        if per_details:
+            # first left ts
+            lts = per_details[0].get("left", {}).get("ts")
+            if lts: ts_candidates.append(lts)
+            for d in per_details:
+                rts = d.get("right", {}).get("ts")
+                if rts: ts_candidates.append(rts)
+    except Exception:
+        pass
+    bar_ts = _safe_max_iso(ts_candidates, fallback=None)
+
     dt = (time.perf_counter() - t0) * 1000.0
     if DEBUG_VALUES:
-        log.debug(f"[GROUP] {profile.get('name')}[{group_index}] {symbol}@{main_interval} -> {bool(group_result)} "
+        log.debug(f"[GROUP] {profile.get('name')}[{group_index}] {symbol}@{main_interval} -> {status} "
                   f"(conds={len(conditions)}, {dt:.1f} ms)")
-    return bool(group_result), per_details
+    return status, per_details, bar_ts
 
 # -----------------------------------------------------------------------------
 # Top-Level: run_check
 # -----------------------------------------------------------------------------
 def run_check() -> List[Dict[str, Any]]:
     """
-    Evaluator mit optionalem Auto-Deaktivieren je Gruppe:
-      - deactivate_on: "true"|"any_true" (oder Aliase)
-      - bei Erfolg: Gruppe -> active:false (per API oder lokal), Break weiterer Symbole
+    Evaluator ohne Auto-Deaktivierung.
+    - Ermittelt je Gruppe+Symbol den Status: FULL / PARTIAL / NONE
+    - Baut EVAL-Events (inkl. deactivate_on, min_true_ticks)
+    - Übergibt an gate_and_build_triggers (Streak-Gate pro Modus)
+    - Gibt die fertigen Trigger-Payloads zurück (für Alarm-Checker)
     """
     _INDICATOR_CACHE.clear()
 
@@ -737,8 +702,7 @@ def run_check() -> List[Dict[str, Any]]:
         log.error(f"⚠️ Fehler beim Laden der Indikator-Metadaten: {e}")
         return []
 
-    triggered: List[Dict[str, Any]] = []
-    seen_run_keys: Set[str] = set()
+    evals: List[Dict[str, Any]] = []
     now_iso = _now_iso()
 
     for p_idx, profile in enumerate(profiles):
@@ -756,68 +720,49 @@ def run_check() -> List[Dict[str, Any]]:
             if not symbols or not main_interval:
                 continue
 
-            group_deactivated = False  # Break-Schutz nach Deaktivierung
+            notify_mode = _normalize_notify_mode(group)  # "always" | "true" | "any_true"
+            min_ticks = _min_true_ticks_of(group)  # None => im Gate 1
 
             for sym in symbols:
-                if group_deactivated:
-                    break
+                status, cond_details, bar_ts = _eval_group_for_symbol(meta, profile, group, sym, g_idx)
 
-                group_ok, cond_details = _eval_group_for_symbol(meta, profile, group, sym, g_idx)
+                # Live-Event bauen (geht an Gate)
+                ev = {
+                    "profile_id":   profile.get("id"),
+                    "profile_name": profile.get("name"),
+                    "group_index":  g_idx,
+                    "group_name":   group.get("name") or f"group_{g_idx}",
+                    "symbol":       sym,
+                    "interval":     main_interval,
+                    "exchange":     group.get("exchange") or None,
+                    "telegram_bot_id": group.get("telegram_bot_id") or None,
+                    "telegram_bot_token": group.get("telegram_bot_token") or None,
+                    "telegram_chat_id": group.get("telegram_chat_id") or None,
+                    "description":  group.get("description") or None,
+                    "ts":           now_iso,
+                    "bar_ts":       bar_ts or now_iso,
+                    "status":       status,                 # "FULL" | "PARTIAL" | "NONE"
+                    "deactivate_on": notify_mode,           # UI-Feld, hier als Notify-Mode interpretiert
+                    "min_true_ticks": min_ticks,            # None ⇒ Gate nutzt 1
+                    "conditions":   cond_details,
+                }
+                if DEBUG_VALUES:
+                    log.debug(f"[EVAL-ROW] {ev['profile_name']}/{ev['group_name']}/{sym}@{main_interval} status={status} "
+                              f"mode={notify_mode} mtt={min_ticks}")
 
-                # Bar TS bestimmen
-                ts_candidates: List[Optional[str]] = []
-                try:
-                    left_ts = cond_details[0].get("left", {}).get("ts") if cond_details else None
-                    if left_ts:
-                        ts_candidates.append(left_ts)
-                    for d in cond_details:
-                        rts = d.get("right", {}).get("ts")
-                        if rts:
-                            ts_candidates.append(rts)
-                except Exception:
-                    pass
-                bar_ts = _safe_max_iso(ts_candidates, fallback=now_iso) or now_iso
+                evals.append(ev)
 
-                # Trigger handling
-                if group_ok:
-                    key_raw = _stable_event_key(profile.get("id"), g_idx, sym, main_interval)
-                    if key_raw in seen_run_keys:
-                        continue
-                    seen_run_keys.add(key_raw)
-
-                    alarm_id = _stable_event_id(profile.get("id"), g_idx, sym, main_interval)
-                    payload = {
-                        "alarm_id": alarm_id,
-                        "ts": now_iso,
-                        "bar_ts": bar_ts,
-                        "profile_id": profile.get("id"),
-                        "profile_name": profile.get("name"),
-                        "group_index": g_idx,
-                        "group_name": group.get("name") or f"group_{g_idx}",
-                        "symbol": sym,
-                        "interval": main_interval,
-                        "exchange": group.get("exchange") or None,
-                        "telegram_bot_id": group.get("telegram_bot_id") or None,
-                        "telegram_bot_token": group.get("telegram_bot_token") or None,
-                        "telegram_chat_id": group.get("telegram_chat_id") or None,
-                        "description": group.get("description") or None,
-                        "conditions": cond_details,
-                        "result": True,
-                    }
-                    triggered.append(payload)
-                    log.info(f"✅ Gruppe erfüllt: {profile.get('name')} / {payload['group_name']} / {sym} ({main_interval}) [alarm_id={alarm_id[:12]}]")
-
-                # Auto-Deactivate?
-                should_deact, reason = _should_deactivate_group(group, cond_details, group_ok)
-                if should_deact:
-                    ok = _deactivate_group(profile, g_idx, reason=reason)
-                    if ok:
-                        group_deactivated = True
-                    else:
-                        log.warning(f"[AUTO-DEACT] Konnte Gruppe NICHT deaktivieren: profile={profile.get('name')} group_index={g_idx}")
+    # Gate anwenden (Streak + Modus-Logik)
+    triggered = gate_and_build_triggers(evals)
 
     dt_total = (time.perf_counter() - t_start) * 1000.0
-    log.info(f"Gesamt ausgelöste Gruppen (nach per-Run Dedupe): {len(triggered)} — Laufzeit: {dt_total:.1f} ms")
+    log.info(f"Evals={len(evals)} → Trigger={len(triggered)} — Laufzeit: {dt_total:.1f} ms")
+    if triggered and DEBUG_VALUES:
+        try:
+            # Nur Kopf zeigen
+            log.debug(json.dumps(triggered[:2], ensure_ascii=False, indent=2))
+        except Exception:
+            pass
     return triggered
 
 # -----------------------------------------------------------------------------
@@ -830,6 +775,6 @@ def run_evaluator() -> None:
     except Exception as e:
         print(f"💥 Fatal: {e}")
         return
-    print(f"✅ {len(res)} Gruppe(n) erfüllt.")
+    print(f"✅ {len(res)} Trigger(s) generiert.")
     if DEBUG_VALUES and res:
         print(json.dumps(res[:3], indent=2, ensure_ascii=False))

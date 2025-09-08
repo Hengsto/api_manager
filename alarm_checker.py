@@ -59,9 +59,11 @@ def _alarm_key(alarm: Dict[str, Any]) -> str:
         "group_name": alarm.get("group_name"),
         "symbol": alarm.get("symbol"),
         "interval": alarm.get("interval"),
+        "status": (alarm.get("status") or "FULL"),  # PARTIAL/FULL getrennt dedupen
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
 
 def _is_cooled_down(state: Dict[str, float], key: str, now: float) -> bool:
     last = state.get(key, 0.0)
@@ -234,6 +236,11 @@ def format_alarm_message(alarm: Dict[str, Any]) -> str:
     desc    = alarm.get("description") or ""
     ts      = alarm.get("ts") or ""
 
+    status = (alarm.get("status") or "").upper()  # "FULL" | "PARTIAL" | ""
+    mode   = (alarm.get("notify_mode") or "").lower()  # "true" | "any_true" | "always"
+    streak = alarm.get("streak")
+    mtt    = alarm.get("min_true_ticks")
+
     header = (
         "🚨 *Alarm ausgelöst*\n"
         f"*Profil:* {profile}\n"
@@ -242,8 +249,13 @@ def format_alarm_message(alarm: Dict[str, Any]) -> str:
         f"*Intervall:* {iv}"
         f"{('  \n*Börse:* ' + exch) if exch else ''}"
         f"{('  \n' + desc) if desc else ''}\n"
+        f"*Status:* {status or '—'}"
+        f"{('  ·  Modus: ' + mode) if mode else ''}"
+        f"{('  ·  Streak: ' + str(streak)) if isinstance(streak, (int,float)) else ''}"
+        f"{('  ·  MinTicks: ' + str(mtt)) if mtt else ''}\n"
         f"*Zeit:* {ts}"
     )
+
 
     lines: List[str] = []
     for c in (alarm.get("conditions") or []):
