@@ -16,8 +16,20 @@ import tempfile
 import hashlib
 import random
 import string
+from datetime import datetime, timezone
 
 from config import PROFILES_NOTIFIER as _PROFILES_NOTIFIER_CFG, ALARMS_NOTIFIER as _ALARMS_NOTIFIER_CFG
+
+# ✨ NEU: optionale Pfade für Overrides/Commands (Fallbacks, wenn nicht in config definiert)
+try:
+    from config import OVERRIDES_NOTIFIER as _OVERRIDES_NOTIFIER_CFG  # optional
+except Exception:
+    _OVERRIDES_NOTIFIER_CFG = None
+try:
+    from config import COMMANDS_NOTIFIER as _COMMANDS_NOTIFIER_CFG  # optional
+except Exception:
+    _COMMANDS_NOTIFIER_CFG = None
+
 from notifier.indicator_registry import REGISTERED, SIMPLE_SIGNALS
 
 router = APIRouter(prefix="/notifier")
@@ -33,17 +45,27 @@ def _to_path(p: Any) -> Path:
 PROFILES_NOTIFIER: Path = _to_path(_PROFILES_NOTIFIER_CFG)
 ALARMS_NOTIFIER:   Path = _to_path(_ALARMS_NOTIFIER_CFG)
 
+# ✨ NEU: Overrides/Commands Pfade (Fallback neben PROFILES_NOTIFIER)
+_OVERRIDES_FALLBACK = PROFILES_NOTIFIER.parent / "notifier_overrides.json"
+_COMMANDS_FALLBACK  = PROFILES_NOTIFIER.parent / "notifier_commands.json"
+OVERRIDES_NOTIFIER: Path = _to_path(_OVERRIDES_NOTIFIER_CFG) if _OVERRIDES_NOTIFIER_CFG else _OVERRIDES_FALLBACK
+COMMANDS_NOTIFIER:  Path = _to_path(_COMMANDS_NOTIFIER_CFG)  if _COMMANDS_NOTIFIER_CFG  else _COMMANDS_FALLBACK
+
 # ─────────────────────────────────────────────────────────────
 # Verzeichnisse
 # ─────────────────────────────────────────────────────────────
 try:
     PROFILES_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
     ALARMS_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
+    OVERRIDES_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
+    COMMANDS_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
 except Exception as _mkerr:
     print(f"💥 mkdir for JSON dirs failed: {_mkerr}")
 
 print(f"[DEBUG] Profiles path: {PROFILES_NOTIFIER}")
 print(f"[DEBUG] Alarms   path: {ALARMS_NOTIFIER}")
+print(f"[DEBUG] Overrides path: {OVERRIDES_NOTIFIER}")
+print(f"[DEBUG] Commands  path: {COMMANDS_NOTIFIER}")
 
 def _is_relative_to(p: Path, base: Path) -> bool:
     try:
@@ -91,6 +113,9 @@ def _trim_str(x: Any, dash_to_empty: bool = True) -> str:
 
 def _sha256_bytes(b: bytes) -> str:
     h = hashlib.sha256(); h.update(b); return h.hexdigest()
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 # Slope-Params: bp.* in base_params heben (bp.* hat Vorrang)
 def _normalize_slope_params_dict(p: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -229,6 +254,10 @@ class ProfileCreate(ProfileBaseIn):
     id: Optional[str] = None
 
 class ProfileUpdate(ProfileBaseIn):
+    # ✨ NEU: Master-Reset Flags tolerieren (Variante B)
+    active: Optional[bool] = None  # tolerieren, wird zu enabled gemappt
+    activate: Optional[bool] = None
+    rebaseline: Optional[bool] = None
     pass
 
 # ─────────────────────────────────────────────────────────────
@@ -340,6 +369,58 @@ def save_json(path: Path, data: list):
             except Exception as e:
                 print(f"[DEBUG] dir fsync skipped: {e}")
         print(f"[DEBUG] save_json -> {path} ({len(data)} items)")
+    except Exception as e:
+        print(f"💥 Fehler beim Schreiben {path}: {e}")
+        try:
+            if tmp.exists(): tmp.unlink()
+        except Exception: pass
+        raise
+
+# ✨ NEU: Dict-Wurzel IO (Overrides/Commands)
+def load_json_any(path: Path, fallback: Any) -> Any:
+    path = _to_path(path)
+    if not path.exists():
+        print(f"[DEBUG] load_json_any -> {path} not found; returning fallback")
+        return deepcopy(fallback)
+    try:
+        txt = path.read_text(encoding="utf-8")
+        data = json.loads(txt)
+        print(f"[DEBUG] load_json_any <- {path} (type={type(data).__name__})")
+        return data
+    except Exception as e:
+        print(f"⚠️ Fehler beim Lesen {path}: {e}")
+        return deepcopy(fallback)
+
+def save_json_any(path: Path, data: Any):
+    path = _to_path(path)
+    payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        if tmp.exists():
+            tmp.unlink()
+    except Exception as e:
+        print(f"[DEBUG] tmp unlink failed (pre): {e}")
+    try:
+        if path.exists():
+            try:
+                cur = path.read_bytes()
+                if len(cur) == len(payload) and _sha256_bytes(cur) == _sha256_bytes(payload):
+                    print(f"[DEBUG] save_json_any -> SKIP (content unchanged) {path}")
+                    return
+            except Exception as e:
+                print(f"[DEBUG] save_json_any compare failed ({e}); continue write")
+        with FileLock(path):
+            with open(tmp, "wb") as f:
+                f.write(payload); f.flush(); os.fsync(f.fileno())
+            os.replace(tmp, path)
+            try:
+                if hasattr(os, "O_DIRECTORY"):
+                    dfd = os.open(str(path.parent), os.O_DIRECTORY)
+                    try: os.fsync(dfd)
+                    finally: os.close(dfd)
+            except Exception as e:
+                print(f"[DEBUG] dir fsync skipped: {e}")
+        print(f"[DEBUG] save_json_any -> {path}")
     except Exception as e:
         print(f"💥 Fehler beim Schreiben {path}: {e}")
         try:
@@ -561,6 +642,56 @@ def _merge_ids(old_p: dict, new_p: dict) -> dict:
     return new_p
 
 # ─────────────────────────────────────────────────────────────
+# ✨ NEU: Overrides + Commands Helpers
+# ─────────────────────────────────────────────────────────────
+_OVR_TEMPLATE: Dict[str, Dict[str, Dict[str, Any]]] = {"overrides": {}, "updated_ts": None}
+_CMD_TEMPLATE: Dict[str, List[Dict[str, Any]]] = {"queue": []}
+
+def _load_overrides() -> Dict[str, Any]:
+    data = load_json_any(OVERRIDES_NOTIFIER, deepcopy(_OVR_TEMPLATE))
+    if not isinstance(data, dict) or "overrides" not in data:
+        print("[DEBUG] _load_overrides: coercing to template")
+        data = deepcopy(_OVR_TEMPLATE)
+    if "overrides" not in data: data["overrides"] = {}
+    return data
+
+def _save_overrides(data: Dict[str, Any]) -> None:
+    data = deepcopy(data)
+    data["updated_ts"] = _now_iso()
+    save_json_any(OVERRIDES_NOTIFIER, data)
+
+def _ensure_ovr_slot(ovr: Dict[str, Any], pid: str, gid: str) -> Dict[str, Any]:
+    ovr.setdefault("overrides", {})
+    ovr["overrides"].setdefault(pid, {})
+    ovr["overrides"][pid].setdefault(gid, {"forced_off": False, "snooze_until": None, "note": None})
+    return ovr["overrides"][pid][gid]
+
+def _load_commands() -> Dict[str, Any]:
+    data = load_json_any(COMMANDS_NOTIFIER, deepcopy(_CMD_TEMPLATE))
+    if not isinstance(data, dict) or "queue" not in data:
+        print("[DEBUG] _load_commands: coercing to template")
+        data = deepcopy(_CMD_TEMPLATE)
+    if "queue" not in data: data["queue"] = []
+    return data
+
+def _save_commands(data: Dict[str, Any]) -> None:
+    save_json_any(COMMANDS_NOTIFIER, data)
+
+def _enqueue_command(pid: str, gid: str, rearm: bool = True, rebaseline: bool = False) -> None:
+    cmds = _load_commands()
+    item = {
+        "profile_id": pid,
+        "group_id": gid,
+        "rearm": bool(rearm),
+        "rebaseline": bool(rebaseline),
+        "ts": _now_iso(),
+        "id": _rand_id(8),
+    }
+    print(f"[DEBUG] _enqueue_command -> {item}")
+    cmds["queue"].append(item)
+    _save_commands(cmds)
+
+# ─────────────────────────────────────────────────────────────
 # Endpunkte: PROFILES
 # ─────────────────────────────────────────────────────────────
 @router.get(
@@ -626,6 +757,14 @@ def update_profile(pid: str, p: ProfileUpdate):
     profs = load_json(PROFILES_NOTIFIER, [])
     incoming = model_to_dict(p)
 
+    # ✨ NEU: Toleranz für active/enabled (Map auf enabled)
+    if "active" in incoming and "enabled" not in incoming:
+        incoming["enabled"] = bool(incoming.get("active"))
+        print(f"[DEBUG] update_profile: mapped active->{incoming['enabled']} for id={pid}")
+
+    activate_flag   = bool(incoming.get("activate", False))
+    rebaseline_flag = bool(incoming.get("rebaseline", False))
+
     # sanitize tolerant
     new_groups = []
     for g in incoming.get("condition_groups", []) or []:
@@ -636,23 +775,76 @@ def update_profile(pid: str, p: ProfileUpdate):
     if idx is None:
         raise HTTPException(status_code=404, detail="Profil nicht gefunden")
 
+    # Vorherzustand normalisieren (für Compare + Toggle-Erkennung)
+    before_norm = _sanitize_profiles([profs[idx]])[0]
+    before_enabled = bool(before_norm.get("enabled", True))
+
     incoming["id"] = pid
 
     # IDs mergen (vor Compare, damit Stabilität erhalten bleibt)
-    old_norm = _sanitize_profiles([profs[idx]])[0]
-    merged   = _merge_ids(old_norm, deepcopy(incoming))
+    merged   = _merge_ids(before_norm, deepcopy(incoming))
+    after_norm = _sanitize_profiles([merged])[0]
+    after_enabled = bool(after_norm.get("enabled", True))
 
-    old_norm_json = json.dumps(old_norm, sort_keys=True, ensure_ascii=False)
-    new_norm_json = json.dumps(_sanitize_profiles([merged])[0], sort_keys=True, ensure_ascii=False)
-
-    if old_norm_json == new_norm_json:
+    # Short-circuit wenn nichts geändert
+    if json.dumps(before_norm, sort_keys=True, ensure_ascii=False) == json.dumps(after_norm, sort_keys=True, ensure_ascii=False):
         print(f"[DEBUG] update_profile -> NO CHANGE (skip save) id={pid}")
-        return {"status": "ok", "id": pid}  # wichtig: 'ok' für UI
+        # selbst wenn kein Profilsave, kann activate_flag gesetzt sein → Routine dennoch ausführen
+        if activate_flag or (not before_enabled and after_enabled):
+            print(f"[DEBUG] update_profile -> run activation routine (no profile change) id={pid}")
+            _run_activation_routine(after_norm, activate_flag=True, rebaseline=rebaseline_flag)
+        return {"status": "ok", "id": pid}
 
-    profs[idx] = merged
+    # Persistiere Profil
+    profs[idx] = after_norm
     save_json(PROFILES_NOTIFIER, profs)
     print(f"[DEBUG] update_profile -> updated id={pid}")
+
+    # ✨ NEU: Aktivierungs-Routine nur, wenn aktiviert wurde (Flag ODER false→true)
+    should_activate = activate_flag or (not before_enabled and after_enabled)
+    if should_activate:
+        print(f"[DEBUG] update_profile -> run activation routine id={pid} (activate={activate_flag}, rebaseline={rebaseline_flag})")
+        _run_activation_routine(after_norm, activate_flag=True, rebaseline=rebaseline_flag)
+
     return {"status": "updated", "id": pid}
+
+def _run_activation_routine(profile_obj: dict, activate_flag: bool, rebaseline: bool) -> None:
+    """
+    Aktiviert alle 'aktiven' Gruppen des Profils deterministisch:
+      - overrides: forced_off=false, snooze_until=null
+      - commands: enqueue rearm(+rebaseline)
+    """
+    pid = str(profile_obj.get("id"))
+    ovr = _load_overrides()
+    groups = profile_obj.get("condition_groups") or []
+    changed = 0
+    enq = 0
+
+    for g in groups:
+        gid = str(g.get("gid") or "")
+        if not gid:
+            continue
+        if not bool(g.get("active", True)):
+            print(f"[DEBUG] activation: skip group gid={gid} (inactive)")
+            continue
+
+        slot = _ensure_ovr_slot(ovr, pid, gid)
+        # Setze nur, wenn sich was ändert → weniger Writes
+        if slot.get("forced_off", False) or (slot.get("snooze_until") is not None):
+            print(f"[DEBUG] activation: clear overrides pid={pid} gid={gid} (forced_off->False, snooze_until->None)")
+        slot["forced_off"] = False
+        slot["snooze_until"] = None
+        changed += 1
+
+        # enqueue command (idempotent genug auf Evaluator-Seite; hier nicht dedupen)
+        _enqueue_command(pid, gid, rearm=True, rebaseline=rebaseline)
+        enq += 1
+
+    # Schreibe Overrides nur, wenn sich Slots berührt haben
+    if changed > 0:
+        _save_overrides(ovr)
+        print(f"[DEBUG] activation: overrides saved (changed groups={changed})")
+    print(f"[DEBUG] activation: commands enqueued={enq} (rebaseline={rebaseline}) for profile id={pid}")
 
 @router.delete("/profiles/{pid}", response_model=dict)
 def delete_profile(pid: str):
@@ -742,7 +934,13 @@ def health():
             st = _to_path(p).stat(); return {"exists": True, "size": st.st_size, "mtime": st.st_mtime}
         except FileNotFoundError:
             return {"exists": False, "size": 0, "mtime": None}
-    return {"profiles": _stat(PROFILES_NOTIFIER), "alarms": _stat(ALARMS_NOTIFIER), "lock_dir": str(_LOCK_DIR)}
+    return {
+        "profiles": _stat(PROFILES_NOTIFIER),
+        "alarms": _stat(ALARMS_NOTIFIER),
+        "overrides": _stat(OVERRIDES_NOTIFIER),
+        "commands": _stat(COMMANDS_NOTIFIER),
+        "lock_dir": str(_LOCK_DIR)
+    }
 
 # ─────────────────────────────────────────────────────────────
 # ALARMS: Modelle + Endpunkte (inkl. reason)
@@ -822,3 +1020,47 @@ def delete_alarm(aid: str):
     after = len(items)
     print(f"[DEBUG] DELETE /notifier/alarms/{aid} -> {(before-after)} removed")
     return {"status": "deleted", "id": aid}
+
+# ─────────────────────────────────────────────────────────────
+# ✨ NEU: Overrides & Commands Endpunkte
+# ─────────────────────────────────────────────────────────────
+@router.get("/overrides", response_model=Dict[str, Any])
+def get_overrides():
+    ovr = _load_overrides()
+    print(f"[DEBUG] GET /notifier/overrides -> profiles={len(ovr.get('overrides', {}))}")
+    return ovr
+
+class OverridePatch(ApiModel):
+    forced_off: Optional[bool] = None
+    snooze_until: Optional[Union[str, None]] = None
+    note: Optional[str] = None
+
+@router.patch("/overrides/{profile_id}/{group_id}", response_model=dict)
+def patch_override(profile_id: str, group_id: str, body: OverridePatch):
+    ovr = _load_overrides()
+    slot = _ensure_ovr_slot(ovr, profile_id, group_id)
+    payload = model_to_dict(body)
+    print(f"[DEBUG] PATCH overrides <- pid={profile_id} gid={group_id} {payload}")
+
+    if "forced_off" in payload and payload["forced_off"] is not None:
+        slot["forced_off"] = bool(payload["forced_off"])
+    if "snooze_until" in payload:
+        slot["snooze_until"] = payload["snooze_until"]  # ISO8601 oder None (UI entscheidet)
+    if "note" in payload and payload["note"] is not None:
+        slot["note"] = str(payload["note"])
+
+    _save_overrides(ovr)
+    print(f"[DEBUG] PATCH overrides -> saved pid={profile_id} gid={group_id}")
+    return {"status": "ok", "profile_id": profile_id, "group_id": group_id}
+
+class CommandPost(ApiModel):
+    rearm: Optional[bool] = True
+    rebaseline: Optional[bool] = False
+
+@router.post("/overrides/{profile_id}/{group_id}/commands", response_model=dict)
+def post_command(profile_id: str, group_id: str, body: CommandPost):
+    pb = model_to_dict(body)
+    rearm = bool(pb.get("rearm", True))
+    rebaseline = bool(pb.get("rebaseline", False))
+    _enqueue_command(profile_id, group_id, rearm=rearm, rebaseline=rebaseline)
+    return {"status": "ok", "profile_id": profile_id, "group_id": group_id, "rearm": rearm, "rebaseline": rebaseline}

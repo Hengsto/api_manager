@@ -13,6 +13,9 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 # ⬇️ wichtig: Empfänger-Liste wie beim Watcher verwenden
 from notifier.telegram_client import recipients_from_config
 
+# ✨ NEU: API-Endpoint für Persistenz/Overrides
+from config import NOTIFIER_ENDPOINT
+
 # -----------------------------------------------------------------------------
 # Einstellungen
 # -----------------------------------------------------------------------------
@@ -271,6 +274,128 @@ def format_alarm_message(alarm: Dict[str, Any]) -> str:
     return text
 
 # -----------------------------------------------------------------------------
+# ✨ NEU: API-Helpers (Persistenz + Overrides)
+# -----------------------------------------------------------------------------
+def _http_post_json(url: str, payload: Dict[str, Any], timeout: float = 10.0, tries: int = 3) -> Optional[Dict[str, Any]]:
+    last_err: Optional[Exception] = None
+    for i in range(max(1, tries)):
+        try:
+            if DEBUG:
+                print(f"[DEBUG] HTTP POST {url} try {i+1}/{tries}")
+            r = requests.post(url, json=payload, timeout=timeout)
+            if r.status_code >= 500:
+                if DEBUG: print(f"[DEBUG] HTTP 5xx: {r.status_code} {r.text[:200]}")
+                time.sleep(0.5 * (i + 1)); continue
+            if r.status_code == 429:
+                ra = int(r.headers.get("Retry-After", "1"))
+                if DEBUG: print(f"[DEBUG] HTTP 429 Retry-After={ra}")
+                time.sleep(ra + 0.5); continue
+            r.raise_for_status()
+            return r.json() if r.text else {}
+        except Exception as e:
+            last_err = e
+            if DEBUG: print(f"[DEBUG] HTTP POST exception: {e}")
+            time.sleep(0.5 * (i + 1))
+    if DEBUG:
+        print(f"[DEBUG] HTTP POST failed after retries: {last_err}")
+    return None
+
+def _http_patch_json(url: str, payload: Dict[str, Any], timeout: float = 10.0, tries: int = 3) -> Optional[Dict[str, Any]]:
+    last_err: Optional[Exception] = None
+    for i in range(max(1, tries)):
+        try:
+            if DEBUG:
+                print(f"[DEBUG] HTTP PATCH {url} try {i+1}/{tries}")
+            r = requests.patch(url, json=payload, timeout=timeout)
+            if r.status_code >= 500:
+                if DEBUG: print(f"[DEBUG] HTTP 5xx: {r.status_code} {r.text[:200]}")
+                time.sleep(0.5 * (i + 1)); continue
+            if r.status_code == 429:
+                ra = int(r.headers.get("Retry-After", "1"))
+                if DEBUG: print(f"[DEBUG] HTTP 429 Retry-After={ra}")
+                time.sleep(ra + 0.5); continue
+            r.raise_for_status()
+            return r.json() if r.text else {}
+        except Exception as e:
+            last_err = e
+            if DEBUG: print(f"[DEBUG] HTTP PATCH exception: {e}")
+            time.sleep(0.5 * (i + 1))
+    if DEBUG:
+        print(f"[DEBUG] HTTP PATCH failed after retries: {last_err}")
+    return None
+
+def _persist_alarm_via_api(alarm: Dict[str, Any]) -> None:
+    try:
+        url = f"{NOTIFIER_ENDPOINT}/alarms"
+        payload = {
+            # Map auf AlarmIn der API
+            "ts": alarm.get("ts"),
+            "profile_id": alarm.get("profile_id"),
+            "group_id": alarm.get("group_id") or alarm.get("group_index"),  # toleranter Fallback
+            "symbol": alarm.get("symbol"),
+            "interval": alarm.get("interval") or "",
+            "reason": alarm.get("reason") or "",
+            "reason_code": alarm.get("reason_code") or "",
+            "matched": alarm.get("conditions") or [],
+            "deactivate_applied": alarm.get("deactivate_applied", ""),
+            "meta": {
+                "status": alarm.get("status"),
+                "notify_mode": alarm.get("notify_mode"),
+                "profile_name": alarm.get("profile_name"),
+                "group_name": alarm.get("group_name"),
+                "exchange": alarm.get("exchange"),
+                "description": alarm.get("description"),
+                "telegram_bot_id": alarm.get("telegram_bot_id"),
+                "telegram_chat_id": alarm.get("telegram_chat_id"),
+                "telegram_bot_token": alarm.get("telegram_bot_token"),
+            },
+        }
+        res = _http_post_json(url, payload)
+        if DEBUG:
+            print(f"[DEBUG] Persist alarm -> {'OK' if res is not None else 'FAIL'}")
+    except Exception as e:
+        print(f"[DEBUG] Persist alarm error: {e}")
+
+def _maybe_auto_deactivate_via_overrides(alarm: Dict[str, Any]) -> bool:
+    """
+    Setzt forced_off=true via API-Patch wenn deactivate_on-Regel greift.
+    Rückgabe: True, wenn Deaktivierung angewandt wurde.
+    """
+    mode = (alarm.get("notify_mode") or "").lower()  # "true" | "any_true" | "always"
+    status = (alarm.get("status") or "").upper()     # "FULL" | "PARTIAL" | ...
+    pid = alarm.get("profile_id")
+    gid = alarm.get("group_id") or alarm.get("group_index")
+
+    if not pid or gid in (None, ""):
+        if DEBUG:
+            print("[DEBUG] auto-deactivate skipped (missing pid/gid)")
+        return False
+
+    apply = False
+    if mode == "true" and status == "FULL":
+        apply = True
+    elif mode == "any_true" and status in ("FULL", "PARTIAL"):
+        apply = True
+    elif mode == "always":
+        apply = False  # per Definition keine Auto-Deaktivierung
+
+    if not apply:
+        if DEBUG:
+            print(f"[DEBUG] auto-deactivate not applicable (mode={mode}, status={status})")
+        return False
+
+    try:
+        url = f"{NOTIFIER_ENDPOINT}/overrides/{pid}/{gid}"
+        body = {"forced_off": True}
+        res = _http_patch_json(url, body)
+        if DEBUG:
+            print(f"[DEBUG] overrides forced_off=true -> {'OK' if res is not None else 'FAIL'} pid={pid} gid={gid}")
+        return res is not None
+    except Exception as e:
+        print(f"[DEBUG] auto-deactivate error: {e}")
+        return False
+
+# -----------------------------------------------------------------------------
 # Main-API
 # -----------------------------------------------------------------------------
 def run_alarm_checker(triggered: List[Dict[str, Any]]) -> None:
@@ -289,13 +414,16 @@ def run_alarm_checker(triggered: List[Dict[str, Any]]) -> None:
     state = _load_state()
     now = time.time()
     sent = 0
+    persisted = 0
+    deactivated = 0
 
     for alarm in triggered:
         try:
             key = _alarm_key(alarm)
             if not _is_cooled_down(state, key, now):
                 if DEBUG:
-                    print(f"[DEBUG] skip (cooldown): {alarm.get('profile_name')} / {alarm.get('group_name')} / {alarm.get('symbol')}")
+                    remaining = COOLDOWN_SEC - int(now - state.get(key, 0.0))
+                    print(f"[DEBUG] skip (cooldown {remaining}s): {alarm.get('profile_name')} / {alarm.get('group_name')} / {alarm.get('symbol')}")
                 continue
 
             msg = format_alarm_message(alarm)
@@ -316,14 +444,24 @@ def run_alarm_checker(triggered: List[Dict[str, Any]]) -> None:
                 token_used = "<override>" if token_override else "<default>"
                 print(f"[DEBUG] sending → recips={recipients} token={token_used} len={len(msg)}")
 
+            # 1) Telegram senden
             _send_tg_text(
                 text=msg,
                 recipients=[int(r) for r in recipients],
                 bot_token=token_override or DEFAULT_BOT_TOKEN,
             )
+            sent += 1
+
+            # 2) Alarm persistieren (API)
+            _persist_alarm_via_api(alarm)
+            persisted += 1
+
+            # 3) Optional: Auto-Deaktivieren via Overrides (nicht Profile!)
+            if _maybe_auto_deactivate_via_overrides(alarm):
+                deactivated += 1
+                alarm["deactivate_applied"] = (alarm.get("notify_mode") or "").lower() in ("true","any_true")
 
             _mark_sent(state, key, now)
-            sent += 1
 
         except Exception as e:
             print("💥 Alarm send failed:", e)
@@ -332,4 +470,4 @@ def run_alarm_checker(triggered: List[Dict[str, Any]]) -> None:
         time.sleep(SEND_DELAY_SEC)
 
     _save_state(state)
-    print(f"✅ Versand fertig. {sent} / {n} Nachricht(en) verschickt.")
+    print(f"✅ Versand fertig. {sent} / {n} Nachricht(en) verschickt. Persistiert: {persisted}. Auto-deaktiviert: {deactivated}.")

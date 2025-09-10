@@ -21,13 +21,30 @@ from urllib3.util.retry import Retry
 # WICHTIG: Gate importieren UND BENUTZEN
 from .gate import gate_and_build_triggers
 
+# ─────────────────────────────────────────────────────────────
+# ✨ NEU: Persistenz (Status/Overrides/Commands) aus config
+# ─────────────────────────────────────────────────────────────
+from config import NOTIFIER_ENDPOINT, PRICE_API_ENDPOINT, CHART_API_ENDPOINT
 
-from config import NOTIFIER_ENDPOINT, PRICE_API_ENDPOINT
 # Optional: lokaler Profiles-Pfad, falls API-Write nicht geht (hier ungenutzt)
 try:
     from config import PROFILES_NOTIFIER  # type: ignore
 except Exception:
     PROFILES_NOTIFIER = None  # type: ignore[assignment]
+
+# Optional/fallback: Status/Overrides/Commands Pfade für Persistenz
+try:
+    from config import STATUS_NOTIFIER  # type: ignore
+except Exception:
+    STATUS_NOTIFIER = None  # type: ignore[assignment]
+try:
+    from config import OVERRIDES_NOTIFIER  # type: ignore
+except Exception:
+    OVERRIDES_NOTIFIER = None  # type: ignore[assignment]
+try:
+    from config import COMMANDS_NOTIFIER  # type: ignore
+except Exception:
+    COMMANDS_NOTIFIER = None  # type: ignore[assignment]
 
 # -----------------------------------------------------------------------------
 # Logging & ENV
@@ -57,6 +74,112 @@ DEBUG_VALUES = _bool_env("EVAL_DEBUG_VALUES", True)
 HTTP_TIMEOUT = float(_int_env("EVAL_HTTP_TIMEOUT", 15))
 HTTP_RETRIES = _int_env("EVAL_HTTP_RETRIES", 3)
 CACHE_MAX    = _int_env("EVAL_CACHE_MAX", 256)
+
+# ─────────────────────────────────────────────────────────────
+# ✨ NEU: Pfade & Locks
+# ─────────────────────────────────────────────────────────────
+def _to_path(p: Any | None) -> Optional[Path]:
+    if p is None: return None
+    if isinstance(p, Path): return p
+    return Path(str(p)).expanduser().resolve()
+
+# Fallback-Basis für JSON-Dateien
+_BASE_DIR = _to_path(PROFILES_NOTIFIER).parent if _to_path(PROFILES_NOTIFIER) else Path(os.getcwd())
+
+_STATUS_PATH    = _to_path(STATUS_NOTIFIER)    or (_BASE_DIR / "notifier_status.json")
+_OVERRIDES_PATH = _to_path(OVERRIDES_NOTIFIER) or (_BASE_DIR / "notifier_overrides.json")
+_COMMANDS_PATH  = _to_path(COMMANDS_NOTIFIER)  or (_BASE_DIR / "notifier_commands.json")
+
+for _p in (_STATUS_PATH, _OVERRIDES_PATH, _COMMANDS_PATH):
+    try:
+        _p.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log.warning(f"[DEBUG] mkdir failed for {_p.parent}: {e}")
+
+# Lock-Verzeichnis
+_LOCK_DIR = Path(os.environ.get("NOTIFIER_LOCK_DIR", "") or (Path(os.getenv("TMPDIR", "/tmp")) / "notifier_locks"))
+_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+log.info(f"[DEBUG] Using lock dir: {_LOCK_DIR}")
+
+def _lock_path(path: Path) -> Path:
+    try:
+        name = Path(path).name
+    except Exception:
+        name = str(path)
+    return _LOCK_DIR / (name + ".lock")
+
+class FileLock:
+    def __init__(self, path: Path, timeout: float = 10.0, poll: float = 0.05):
+        self.lockfile = _lock_path(path)
+        self.timeout = timeout
+        self.poll = poll
+        self._acq = False
+    def acquire(self):
+        start = time.time()
+        while True:
+            try:
+                fd = os.open(str(self.lockfile), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                self._acq = True
+                if DEBUG_VALUES:
+                    log.debug(f"[LOCK] acquired {self.lockfile}")
+                return
+            except FileExistsError:
+                if time.time() - start > self.timeout:
+                    raise TimeoutError(f"Timeout acquiring lock: {self.lockfile}")
+                time.sleep(self.poll)
+    def release(self):
+        if self._acq:
+            try:
+                os.unlink(self.lockfile)
+                if DEBUG_VALUES:
+                    log.debug(f"[LOCK] released {self.lockfile}")
+            except FileNotFoundError:
+                pass
+            finally:
+                self._acq = False
+    def __enter__(self): self.acquire(); return self
+    def __exit__(self, exc_type, exc, tb): self.release()
+
+def _sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256(); h.update(b); return h.hexdigest()
+
+def _json_load_any(path: Path, fallback: Any) -> Any:
+    if not path.exists():
+        if DEBUG_VALUES: log.debug(f"[IO] load {path} -> fallback")
+        return json.loads(json.dumps(fallback))
+    try:
+        txt = path.read_text(encoding="utf-8")
+        data = json.loads(txt)
+        if DEBUG_VALUES: log.debug(f"[IO] load {path} ok (type={type(data).__name__})")
+        return data
+    except Exception as e:
+        log.warning(f"[IO] read error {path}: {e} -> fallback")
+        return json.loads(json.dumps(fallback))
+
+def _json_save_any(path: Path, data: Any) -> None:
+    payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with FileLock(path):
+        try:
+            if path.exists():
+                cur = path.read_bytes()
+                if len(cur) == len(payload) and _sha256_bytes(cur) == _sha256_bytes(payload):
+                    if DEBUG_VALUES: log.debug(f"[IO] save {path} -> SKIP (unchanged)")
+                    return
+        except Exception as e:
+            log.debug(f"[IO] compare failed for {path}: {e}")
+        with open(tmp, "wb") as f:
+            f.write(payload); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, path)
+        # fsync parent dir (best effort)
+        try:
+            if hasattr(os, "O_DIRECTORY"):
+                dfd = os.open(str(path.parent), os.O_DIRECTORY)
+                try: os.fsync(dfd)
+                finally: os.close(dfd)
+        except Exception: pass
+    if DEBUG_VALUES: log.debug(f"[IO] save {path} ok")
 
 # -----------------------------------------------------------------------------
 # Global HTTP Session mit Retries
@@ -306,29 +429,85 @@ def _cache_put(key: Tuple[str, str, str, str, str], value: Dict[str, Any]) -> No
     if len(_INDICATOR_CACHE) > max(8, CACHE_MAX):
         _INDICATOR_CACHE.popitem(last=False)
 
+# ✨ UI-kompatible Helpers
+def _clean_params_for_api(params: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Leere/irrelevante Keys entfernen; 'source' nur senden, wenn gesetzt; niemals 'symbol' als param senden."""
+    p = {k: v for k, v in (params or {}).items() if v not in (None, "", [], {})}
+    p.pop("symbol", None)
+    if not p.get("source"):
+        p.pop("source", None)
+    return p
+
+def _stable_params_json(params: Dict[str, Any]) -> str:
+    """Stabile JSON-Serialisierung (Schlüssel sortiert)."""
+    return json.dumps(params, separators=(",", ":"), sort_keys=True)
+
+def _effective_intervals(chart_interval: Optional[str], indicator_interval: Optional[str]) -> tuple[str, str]:
+    """Spiegelt Intervalle. Wenn beide fehlen → '1d'/'1d'."""
+    ci = (chart_interval or "").strip()
+    ii = (indicator_interval or "").strip()
+    if ci and not ii:
+        ii = ci
+    elif ii and not ci:
+        ci = ii
+    if not ci and not ii:
+        ci = ii = "1d"
+    return ci, ii
+
 def _fetch_indicator_series(name: str, symbol: str, chart_interval: str, indicator_interval: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    key = _indicator_cache_key(name, symbol, chart_interval, indicator_interval, params)
+    # Intervalle wie in der UI spiegeln
+    eff_ci, eff_ii = _effective_intervals(chart_interval, indicator_interval)
+    # Params wie in der UI säubern + stabil serialisieren
+    clean = _clean_params_for_api(params)
+    params_json = _stable_params_json(clean)
+
+    # Cache-Key mit effektiven Werten
+    key = _indicator_cache_key(name, symbol, eff_ci, eff_ii, clean)
     cached = _cache_get(key)
     if cached is not None:
         return cached
 
-    url = f"{PRICE_API_ENDPOINT}/indicator"
+    # UI-kompatibler Endpoint
+    url = f"{CHART_API_ENDPOINT}/indicator"
     query = {
         "name": name,
         "symbol": symbol,
-        "chart_interval": chart_interval,
-        "indicator_interval": indicator_interval,
-        "params": json.dumps(params or {}, separators=(",", ":"), sort_keys=True),
+        "chart_interval": eff_ci,
+        "indicator_interval": eff_ii,
+        "params": params_json,
+        "count": 5,  # wichtig: min. Tail
     }
     if DEBUG_VALUES:
-        log.debug(f"[FETCH] {name} sym={symbol} chart_iv={chart_interval} ind_iv={indicator_interval} params={params}")
+        log.debug(f"[FETCH] {name} sym={symbol} chart_iv={eff_ci} ind_iv={eff_ii} params={clean} count=5")
+
     t0 = time.perf_counter()
-    data = _http_get_json(url, params=query)
+    sess = _get_session()
+    r = sess.get(url, params=query, timeout=HTTP_TIMEOUT)
+    # 400/422 tolerieren → leeres data-Array
+    if r.status_code in (400, 422):
+        if DEBUG_VALUES:
+            snippet = (r.text or "")[:200].replace("\n", " ")
+            log.debug(f"[FETCH] {r.url} -> {r.status_code} (treated as empty). body[:200]={snippet}")
+        data = {"data": []}
+    else:
+        if r.status_code >= 400:
+            snippet = (r.text or "")[:300].replace("\n", " ")
+            log.warning(f"[HTTP] GET {r.url} -> {r.status_code} body[:300]={snippet}")
+        r.raise_for_status()
+        try:
+            data = r.json()
+        except Exception as je:
+            # Wenn JSON kaputt ist, leer liefern statt crashen
+            log.warning(f"[HTTP] JSON decode failed on {r.url}: {je}")
+            data = {"data": []}
+
     dt = (time.perf_counter() - t0) * 1000
     if DEBUG_VALUES:
         log.debug(f"[FETCH] done {name} in {dt:.1f} ms")
+
     if not isinstance(data, dict) or "data" not in data:
         raise RuntimeError(f"/indicator lieferte kein dict mit 'data'. name={name}")
+
     _cache_put(key, data)
     return data
 
@@ -463,6 +642,33 @@ def _min_true_ticks_of(group: Dict[str, Any]) -> Optional[int]:
     except Exception:
         return None
 
+# ✨ NEU: ISO-Zeit utils
+def _parse_iso(s: Optional[str]) -> Optional[datetime]:
+    if not s: return None
+    try:
+        # tolerant: Z / ohne Z
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _iso_now_dt() -> datetime:
+    return datetime.now(timezone.utc)
+
+# ✨ NEU: Required-Params absichern (insb. source)
+def _ensure_required_params(meta: Dict[str, Dict[str, Any]], name: Optional[str], p: Dict[str, Any]) -> Dict[str, Any]:
+    if not name:
+        return p
+    out = dict(p or {})
+    spec = meta.get(str(name).lower()) or {}
+    req  = spec.get("required_params") or {}
+    dfl  = spec.get("default_params") or {}
+    # 'source' injizieren, wenn required & nicht gesetzt
+    if "source" in req and not out.get("source"):
+        out["source"] = dfl.get("source") or "Close"
+    return out
+
 # -----------------------------------------------------------------------------
 # Condition-Evaluation
 # -----------------------------------------------------------------------------
@@ -497,6 +703,8 @@ def evaluate_condition_for_symbol(
         left_ts  = None
     else:
         try:
+            # fehlende required params (z.B. source) ergänzen
+            left_p = _ensure_required_params(meta, left_name, left_p)
             left_val, left_col, left_ts = _last_value_for_indicator(
                 meta=meta,
                 name=left_name,                      # type: ignore[arg-type]
@@ -549,6 +757,8 @@ def evaluate_condition_for_symbol(
             right_ts  = None
         else:
             try:
+                # fehlende required params (z.B. source) ergänzen
+                right_p = _ensure_required_params(meta, right_name, right_p)
                 right_val, right_col, right_ts = _last_value_for_indicator(
                     meta=meta,
                     name=right_name,                   # type: ignore[arg-type]
@@ -601,12 +811,12 @@ def evaluate_condition_for_symbol(
             "params": right_p if right_label else {},
         },
         "op": (cond.get("op") or "").lower(),
-        "op_norm": op,
+        "op_norm": _normalize_op(cond.get("op") or ""),
         "result": result,
         "duration_ms": round(dt, 2),
     }
     if DEBUG_VALUES:
-        log.debug(f"[EVAL] {main_symbol}@{main_interval} {left_label} {op} {right_label} -> {result} ({dt:.1f} ms)")
+        log.debug(f"[EVAL] {main_symbol}@{main_interval} {left_label} {details['op_norm']} {right_label} -> {result} ({dt:.1f} ms)")
     return result, details
 
 # -----------------------------------------------------------------------------
@@ -618,30 +828,38 @@ def _eval_group_for_symbol(
     group: Dict[str, Any],
     symbol: str,
     group_index: int
-) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
+) -> Tuple[str, List[Dict[str, Any]], Optional[str], Optional[str]]:
     """
     Returns:
       status ∈ {"FULL","PARTIAL","NONE"}
       cond_details
       bar_ts (max Timestamp_ISO aus den beteiligten Reihen)
+      error_str (falls harter Fehler für Blocker)
     """
     t0 = time.perf_counter()
     conditions: List[Dict[str, Any]] = group.get("conditions") or []
     main_interval = (group.get("interval") or "").strip()
     if not main_interval:
-        return "NONE", [], None
+        return "NONE", [], None, "missing_interval"
 
     group_result: Optional[bool] = None
     any_true: bool = False
     per_details: List[Dict[str, Any]] = []
+    hard_error: Optional[str] = None
 
     for idx, cond in enumerate(conditions):
-        res, details = evaluate_condition_for_symbol(meta, cond, symbol, main_interval)
+        try:
+            res, details = evaluate_condition_for_symbol(meta, cond, symbol, main_interval)
+        except Exception as e:
+            res, details = False, {"error": "eval_exception", "exception": str(e)}
         details["idx"] = idx
         per_details.append(details)
 
-        any_true = any_true or bool(res)
+        # Fehler markieren, aber weiterrechnen (zeigt sich als blocker=error)
+        if details.get("error"):
+            hard_error = details["error"]
 
+        any_true = any_true or bool(res)
         if group_result is None:
             group_result = res
         else:
@@ -660,7 +878,6 @@ def _eval_group_for_symbol(
     ts_candidates: List[Optional[str]] = []
     try:
         if per_details:
-            # first left ts
             lts = per_details[0].get("left", {}).get("ts")
             if lts: ts_candidates.append(lts)
             for d in per_details:
@@ -674,7 +891,42 @@ def _eval_group_for_symbol(
     if DEBUG_VALUES:
         log.debug(f"[GROUP] {profile.get('name')}[{group_index}] {symbol}@{main_interval} -> {status} "
                   f"(conds={len(conditions)}, {dt:.1f} ms)")
-    return status, per_details, bar_ts
+    return status, per_details, bar_ts, hard_error
+
+# ─────────────────────────────────────────────────────────────
+# ✨ NEU: Status laden/schreiben + Commands/Overrides verarbeiten
+# ─────────────────────────────────────────────────────────────
+_STATUS_TEMPLATE: Dict[str, Any] = {"version": 0, "updated_ts": None, "profiles": {}}
+_OVR_TEMPLATE: Dict[str, Any]    = {"overrides": {}, "updated_ts": None}
+_CMD_TEMPLATE: Dict[str, Any]    = {"queue": []}
+
+def _load_status() -> Dict[str, Any]:
+    return _json_load_any(_STATUS_PATH, _STATUS_TEMPLATE)
+
+def _save_status(st: Dict[str, Any]) -> None:
+    st["updated_ts"] = _now_iso()
+    _json_save_any(_STATUS_PATH, st)
+
+def _load_overrides() -> Dict[str, Any]:
+    d = _json_load_any(_OVERRIDES_PATH, _OVR_TEMPLATE)
+    if not isinstance(d, dict) or "overrides" not in d:
+        d = {"overrides": {}, "updated_ts": None}
+    return d
+
+def _ensure_ovr_slot(ovr: Dict[str, Any], pid: str, gid: str) -> Dict[str, Any]:
+    ovr.setdefault("overrides", {})
+    ovr["overrides"].setdefault(pid, {})
+    ovr["overrides"][pid].setdefault(gid, {"forced_off": False, "snooze_until": None, "note": None})
+    return ovr["overrides"][pid][gid]
+
+def _load_commands() -> Dict[str, Any]:
+    d = _json_load_any(_COMMANDS_PATH, _CMD_TEMPLATE)
+    if not isinstance(d, dict) or "queue" not in d:
+        d = {"queue": []}
+    return d
+
+def _save_commands(d: Dict[str, Any]) -> None:
+    _json_save_any(_COMMANDS_PATH, d)
 
 # -----------------------------------------------------------------------------
 # Top-Level: run_check
@@ -686,8 +938,27 @@ def run_check() -> List[Dict[str, Any]]:
     - Baut EVAL-Events (inkl. deactivate_on, min_true_ticks)
     - Übergibt an gate_and_build_triggers (Streak-Gate pro Modus)
     - Gibt die fertigen Trigger-Payloads zurück (für Alarm-Checker)
+
+    ✨ NEU:
+    - Lädt & schreibt status.json (effective_active, blockers, cooldown, auto_disabled, …)
+    - Konsumiert commands (rearm/rebaseline) einmalig
+    - Berücksichtigt overrides (forced_off/snooze)
     """
     _INDICATOR_CACHE.clear()
+
+    # Voriger Status + Queue + Overrides
+    status = _load_status()
+    overrides = _load_overrides()
+    commands = _load_commands()
+
+    # Indexiere Commands pro (pid,gid) und konsumiere am Ende
+    cmds_by_pg: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for it in list(commands.get("queue") or []):
+        pid = str(it.get("profile_id") or "")
+        gid = str(it.get("group_id") or "")
+        if not pid or not gid:
+            continue
+        cmds_by_pg.setdefault((pid, gid), []).append(it)
 
     t_start = time.perf_counter()
     try:
@@ -704,62 +975,221 @@ def run_check() -> List[Dict[str, Any]]:
 
     evals: List[Dict[str, Any]] = []
     now_iso = _now_iso()
+    now_dt  = _iso_now_dt()
+
+    # Status-Struktur vorbereiten
+    if "profiles" not in status or not isinstance(status["profiles"], dict):
+        status["profiles"] = {}
+    prev_version = int(status.get("version", 0))
+    cur_profiles = status["profiles"]
+
+    # Durch Profile/Groups iterieren
+    consumed_cmd_ids: Set[str] = set()
 
     for p_idx, profile in enumerate(profiles):
+        pid = str(profile.get("id") or "")
+        if not pid:
+            continue
+
+        # Stelle Profile-Container im Status sicher
+        prof_st = cur_profiles.setdefault(pid, {})
+        prof_st["profile_active"] = bool(profile.get("enabled", True))
+        gmap = prof_st.setdefault("groups", {})
+
         if not profile.get("enabled", True):
+            if DEBUG_VALUES:
+                log.debug(f"[ACTIVE] skip profile pid={pid} (enabled=0)")
             continue
 
         groups = profile.get("condition_groups") or []
         for g_idx, group in enumerate(groups):
-            if not group.get("active", True):
-                continue
+            gid = str(group.get("gid") or f"g{g_idx}")
+            if not gid:
+                gid = f"g{g_idx}"
 
+            grp_st = gmap.setdefault(gid, {})
+            grp_st["group_active"] = bool(group.get("active", True))
+            grp_st["last_eval_ts"] = now_iso
+            blockers: List[str] = []
+            auto_disabled = bool(grp_st.get("auto_disabled", False))
+            cooldown_until_iso = grp_st.get("cooldown_until")
+            cooldown_until_dt  = _parse_iso(cooldown_until_iso)
+            fresh = True  # wir setzen fresh=true; „stale“ markieren wir nur bei harten Fetch-Fehlern
+            hard_error: Optional[str] = None
+
+            # Overrides lesen
+            ov_slot = _ensure_ovr_slot(overrides, pid, gid)
+            forced_off = bool(ov_slot.get("forced_off", False))
+            snooze_until_str = ov_slot.get("snooze_until")
+            snooze_until_dt = _parse_iso(snooze_until_str)
+
+            # Commands anwenden (einmalig)
+            for cmd in cmds_by_pg.get((pid, gid), []):
+                cmd_id = str(cmd.get("id") or "")
+                if cmd_id in consumed_cmd_ids:
+                    continue
+                rearm = bool(cmd.get("rearm", True))
+                rebaseline = bool(cmd.get("rebaseline", False))
+                if rearm:
+                    auto_disabled = False
+                    cooldown_until_dt = now_dt  # sofort wieder scharf (Cooldown vorbei)
+                    cooldown_until_iso = _now_iso()
+                    if DEBUG_VALUES:
+                        log.debug(f"[COMMAND] REARM applied pid={pid} gid={gid} -> auto_disabled=0, cooldown=now")
+                if rebaseline:
+                    # Evaluator kann hier rebaseline-hinweise weiterreichen (Baselines pflegst du in deiner Logik)
+                    if DEBUG_VALUES:
+                        log.debug(f"[COMMAND] REBASELINE requested pid={pid} gid={gid} (handled in indicator logic if applicable)")
+                consumed_cmd_ids.add(cmd_id)
+
+            # Skip inaktive Gruppen
+            if not group.get("active", True):
+                blockers.append("group_inactive")
+
+            # Snooze/Forced-Off Blocker
+            if forced_off:
+                blockers.append("forced_off")
+            if snooze_until_dt and now_dt < snooze_until_dt:
+                blockers.append("snooze")
+
+            # Cooldown/AutoDisabled Blocker
+            if auto_disabled:
+                blockers.append("auto_disabled")
+            if cooldown_until_dt and now_dt < cooldown_until_dt:
+                blockers.append("cooldown")
+
+            # Symbole & Intervalle prüfen
             raw_symbols = [s for s in (group.get("symbols") or []) if s]
             symbols = list(dict.fromkeys(raw_symbols))
             main_interval = (group.get("interval") or "").strip()
-            if not symbols or not main_interval:
+            if (not symbols) or (not main_interval):
+                blockers.append("misconfigured")
+                grp_st.update({
+                    "effective_active": False,
+                    "blockers": blockers,
+                    "auto_disabled": auto_disabled,
+                    "cooldown_until": cooldown_until_iso,
+                    "fresh": fresh,
+                })
                 continue
 
+            # effective_active Vorprüfung (ohne stale/error)
+            effective_active = bool(profile.get("enabled", True)) \
+                               and bool(group.get("active", True)) \
+                               and (not forced_off) \
+                               and (not (snooze_until_dt and now_dt < snooze_until_dt)) \
+                               and (not auto_disabled) \
+                               and (not (cooldown_until_dt and now_dt < cooldown_until_dt))
+
+            # Evaluate nur wenn effective prelim aktiv
+            group_aggregate_passed = False
             notify_mode = _normalize_notify_mode(group)  # "always" | "true" | "any_true"
-            min_ticks = _min_true_ticks_of(group)  # None => im Gate 1
+            min_ticks = _min_true_ticks_of(group)        # None => Gate nutzt 1
 
-            for sym in symbols:
-                status, cond_details, bar_ts = _eval_group_for_symbol(meta, profile, group, sym, g_idx)
+            per_symbol_evals: List[Dict[str, Any]] = []
 
-                # Live-Event bauen (geht an Gate)
-                ev = {
-                    "profile_id":   profile.get("id"),
-                    "profile_name": profile.get("name"),
-                    "group_index":  g_idx,
-                    "group_name":   group.get("name") or f"group_{g_idx}",
-                    "symbol":       sym,
-                    "interval":     main_interval,
-                    "exchange":     group.get("exchange") or None,
-                    "telegram_bot_id": group.get("telegram_bot_id") or None,
-                    "telegram_bot_token": group.get("telegram_bot_token") or None,
-                    "telegram_chat_id": group.get("telegram_chat_id") or None,
-                    "description":  group.get("description") or None,
-                    "ts":           now_iso,
-                    "bar_ts":       bar_ts or now_iso,
-                    "status":       status,                 # "FULL" | "PARTIAL" | "NONE"
-                    "deactivate_on": notify_mode,           # UI-Feld, hier als Notify-Mode interpretiert
-                    "min_true_ticks": min_ticks,            # None ⇒ Gate nutzt 1
-                    "conditions":   cond_details,
-                }
+            if effective_active:
+                for sym in symbols:
+                    status_str, cond_details, bar_ts, err = _eval_group_for_symbol(meta, profile, group, sym, g_idx)
+                    if err:
+                        hard_error = err
+                    # Live-Event bauen (geht an Gate)
+                    ev = {
+                        "profile_id":   pid,
+                        "profile_name": profile.get("name"),
+                        "group_id":     gid,
+                        "group_index":  g_idx,
+                        "group_name":   group.get("name") or f"group_{g_idx}",
+                        "symbol":       sym,
+                        "interval":     main_interval,
+                        "exchange":     group.get("exchange") or None,
+                        "telegram_bot_id": group.get("telegram_bot_id") or None,
+                        "telegram_bot_token": group.get("telegram_bot_token") or None,
+                        "telegram_chat_id": group.get("telegram_chat_id") or None,
+                        "description":  group.get("description") or None,
+                        "ts":           now_iso,
+                        "bar_ts":       bar_ts or now_iso,
+                        "status":       status_str,           # "FULL" | "PARTIAL" | "NONE"
+                        "deactivate_on": notify_mode,         # hier als Notify-Mode interpretiert
+                        "min_true_ticks": min_ticks,          # None ⇒ Gate nutzt 1
+                        "conditions":   cond_details,
+                    }
+                    per_symbol_evals.append(ev)
+                    evals.append(ev)
+
+                # Aggregate-Passed (wenn irgendein Symbol FULL/PARTIAL je nach Modus) – nur Info für Status
+                group_aggregate_passed = any(
+                    (ev["status"] == "FULL") or (notify_mode == "any_true" and ev["status"] in ("FULL", "PARTIAL"))
+                    for ev in per_symbol_evals
+                )
+            else:
                 if DEBUG_VALUES:
-                    log.debug(f"[EVAL-ROW] {ev['profile_name']}/{ev['group_name']}/{sym}@{main_interval} status={status} "
-                              f"mode={notify_mode} mtt={min_ticks}")
+                    log.debug(f"[ACTIVE] skip evaluation pid={pid} gid={gid} due blockers={blockers}")
 
-                evals.append(ev)
+            # stale/error Blocker berücksichtigen
+            if hard_error:
+                blockers.append("error")
+                fresh = False
+
+            # finale effective_active inkl. stale/error
+            effective_active = effective_active and fresh and (len([b for b in blockers if b in ("forced_off","snooze","auto_disabled","cooldown","group_inactive","misconfigured")]) == 0)
+
+            # Status der Gruppe schreiben
+            grp_st.update({
+                "effective_active": bool(effective_active),
+                "blockers": blockers,
+                "auto_disabled": bool(auto_disabled),
+                "cooldown_until": cooldown_until_iso,
+                "fresh": bool(fresh),
+                "last_eval_ts": now_iso,
+                "aggregate": {
+                    "logic": "AND",   # rein informativ – dein Gruppenkonzept kann „and/or“ je Condition sein
+                    "passed": bool(group_aggregate_passed),
+                    "notify_mode": notify_mode,
+                    "min_true_ticks": min_ticks if min_ticks is not None else 1,
+                },
+            })
+
+            # ✨ NEU: Leichtgewichtige Conditions-Zusammenfassung (letzte Werte) – hilfreich für UI/Debug
+            try:
+                if per_symbol_evals:
+                    # nimm die erste Symbol-Row als sample
+                    sample = per_symbol_evals[0]
+                    conds = []
+                    for cd in (sample.get("conditions") or []):
+                        conds.append({
+                            "op": cd.get("op_norm") or cd.get("op"),
+                            "passed": bool(cd.get("result")),
+                            "left_value": cd.get("left", {}).get("value"),
+                            "right_value": cd.get("right", {}).get("value"),
+                            "eval_ms": cd.get("duration_ms"),
+                            "left_ts": cd.get("left", {}).get("ts"),
+                            "right_ts": cd.get("right", {}).get("ts"),
+                            "error": cd.get("error")
+                        })
+                    grp_st["conditions"] = conds
+            except Exception as e:
+                log.debug(f"[STATUS] conditions summary failed pid={pid} gid={gid}: {e}")
 
     # Gate anwenden (Streak + Modus-Logik)
     triggered = gate_and_build_triggers(evals)
 
+    # Commands-Queue um konsumierte Items bereinigen
+    if consumed_cmd_ids:
+        new_queue = [it for it in (commands.get("queue") or []) if str(it.get("id") or "") not in consumed_cmd_ids]
+        commands["queue"] = new_queue
+        _save_commands(commands)
+        if DEBUG_VALUES:
+            log.debug(f"[COMMAND] consumed count={len(consumed_cmd_ids)} remaining_queue={len(new_queue)}")
+
+    # Status-Version hochzählen und speichern
+    status["version"] = int(prev_version) + 1
+    _save_status(status)
+
     dt_total = (time.perf_counter() - t_start) * 1000.0
-    log.info(f"Evals={len(evals)} → Trigger={len(triggered)} — Laufzeit: {dt_total:.1f} ms")
+    log.info(f"Evals={len(evals)} → Trigger={len(triggered)} — Status v{status['version']} geschrieben — Laufzeit: {dt_total:.1f} ms")
     if triggered and DEBUG_VALUES:
         try:
-            # Nur Kopf zeigen
             log.debug(json.dumps(triggered[:2], ensure_ascii=False, indent=2))
         except Exception:
             pass
