@@ -305,7 +305,7 @@ def _http_post_json(url: str, payload: Dict[str, Any], timeout: float = HTTP_TIM
             return r.json() if r.text else {}
         except Exception as e:
             last_err = e
-            log.warning(f"[HTTP] Fehler bei POST {url}: {e} (try {i+1}/{tries})")
+            log.warning(f"[HTTP] Fehler beim POST {url}: {e} (try {i+1}/{tries})")
         time.sleep(0.25 * (i + 1))
     raise RuntimeError(f"HTTP POST fehlgeschlagen: {url} :: {last_err}")
 
@@ -512,7 +512,16 @@ def _fetch_indicator_series(name: str, symbol: str, chart_interval: str, indicat
     return data
 
 def _is_number(x: Any) -> bool:
-    return isinstance(x, (int, float)) and x is not None
+    try:
+        # bool ausschließen; NaN/Inf verwerfen
+        if isinstance(x, bool):
+            return False
+        if isinstance(x, (int, float)):
+            return math.isfinite(float(x))
+        return False
+    except Exception:
+        return False
+
 
 def _pick_value_from_row(row: Dict[str, Any], preferred_cols: Optional[List[str]] = None) -> Tuple[Optional[float], Optional[str]]:
     if preferred_cols:
@@ -603,9 +612,19 @@ def _safe_max_iso(ts_list: List[Optional[str]], fallback: Optional[str] = None) 
     if not vals:
         return fallback
     try:
-        return max(vals)
+        pairs = []
+        for t in vals:
+            dt = _parse_iso(t) or datetime.min.replace(tzinfo=timezone.utc)
+            pairs.append((dt, t))
+        pairs.sort(key=lambda x: x[0])
+        return pairs[-1][1]
     except Exception:
-        return fallback
+        # Fallback: lexikalisch
+        try:
+            return max(vals)
+        except Exception:
+            return fallback
+
 
 def _normalize_notify_mode(group: Dict[str, Any]) -> str:
     """
@@ -667,6 +686,50 @@ def _ensure_required_params(meta: Dict[str, Dict[str, Any]], name: Optional[str]
     # 'source' injizieren, wenn required & nicht gesetzt
     if "source" in req and not out.get("source"):
         out["source"] = dfl.get("source") or "Close"
+    return out
+
+# ✨ NEU: Label-only-Conditions für Status (wenn nicht evaluiert wird)
+def _label_only_conditions(group: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for c in (group.get("conditions") or []):
+        if not isinstance(c, dict):
+            continue
+        left  = (c.get("left") or "").strip() or "—"
+        right = (c.get("right") or "").strip()
+        if not right:
+            rsym = (c.get("right_symbol") or "").strip()
+            rinv = (c.get("right_interval") or "").strip()
+            rout = (c.get("right_output") or "").strip()
+            if rsym:
+                parts = [rsym]
+                if rinv: parts.append(f"@{rinv}")
+                if rout: parts.append(f":{rout}")
+                right = "".join(parts)
+        if not right:
+            right = "—"
+        op = (c.get("op") or "gt").strip().lower()
+        out.append({
+            # Anzeige / Meta
+            "left":         left,
+            "right":        right,
+            "left_spec":    None,
+            "right_spec":   None,
+            "left_output":  None,
+            "right_output": None,
+            "left_col":     None,
+            "right_col":    None,
+            # Operator-Ergebnis
+            "op":     op,
+            "passed": False,
+            # Werte & Timing
+            "left_value":  None,
+            "right_value": None,
+            "left_ts":     None,
+            "right_ts":    None,
+            "eval_ms":     None,
+            # Fehler (falls vorhanden)
+            "error": None,
+        })
     return out
 
 # -----------------------------------------------------------------------------
@@ -857,7 +920,7 @@ def _eval_group_for_symbol(
 
         # Fehler markieren, aber weiterrechnen (zeigt sich als blocker=error)
         if details.get("error"):
-            hard_error = details["error"]
+            hard_error = details.get("error")
 
         any_true = any_true or bool(res)
         if group_result is None:
@@ -877,12 +940,13 @@ def _eval_group_for_symbol(
     # Bar-TS aus Details ziehen
     ts_candidates: List[Optional[str]] = []
     try:
-        if per_details:
-            lts = per_details[0].get("left", {}).get("ts")
-            if lts: ts_candidates.append(lts)
-            for d in per_details:
-                rts = d.get("right", {}).get("ts")
-                if rts: ts_candidates.append(rts)
+        for d in per_details:
+            lts = (d.get("left") or {}).get("ts")
+            rts = (d.get("right") or {}).get("ts")
+            if lts:
+                ts_candidates.append(lts)
+            if rts:
+                ts_candidates.append(rts)
     except Exception:
         pass
     bar_ts = _safe_max_iso(ts_candidates, fallback=None)
@@ -994,6 +1058,11 @@ def run_check() -> List[Dict[str, Any]]:
         # Stelle Profile-Container im Status sicher
         prof_st = cur_profiles.setdefault(pid, {})
         prof_st["profile_active"] = bool(profile.get("enabled", True))
+        # 👇 NEU: für UI/normalize_status()
+        prof_st["id"]   = pid
+        prof_st["name"] = profile.get("name") or ""
+
+        prof_st["profile_active"] = bool(profile.get("enabled", True))
         gmap = prof_st.setdefault("groups", {})
 
         if not profile.get("enabled", True):
@@ -1064,12 +1133,26 @@ def run_check() -> List[Dict[str, Any]]:
             main_interval = (group.get("interval") or "").strip()
             if (not symbols) or (not main_interval):
                 blockers.append("misconfigured")
+                # 👇 WICHTIG: auch im Fehlerfall ausreichende Infos bereitstellen
                 grp_st.update({
+                    "name": (group.get("name") or f"group_{g_idx}"),
                     "effective_active": False,
                     "blockers": blockers,
                     "auto_disabled": auto_disabled,
                     "cooldown_until": cooldown_until_iso,
                     "fresh": fresh,
+                    "aggregate": {
+                        "logic": "AND",
+                        "passed": False,
+                        "notify_mode": _normalize_notify_mode(group),
+                        "min_true_ticks": _min_true_ticks_of(group) or 1,
+                    },
+                    "conditions": _label_only_conditions(group),
+                    "runtime": {
+                        "met": 0,
+                        "total": len(group.get("conditions") or []),
+                        "true_ticks": None,
+                    },
                 })
                 continue
 
@@ -1080,7 +1163,6 @@ def run_check() -> List[Dict[str, Any]]:
                                and (not (snooze_until_dt and now_dt < snooze_until_dt)) \
                                and (not auto_disabled) \
                                and (not (cooldown_until_dt and now_dt < cooldown_until_dt))
-
             # Evaluate nur wenn effective prelim aktiv
             group_aggregate_passed = False
             notify_mode = _normalize_notify_mode(group)  # "always" | "true" | "any_true"
@@ -1099,7 +1181,7 @@ def run_check() -> List[Dict[str, Any]]:
                         "profile_name": profile.get("name"),
                         "group_id":     gid,
                         "group_index":  g_idx,
-                        "group_name":   group.get("name") or f"group_{g_idx}",
+                        "group_name":   group.get("name") or f"group_{g_idx}",  # ← ) entfernt
                         "symbol":       sym,
                         "interval":     main_interval,
                         "exchange":     group.get("exchange") or None,
@@ -1125,6 +1207,8 @@ def run_check() -> List[Dict[str, Any]]:
             else:
                 if DEBUG_VALUES:
                     log.debug(f"[ACTIVE] skip evaluation pid={pid} gid={gid} due blockers={blockers}")
+                # Label-only conditions in den Status (damit das UI etwas anzeigen kann)
+                grp_st["conditions"] = _label_only_conditions(group)
 
             # stale/error Blocker berücksichtigen
             if hard_error:
@@ -1134,8 +1218,26 @@ def run_check() -> List[Dict[str, Any]]:
             # finale effective_active inkl. stale/error
             effective_active = effective_active and fresh and (len([b for b in blockers if b in ("forced_off","snooze","auto_disabled","cooldown","group_inactive","misconfigured")]) == 0)
 
+            # met/total für UI bestimmen (Sample: erstes Symbol – reicht für Übersicht)
+            met = total = 0
+            if per_symbol_evals:
+                try:
+                    sample_conds = per_symbol_evals[0].get("conditions") or []
+                    total = len(sample_conds)
+                    met = sum(1 for c in sample_conds if c and bool(c.get("result")))
+                except Exception:
+                    pass
+            else:
+                # falls nicht evaluiert: total aus Definition
+                total = len(group.get("conditions") or [])
+                met = 0
+
+            # true_ticks: Platzhalter, bis Gate den Streak-State bereitstellt
+            true_ticks = None
+
             # Status der Gruppe schreiben
             grp_st.update({
+                "name": (group.get("name") or f"group_{g_idx}"),
                 "effective_active": bool(effective_active),
                 "blockers": blockers,
                 "auto_disabled": bool(auto_disabled),
@@ -1143,29 +1245,54 @@ def run_check() -> List[Dict[str, Any]]:
                 "fresh": bool(fresh),
                 "last_eval_ts": now_iso,
                 "aggregate": {
-                    "logic": "AND",   # rein informativ – dein Gruppenkonzept kann „and/or“ je Condition sein
+                    "logic": "AND",
                     "passed": bool(group_aggregate_passed),
                     "notify_mode": notify_mode,
                     "min_true_ticks": min_ticks if min_ticks is not None else 1,
                 },
+                "runtime": {
+                    "met": met,
+                    "total": total,
+                    "true_ticks": true_ticks,
+                },
             })
 
-            # ✨ NEU: Leichtgewichtige Conditions-Zusammenfassung (letzte Werte) – hilfreich für UI/Debug
+            # ✨ NEU: Conditions-Zusammenfassung (inkl. Labels/Werten), wenn wir evaluiert haben
             try:
                 if per_symbol_evals:
                     # nimm die erste Symbol-Row als sample
                     sample = per_symbol_evals[0]
-                    conds = []
+                    conds: List[Dict[str, Any]] = []
                     for cd in (sample.get("conditions") or []):
+                        left  = cd.get("left")  if isinstance(cd.get("left"), dict)  else {}
+                        right = cd.get("right") if isinstance(cd.get("right"), dict) else {}
+                        left  = left  or {}
+                        right = right or {}
+
                         conds.append({
-                            "op": cd.get("op_norm") or cd.get("op"),
+                            # Anzeige / Meta
+                            "left":         left.get("label"),
+                            "right":        right.get("label"),
+                            "left_spec":    left.get("spec"),
+                            "right_spec":   right.get("spec"),
+                            "left_output":  left.get("output"),
+                            "right_output": right.get("output"),
+                            "left_col":     left.get("col"),
+                            "right_col":    right.get("col"),
+
+                            # Operator-Ergebnis
+                            "op":     cd.get("op_norm") or cd.get("op"),
                             "passed": bool(cd.get("result")),
-                            "left_value": cd.get("left", {}).get("value"),
-                            "right_value": cd.get("right", {}).get("value"),
-                            "eval_ms": cd.get("duration_ms"),
-                            "left_ts": cd.get("left", {}).get("ts"),
-                            "right_ts": cd.get("right", {}).get("ts"),
-                            "error": cd.get("error")
+
+                            # Werte & Timing
+                            "left_value":  left.get("value"),
+                            "right_value": right.get("value"),
+                            "left_ts":     left.get("ts"),
+                            "right_ts":    right.get("ts"),
+                            "eval_ms":     cd.get("duration_ms"),
+
+                            # Fehler (falls vorhanden)
+                            "error": cd.get("error"),
                         })
                     grp_st["conditions"] = conds
             except Exception as e:
