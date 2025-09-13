@@ -992,6 +992,73 @@ def _load_commands() -> Dict[str, Any]:
 def _save_commands(d: Dict[str, Any]) -> None:
     _json_save_any(_COMMANDS_PATH, d)
 
+# --- Status-Sync aus Profilen (Skeleton für UI schreiben) --------------------
+
+def _skeleton_group_from_def(group: Dict[str, Any], g_idx: int) -> Dict[str, Any]:
+    name = group.get("name") or f"group_{g_idx}"
+    interval = (group.get("interval") or "").strip()
+    raw_symbols = [s for s in (group.get("symbols") or []) if s]
+    symbols = list(dict.fromkeys(raw_symbols))
+    misconfigured = (not interval) or (not symbols)
+
+    notify_mode = _normalize_notify_mode(group)
+    min_ticks   = _min_true_ticks_of(group) or 1
+
+    return {
+        "group_active": bool(group.get("active", True)),
+        "last_eval_ts": None,     # noch nichts evaluiert
+        "effective_active": False,
+        "blockers": (["misconfigured"] if misconfigured else []),
+        "auto_disabled": False,
+        "cooldown_until": None,
+        "fresh": True,
+        "name": name,
+        "aggregate": {
+            "logic": "AND",
+            "passed": False,
+            "notify_mode": notify_mode,
+            "min_true_ticks": min_ticks,
+        },
+        "conditions": _label_only_conditions(group),  # nur Labels
+        "runtime": {
+            "met": 0,
+            "total": len(group.get("conditions") or []),
+            "true_ticks": None,
+        },
+    }
+
+
+def sync_status_from_profiles(profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Schreibt notifier_status.json minimal anhand der Profile,
+    damit das UI direkt nach Speichern schon Inhalte sieht.
+    """
+    st = _load_status()
+    if "profiles" not in st or not isinstance(st["profiles"], dict):
+        st["profiles"] = {}
+    cur_profiles = st["profiles"]
+
+    for p in profiles or []:
+        pid = str(p.get("id") or "")
+        if not pid:
+            continue
+        pobj = cur_profiles.setdefault(pid, {})
+        pobj["profile_active"] = bool(p.get("enabled", True))
+        pobj["id"]   = pid
+        pobj["name"] = p.get("name") or ""
+
+        gmap = pobj.setdefault("groups", {})
+        groups = p.get("condition_groups") or []
+        for g_idx, g in enumerate(groups):
+            gid = str(g.get("gid") or f"g{g_idx}") or f"g{g_idx}"
+            gmap[gid] = {**gmap.get(gid, {}), **_skeleton_group_from_def(g, g_idx)}
+
+    st["version"] = int(st.get("version", 0)) + 1
+    _save_status(st)
+    return st
+
+
+
 # -----------------------------------------------------------------------------
 # Top-Level: run_check
 # -----------------------------------------------------------------------------
@@ -1168,20 +1235,24 @@ def run_check() -> List[Dict[str, Any]]:
             notify_mode = _normalize_notify_mode(group)  # "always" | "true" | "any_true"
             min_ticks = _min_true_ticks_of(group)        # None => Gate nutzt 1
 
+   
+
             per_symbol_evals: List[Dict[str, Any]] = []
+            ts_list: List[Optional[str]] = []   # ← NEU
 
             if effective_active:
                 for sym in symbols:
                     status_str, cond_details, bar_ts, err = _eval_group_for_symbol(meta, profile, group, sym, g_idx)
                     if err:
                         hard_error = err
+
                     # Live-Event bauen (geht an Gate)
                     ev = {
                         "profile_id":   pid,
                         "profile_name": profile.get("name"),
                         "group_id":     gid,
                         "group_index":  g_idx,
-                        "group_name":   group.get("name") or f"group_{g_idx}",  # ← ) entfernt
+                        "group_name":   group.get("name") or f"group_{g_idx}",
                         "symbol":       sym,
                         "interval":     main_interval,
                         "exchange":     group.get("exchange") or None,
@@ -1191,13 +1262,16 @@ def run_check() -> List[Dict[str, Any]]:
                         "description":  group.get("description") or None,
                         "ts":           now_iso,
                         "bar_ts":       bar_ts or now_iso,
-                        "status":       status_str,           # "FULL" | "PARTIAL" | "NONE"
-                        "deactivate_on": notify_mode,         # hier als Notify-Mode interpretiert
-                        "min_true_ticks": min_ticks,          # None ⇒ Gate nutzt 1
+                        "status":       status_str,
+                        "deactivate_on": notify_mode,
+                        "min_true_ticks": min_ticks,
                         "conditions":   cond_details,
                     }
                     per_symbol_evals.append(ev)
                     evals.append(ev)
+                    if bar_ts:
+                        ts_list.append(bar_ts)  # ← NEU
+
 
                 # Aggregate-Passed (wenn irgendein Symbol FULL/PARTIAL je nach Modus) – nur Info für Status
                 group_aggregate_passed = any(
@@ -1243,7 +1317,8 @@ def run_check() -> List[Dict[str, Any]]:
                 "auto_disabled": bool(auto_disabled),
                 "cooldown_until": cooldown_until_iso,
                 "fresh": bool(fresh),
-                "last_eval_ts": now_iso,
+                "last_eval_ts": now_iso,                         # bleibt als „Evaluationszeit“
+                "last_bar_ts": _safe_max_iso(ts_list, None),     # ← NEU: Kerzenzeit für Anzeige
                 "aggregate": {
                     "logic": "AND",
                     "passed": bool(group_aggregate_passed),
