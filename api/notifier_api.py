@@ -19,13 +19,8 @@ import string
 from datetime import datetime, timezone
 
 from config import PROFILES_NOTIFIER as _PROFILES_NOTIFIER_CFG, ALARMS_NOTIFIER as _ALARMS_NOTIFIER_CFG
-from config import NOTIFIER_ENDPOINT
 
-# ✨ NEU: optionale Pfade für Status/Overrides/Commands (Fallbacks, wenn nicht in config definiert)
-try:
-    from config import STATUS_NOTIFIER as _STATUS_NOTIFIER_CFG  # optional
-except Exception:
-    _STATUS_NOTIFIER_CFG = None
+# ✨ NEU: optionale Pfade für Overrides/Commands (Fallbacks, wenn nicht in config definiert)
 try:
     from config import OVERRIDES_NOTIFIER as _OVERRIDES_NOTIFIER_CFG  # optional
 except Exception:
@@ -50,13 +45,9 @@ def _to_path(p: Any) -> Path:
 PROFILES_NOTIFIER: Path = _to_path(_PROFILES_NOTIFIER_CFG)
 ALARMS_NOTIFIER:   Path = _to_path(_ALARMS_NOTIFIER_CFG)
 
-# ✨ NEU: Status/Overrides/Commands Pfade (Fallback neben PROFILES_NOTIFIER)
-_BASE_DIR = PROFILES_NOTIFIER.parent
-_STATUS_FALLBACK    = _BASE_DIR / "notifier_status.json"
-_OVERRIDES_FALLBACK = _BASE_DIR / "notifier_overrides.json"
-_COMMANDS_FALLBACK  = _BASE_DIR / "notifier_commands.json"
-
-STATUS_NOTIFIER:    Path = _to_path(_STATUS_NOTIFIER_CFG)    if _STATUS_NOTIFIER_CFG    else _STATUS_FALLBACK
+# ✨ NEU: Overrides/Commands Pfade (Fallback neben PROFILES_NOTIFIER)
+_OVERRIDES_FALLBACK = PROFILES_NOTIFIER.parent / "notifier_overrides.json"
+_COMMANDS_FALLBACK  = PROFILES_NOTIFIER.parent / "notifier_commands.json"
 OVERRIDES_NOTIFIER: Path = _to_path(_OVERRIDES_NOTIFIER_CFG) if _OVERRIDES_NOTIFIER_CFG else _OVERRIDES_FALLBACK
 COMMANDS_NOTIFIER:  Path = _to_path(_COMMANDS_NOTIFIER_CFG)  if _COMMANDS_NOTIFIER_CFG  else _COMMANDS_FALLBACK
 
@@ -66,7 +57,6 @@ COMMANDS_NOTIFIER:  Path = _to_path(_COMMANDS_NOTIFIER_CFG)  if _COMMANDS_NOTIFI
 try:
     PROFILES_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
     ALARMS_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
-    STATUS_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
     OVERRIDES_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
     COMMANDS_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
 except Exception as _mkerr:
@@ -74,7 +64,6 @@ except Exception as _mkerr:
 
 print(f"[DEBUG] Profiles path: {PROFILES_NOTIFIER}")
 print(f"[DEBUG] Alarms   path: {ALARMS_NOTIFIER}")
-print(f"[DEBUG] Status   path: {STATUS_NOTIFIER}")
 print(f"[DEBUG] Overrides path: {OVERRIDES_NOTIFIER}")
 print(f"[DEBUG] Commands  path: {COMMANDS_NOTIFIER}")
 
@@ -112,10 +101,7 @@ class ApiModel(BaseModel):
 # IDs & Utils
 # ─────────────────────────────────────────────────────────────
 def _rand_id(n: int = 6) -> str:
-    # echte Hex-Char-Menge ohne Duplikate/Bias
-    alphabet = "0123456789abcdef"
-    return "".join(random.choices(alphabet, k=n))
-
+    return "".join(random.choices(string.hexdigits.lower(), k=n))
 
 def _trim_str(x: Any, dash_to_empty: bool = True) -> str:
     if x is None:
@@ -136,16 +122,13 @@ def _normalize_slope_params_dict(p: Dict[str, Any] | None) -> Dict[str, Any]:
     if not isinstance(p, dict):
         return {}
     out = dict(p)
-    bp_pairs = [(k, v) for k, v in p.items()
-                if isinstance(k, str) and k.startswith("bp.") and v not in (None, "")]
-    if bp_pairs:
+    bp = {k[3:]: v for k, v in p.items()
+          if isinstance(k, str) and k.startswith("bp.") and v not in (None, "")}
+    if bp:
         nested = dict(p.get("base_params") or {})
-        for k, v in bp_pairs:
-            nested[k[3:]] = v         # bp.* > base_params
-            out.pop(k, None)          # <<< Urspr. bp.* entfernen
+        nested.update(bp)  # bp.* > base_params
         out["base_params"] = nested
     return out
-
 
 # ▼▼▼ Deactivate-Mode Normalisierung
 _ALLOWED_DEACT = {"always", "true", "any_true"}
@@ -153,6 +136,15 @@ _ALLOWED_DEACT = {"always", "true", "any_true"}
 def _normalize_deactivate_value(v: Any) -> Optional[str]:
     """
     Normalisiert UI/Legacy-Werte auf 'always' | 'true' | 'any_true' | None.
+      - Strings:
+          'always'                   => 'always'
+          'true'|'full'|'match'      => 'true'
+          'any_true'|'any'|'partial' => 'any_true'
+          ''/None                    => None  (bewusst: keine Migration)
+      - Bool:
+          True  => 'true'
+          False => None
+      - Sonst: None
     """
     if v is None:
         return None
@@ -384,7 +376,7 @@ def save_json(path: Path, data: list):
         except Exception: pass
         raise
 
-# ✨ NEU: Dict-Wurzel IO (Status/Overrides/Commands)
+# ✨ NEU: Dict-Wurzel IO (Overrides/Commands)
 def load_json_any(path: Path, fallback: Any) -> Any:
     path = _to_path(path)
     if not path.exists():
@@ -947,213 +939,8 @@ def health():
         "alarms": _stat(ALARMS_NOTIFIER),
         "overrides": _stat(OVERRIDES_NOTIFIER),
         "commands": _stat(COMMANDS_NOTIFIER),
-        "status": _stat(STATUS_NOTIFIER),            
         "lock_dir": str(_LOCK_DIR)
     }
-
-# ─────────────────────────────────────────────────────────────
-# (Bestands-)Helper: synthetischer Fallback-Status
-# ─────────────────────────────────────────────────────────────
-def get_status() -> dict:
-    # Erst versuchen: echter /status beim Evaluator (optional)
-    try:
-        # Diese Funktion darf fehlschlagen – wir nutzen ohnehin die lokale Status-Datei im neuen Handler
-        import requests
-        s = requests.Session()
-        r = s.get(f"{NOTIFIER_ENDPOINT}/status", timeout=8)
-        if r.ok:
-            data = r.json()
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-
-    # Fallback: /profiles -> synthetischer Status
-    try:
-        profs = get_profiles() or []
-        items = []
-        from time import time as _t
-        for p in profs:
-            groups = []
-            for g in p.get("condition_groups") or []:
-                groups.append({
-                    "gid": g.get("gid"),
-                    "active": bool(g.get("active", True)),
-                    "deactivate_on": g.get("deactivate_on"),
-                    "min_true_ticks": g.get("min_true_ticks"),
-                    "last_eval_ts": None,
-                    "cooldown_until": None,
-                    "blockers": [],
-                })
-            items.append({"id": p.get("id"), "name": p.get("name"), "groups": groups})
-        return {"version": "synthetic", "updated_ts": _now_iso(), "profiles": items}
-
-    except Exception:
-        return {}
-
-# ─────────────────────────────────────────────────────────────
-# ✨ NEU: Status-Datei lesen & ins UI-Schema mappen
-# ─────────────────────────────────────────────────────────────
-def _load_status_file() -> Dict[str, Any]:
-    try:
-        txt = STATUS_NOTIFIER.read_text(encoding="utf-8")
-        data = json.loads(txt)
-        if isinstance(data, dict):
-            return data
-        print(f"[DEBUG] _load_status_file: root is {type(data).__name__}, expected dict")
-        return {}
-    except FileNotFoundError:
-        print(f"[DEBUG] _load_status_file: {STATUS_NOTIFIER} not found")
-        return {}
-    except Exception as e:
-        print(f"[DEBUG] _load_status_file: error reading {STATUS_NOTIFIER}: {e}")
-        return {}
-
-def _as_float_or_none(x: Any) -> Optional[float]:
-    try:
-        if x in (None, "", "null"):
-            return None
-    except Exception:
-        pass
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-def _map_group_to_ui(grp_state: Dict[str, Any], grp_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Erwartet:
-      grp_state ≈ vom Evaluator geschrieben (profiles[pid].groups[gid] = {...})
-      grp_cfg   ≈ Gruppe aus /profiles (Name, gid, interval, conditions...)
-    Liefert fürs UI:
-      - conditions_status: [{left, op, right, value_left, value_right, result}, ...]
-      - met_count, total_count, true_ticks, blockers etc.
-    """
-    conds_state = grp_state.get("conditions") or []
-    conds_cfg = grp_cfg.get("conditions") or []
-    details: List[Dict[str, Any]] = []
-    met = 0
-    total = 0
-
-    def _label_from_cfg(ccfg: Dict[str, Any], side: str) -> str:
-        # side ∈ {"left","right"}
-        base = (ccfg.get(side) or "").strip()
-        # Für „right“ hübsch aus Symbol/Interval/Output zusammensetzen, wenn 'right' leer ist.
-        if side == "right" and base == "":
-            rsym = (ccfg.get("right_symbol") or "").strip()
-            rinv = (ccfg.get("right_interval") or "").strip()
-            rout = (ccfg.get("right_output") or "").strip()
-            if rsym:
-                parts = [rsym]
-                if rinv: parts.append(f"@{rinv}")
-                if rout: parts.append(f":{rout}")
-                return "".join(parts)
-        # Für „left“ ggf. left_symbol/left_interval/linkes Output anhängen (optional)
-        if side == "left" and base:
-            lsym = (ccfg.get("left_symbol") or "").strip()
-            linv = (ccfg.get("left_interval") or "").strip()
-            lout = (ccfg.get("left_output") or "").strip()
-            # Nur anhängen, wenn es wirklich Zusatzinfos gibt
-            suffix = ""
-            if lsym:
-                s = [lsym]
-                if linv: s.append(f"@{linv}")
-                if lout: s.append(f":{lout}")
-                suffix = " [" + "".join(s) + "]"
-            return base + suffix
-        return base
-
-    for i, cst in enumerate(conds_state):
-        ok = bool(cst.get("passed"))
-        op = (cst.get("op") or cst.get("op_norm") or "").strip().lower()
-
-        lv = _as_float_or_none(cst.get("left_value"))
-        rv = _as_float_or_none(cst.get("right_value"))
-
-        cfg = conds_cfg[i] if i < len(conds_cfg) else {}
-        left_label  = _label_from_cfg(cfg, "left")  or "left"
-        right_label = _label_from_cfg(cfg, "right") or "right"
-
-        total += 1
-        if ok: met += 1
-
-        details.append({
-            "left": left_label,
-            "op": op,
-            "right": right_label,
-            "value_left": lv,
-            "value_right": rv,
-            "result": ok,
-        })
-
-    # Ticks holen (runtime.true_ticks bevorzugen)
-    rt = grp_state.get("runtime") or {}
-    ticks = rt.get("true_ticks")
-    if ticks is None:
-        ticks = grp_state.get("true_ticks")
-
-    return {
-        "gid": grp_cfg.get("gid"),
-        "name": grp_cfg.get("name") or grp_cfg.get("gid"),
-        "active": bool(grp_state.get("effective_active", False)),
-        "deactivate_on": grp_cfg.get("deactivate_on"),
-        "min_true_ticks": grp_cfg.get("min_true_ticks"),
-        "blockers": grp_state.get("blockers") or [],
-        "cooldown_until": grp_state.get("cooldown_until"),
-        "last_eval_ts": grp_state.get("last_eval_ts"),
-
-        "met_count": met,
-        "total_count": total,
-        "conditions_status": details,
-
-        "runtime": {
-            "true_ticks": ticks,
-            "last_eval_ts": grp_state.get("last_eval_ts"),
-        },
-        "true_ticks": ticks,
-    }
-
-
-@router.get("/status")
-def status():
-    # 1) Versuch: echte Status-Datei vom Evaluator
-    try:
-        data = load_json_any(STATUS_NOTIFIER, fallback=None)
-        if isinstance(data, dict) and "profiles" in data:
-            # minimal sanitisieren
-            data.setdefault("version", "notifier-api")
-            data.setdefault("updated_ts", _now_iso())
-            return data
-        print("[DEBUG] /status: STATUS_NOTIFIER vorhanden, aber kein dict/profiles – fallback")
-    except Exception as e:
-        print(f"[DEBUG] /status: STATUS_NOTIFIER read error: {e} – fallback")
-
-    # 2) Fallback: wie bisher – synthetisch aus /profiles
-    profs = load_json(PROFILES_NOTIFIER, [])
-    sanitized = _sanitize_profiles(profs)
-
-    profiles_out = []
-    for p in sanitized:
-        groups_out = []
-        for g in (p.get("condition_groups") or []):
-            total_cnt = len(g.get("conditions") or [])
-            groups_out.append({
-                "gid": g.get("gid"),
-                "name": g.get("name") or g.get("gid"),
-                "active": bool(g.get("active", True)),
-                "deactivate_on": g.get("deactivate_on"),
-                "min_true_ticks": g.get("min_true_ticks"),
-                "total_count": total_cnt,
-                "met_count": 0,
-                "conditions_status": [],
-                "last_eval_ts": None,
-                "cooldown_until": None,
-                "blockers": [],
-                "runtime": {"true_ticks": 0, "last_eval_ts": None},
-                "true_ticks": 0,
-            })
-        profiles_out.append({"id": p.get("id"), "name": p.get("name"), "groups": groups_out})
-
-    return {"version": "notifier-api", "updated_ts": _now_iso(), "profiles": profiles_out}
 
 # ─────────────────────────────────────────────────────────────
 # ALARMS: Modelle + Endpunkte (inkl. reason)
