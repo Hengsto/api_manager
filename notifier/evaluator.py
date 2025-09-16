@@ -458,6 +458,16 @@ def _numeric_or_none(x: Any) -> Optional[float]:
         return float(x) if x is not None else None
     except Exception:
         return None
+    
+def _to_int_or_none(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        return int(str(v).strip())
+    except Exception as e:
+        log.warning(f"[EVAL] bad telegram_bot_id={v!r} -> using None ({e})")
+        return None
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
@@ -685,6 +695,8 @@ def _eval_group_for_symbol(
         except Exception as e:
             res, details = False, {"error": "eval_exception", "exception": str(e)}
         details["idx"] = idx
+        details["rid"] = (cond.get("rid") or None)
+
         per_details.append(details)
 
         if details.get("error"): hard_error = details.get("error")
@@ -812,14 +824,24 @@ def _skeleton_group_from_def(group: Dict[str, Any], g_idx: int) -> Dict[str, Any
     min_ticks   = _min_true_ticks_of(group) or 1
     return {
         "group_active": bool(group.get("active", True)),
-        "last_eval_ts": None, "effective_active": False,
+        "last_eval_ts": None,
+        "effective_active": False,
         "blockers": (["misconfigured"] if misconfigured else []),
-        "auto_disabled": False, "cooldown_until": None, "fresh": True,
+        "auto_disabled": False,
+        "cooldown_until": None,
+        "fresh": True,
         "name": name,
-        "aggregate": {"logic": "AND", "passed": False, "notify_mode": notify_mode, "min_true_ticks": min_ticks},
+        "aggregate": {
+            "logic": "AND",
+            "passed": False,
+            "notify_mode": notify_mode,
+            "min_true_ticks": min_ticks
+        },
         "conditions": _label_only_conditions(group),
-        "runtime": {"met": 0, "total": len(group.get("conditions") or []), "true_ticks": None},
+        # 👉 details als leeres Array vorhanden, damit UI nie auf Fallback muss
+        "runtime": {"met": 0, "total": len(group.get("conditions") or []), "true_ticks": None, "details": []},
     }
+
 
 def sync_status_from_profiles(profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
     st = _load_status()
@@ -1004,9 +1026,10 @@ def run_check() -> List[Dict[str, Any]]:
                         "profile_id": pid, "profile_name": profile.get("name"),
                         "group_id": gid, "group_index": g_idx, "group_name": group.get("name") or f"group_{g_idx}",
                         "symbol": sym, "interval": main_interval, "exchange": group.get("exchange") or None,
-                        "telegram_bot_id": group.get("telegram_bot_id") or None,
+                        "telegram_bot_id": _to_int_or_none(group.get("telegram_bot_id")),
                         "telegram_bot_token": group.get("telegram_bot_token") or None,
                         "telegram_chat_id": group.get("telegram_chat_id") or None,
+
                         "description": group.get("description") or None,
                         "ts": now_iso, "bar_ts": bar_ts or now_iso, "tick_id": tick_id,
                         "status": status_str, "notify_mode": notify_mode, "min_true_ticks": min_ticks,
@@ -1045,6 +1068,78 @@ def run_check() -> List[Dict[str, Any]]:
             else:
                 total = len(group.get("conditions") or []); met = 0
 
+            # 👉 Bedingungen + Details aus erstem Symbol (repräsentativ) ableiten
+            conditions_list: List[Dict[str, Any]] = []
+            details_list: List[Dict[str, Any]] = []
+            if per_symbol_evals:
+                try:
+                    sample = per_symbol_evals[0]
+                    for cd in (sample.get("conditions") or []):
+                        left  = cd.get("left")  if isinstance(cd.get("left"), dict)  else {}
+                        right = cd.get("right") if isinstance(cd.get("right"), dict) else {}
+
+                        # UI-freundliche Kurzform (conditions) – wie bisher
+                        conditions_list.append({
+                            "left": left.get("label"),
+                            "right": right.get("label"),
+                            "left_spec": left.get("spec"),
+                            "right_spec": right.get("spec"),
+                            "left_output": left.get("output"),
+                            "right_output": right.get("output"),
+                            "left_col": left.get("col"),
+                            "right_col": right.get("col"),
+                            "op": cd.get("op_norm") or cd.get("op"),
+                            "passed": bool(cd.get("result")),
+                            "left_value": left.get("value"),
+                            "right_value": right.get("value"),
+                            "left_ts": left.get("ts"),
+                            "right_ts": right.get("ts"),
+                            "eval_ms": cd.get("duration_ms"),
+                            "error": cd.get("error"),
+                        })
+
+                        # 🔥 Vollständige Details (runtime.details) – damit UI echte Werte hat
+                        details_list.append({
+                            "rid": cd.get("rid") or None,
+                            "op": cd.get("op_norm") or cd.get("op"),
+                            "result": bool(cd.get("result")),
+                            "left": {
+                                "label":  left.get("label"),
+                                "spec":   left.get("spec"),
+                                "output": left.get("output"),
+                                "col":    left.get("col"),
+                                "value":  left.get("value"),
+                                "symbol": left.get("symbol"),
+                                "interval": left.get("interval"),
+                                "ts":     left.get("ts"),
+                                "params": left.get("params") or {},
+                            },
+                            "right": {
+                                "label":  right.get("label"),
+                                "spec":   right.get("spec"),
+                                "output": right.get("output"),
+                                "col":    right.get("col"),
+                                "value":  right.get("value"),
+                                "symbol": right.get("symbol"),
+                                "interval": right.get("interval"),
+                                "ts":     right.get("ts"),
+                                "params": right.get("params") or {},
+                                "right_absolut": right.get("right_absolut"),
+                                "right_change_legacy_pct": right.get("right_change_legacy_pct"),
+                            },
+                            "duration_ms": cd.get("duration_ms"),
+                            "error": cd.get("error"),
+                        })
+                except Exception as e:
+                    log.debug(f"[STATUS] details build failed pid={pid} gid={gid}: {e}")
+
+            # Vorhandene true_ticks erhalten (Gate setzt die später evtl. noch)
+            prev_true_ticks = None
+            try:
+                prev_true_ticks = (grp_st.get("runtime") or {}).get("true_ticks")
+            except Exception:
+                prev_true_ticks = None
+
             grp_st.update({
                 "name": (group.get("name") or f"group_{g_idx}"),
                 "effective_active": bool(effective_active),
@@ -1056,33 +1151,25 @@ def run_check() -> List[Dict[str, Any]]:
                 "last_bar_ts": _safe_max_iso(ts_list, None),
                 "aggregate": {
                     "logic": "AND",
-                    "passed": any((ev["status"] == "FULL") or (notify_mode == "any_true" and ev["status"] in ("FULL","PARTIAL")) for ev in per_symbol_evals),
+                    "passed": any(
+                        (ev["status"] == "FULL")
+                        or (notify_mode == "any_true" and ev["status"] in ("FULL","PARTIAL"))
+                        for ev in per_symbol_evals
+                    ),
                     "notify_mode": notify_mode,
                     "min_true_ticks": (min_ticks if min_ticks is not None else 1),
                 },
-                "runtime": {"met": met, "total": total, "true_ticks": None},
+                "conditions": conditions_list if conditions_list else _label_only_conditions(group),
+                "runtime": {
+                    "met": met,
+                    "total": total,
+                    "true_ticks": prev_true_ticks,
+                    "details": details_list,  # 👉 das will die UI sehen
+                },
             })
 
-            if per_symbol_evals:
-                try:
-                    sample = per_symbol_evals[0]
-                    conds: List[Dict[str, Any]] = []
-                    for cd in (sample.get("conditions") or []):
-                        left  = cd.get("left")  if isinstance(cd.get("left"), dict)  else {}
-                        right = cd.get("right") if isinstance(cd.get("right"), dict) else {}
-                        conds.append({
-                            "left": left.get("label"), "right": right.get("label"),
-                            "left_spec": left.get("spec"), "right_spec": right.get("spec"),
-                            "left_output": left.get("output"), "right_output": right.get("output"),
-                            "left_col": left.get("col"), "right_col": right.get("col"),
-                            "op": cd.get("op_norm") or cd.get("op"), "passed": bool(cd.get("result")),
-                            "left_value": left.get("value"), "right_value": right.get("value"),
-                            "left_ts": left.get("ts"), "right_ts": right.get("ts"),
-                            "eval_ms": cd.get("duration_ms"), "error": cd.get("error"),
-                        })
-                    grp_st["conditions"] = conds
-                except Exception as e:
-                    log.debug(f"[STATUS] conditions summary failed pid={pid} gid={gid}: {e}")
+            if DEBUG_VALUES:
+                log.debug(f"[STATUS] pid={pid} gid={gid} conds={len(conditions_list)} details={len(details_list)}")
 
     triggered = gate_and_build_triggers(evals)
 

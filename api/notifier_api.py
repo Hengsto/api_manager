@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Body
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Literal, Optional, Union
 from pathlib import Path
@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 
 from config import PROFILES_NOTIFIER as _PROFILES_NOTIFIER_CFG, ALARMS_NOTIFIER as _ALARMS_NOTIFIER_CFG
 
-# ✨ NEU: optionale Pfade für Overrides/Commands (Fallbacks, wenn nicht in config definiert)
+# ✨ NEU: optionale Pfade für Overrides/Commands/Status (Fallbacks, wenn nicht in config definiert)
 try:
     from config import OVERRIDES_NOTIFIER as _OVERRIDES_NOTIFIER_CFG  # optional
 except Exception:
@@ -29,6 +29,10 @@ try:
     from config import COMMANDS_NOTIFIER as _COMMANDS_NOTIFIER_CFG  # optional
 except Exception:
     _COMMANDS_NOTIFIER_CFG = None
+try:
+    from config import STATUS_NOTIFIER as _STATUS_NOTIFIER_CFG  # optional
+except Exception:
+    _STATUS_NOTIFIER_CFG = None
 
 from notifier.indicator_registry import REGISTERED, SIMPLE_SIGNALS
 
@@ -45,11 +49,14 @@ def _to_path(p: Any) -> Path:
 PROFILES_NOTIFIER: Path = _to_path(_PROFILES_NOTIFIER_CFG)
 ALARMS_NOTIFIER:   Path = _to_path(_ALARMS_NOTIFIER_CFG)
 
-# ✨ NEU: Overrides/Commands Pfade (Fallback neben PROFILES_NOTIFIER)
+# ✨ NEU: Overrides/Commands/Status Pfade (Fallback neben PROFILES_NOTIFIER)
 _OVERRIDES_FALLBACK = PROFILES_NOTIFIER.parent / "notifier_overrides.json"
 _COMMANDS_FALLBACK  = PROFILES_NOTIFIER.parent / "notifier_commands.json"
+_STATUS_FALLBACK    = PROFILES_NOTIFIER.parent / "notifier_status.json"
+
 OVERRIDES_NOTIFIER: Path = _to_path(_OVERRIDES_NOTIFIER_CFG) if _OVERRIDES_NOTIFIER_CFG else _OVERRIDES_FALLBACK
 COMMANDS_NOTIFIER:  Path = _to_path(_COMMANDS_NOTIFIER_CFG)  if _COMMANDS_NOTIFIER_CFG  else _COMMANDS_FALLBACK
+STATUS_NOTIFIER:    Path = _to_path(_STATUS_NOTIFIER_CFG)    if _STATUS_NOTIFIER_CFG    else _STATUS_FALLBACK
 
 # ─────────────────────────────────────────────────────────────
 # Verzeichnisse
@@ -59,6 +66,7 @@ try:
     ALARMS_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
     OVERRIDES_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
     COMMANDS_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
+    STATUS_NOTIFIER.parent.mkdir(parents=True, exist_ok=True)  # ← wichtig für /status
 except Exception as _mkerr:
     print(f"💥 mkdir for JSON dirs failed: {_mkerr}")
 
@@ -66,6 +74,7 @@ print(f"[DEBUG] Profiles path: {PROFILES_NOTIFIER}")
 print(f"[DEBUG] Alarms   path: {ALARMS_NOTIFIER}")
 print(f"[DEBUG] Overrides path: {OVERRIDES_NOTIFIER}")
 print(f"[DEBUG] Commands  path: {COMMANDS_NOTIFIER}")
+print(f"[DEBUG] Status   path: {STATUS_NOTIFIER}")
 
 def _is_relative_to(p: Path, base: Path) -> bool:
     try:
@@ -111,6 +120,9 @@ def _trim_str(x: Any, dash_to_empty: bool = True) -> str:
         return ""
     return s
 
+def _name_key(x: Any) -> str:
+    return _trim_str(x).lower()
+
 def _sha256_bytes(b: bytes) -> str:
     h = hashlib.sha256(); h.update(b); return h.hexdigest()
 
@@ -136,15 +148,6 @@ _ALLOWED_DEACT = {"always", "true", "any_true"}
 def _normalize_deactivate_value(v: Any) -> Optional[str]:
     """
     Normalisiert UI/Legacy-Werte auf 'always' | 'true' | 'any_true' | None.
-      - Strings:
-          'always'                   => 'always'
-          'true'|'full'|'match'      => 'true'
-          'any_true'|'any'|'partial' => 'any_true'
-          ''/None                    => None  (bewusst: keine Migration)
-      - Bool:
-          True  => 'true'
-          False => None
-      - Sonst: None
     """
     if v is None:
         return None
@@ -376,7 +379,7 @@ def save_json(path: Path, data: list):
         except Exception: pass
         raise
 
-# ✨ NEU: Dict-Wurzel IO (Overrides/Commands)
+# ✨ NEU: Dict-Wurzel IO (Overrides/Commands/Status)
 def load_json_any(path: Path, fallback: Any) -> Any:
     path = _to_path(path)
     if not path.exists():
@@ -552,7 +555,6 @@ def _sanitize_group(g: dict) -> dict:
     if _mtt is not None and _mtt < 1:
         print(f"[DEBUG] _sanitize_group: min_true_ticks={_mtt} < 1 -> set None")
         _mtt = None
-    # WICHTIG: Key immer setzen, auch wenn None → erscheint in API
     g["min_true_ticks"] = _mtt
 
     # ▼▼▼ deactivate_on normalisieren (+ Legacy auto_deactivate)
@@ -571,7 +573,6 @@ def _sanitize_group(g: dict) -> dict:
         if before_deact not in (None, ""):
             print(f"[DEBUG] _sanitize_group: drop invalid deactivate_on='{before_deact}'")
         g.pop("deactivate_on", None)
-    # Legacy-Feld entfernen
     if "auto_deactivate" in g:
         g.pop("auto_deactivate", None)
 
@@ -704,7 +705,6 @@ def get_profiles():
     data = load_json(PROFILES_NOTIFIER, [])
     sanitized = _sanitize_profiles(data)
     print(f"[DEBUG] get_profiles -> {len(sanitized)} profiles")
-    # Debug: zeig Keys der ersten Gruppe, falls vorhanden
     try:
         if sanitized and (sanitized[0].get("condition_groups") or []):
             print(f"[DEBUG] get_profiles: first group keys -> {list((sanitized[0]['condition_groups'][0]).keys())}")
@@ -732,25 +732,51 @@ def get_profile(pid: str):
     print(f"[DEBUG] get_profile -> id={pid} not found")
     raise HTTPException(status_code=404, detail="Profil nicht gefunden")
 
+# ✨ NEU: Upsert-by-Name – gleicher Name überschreibt statt zu duplizieren
 @router.post("/profiles", response_model=dict)
 def add_profile(p: ProfileCreate):
     profs = load_json(PROFILES_NOTIFIER, [])
     incoming = model_to_dict(p)
 
+    # ID setzen (falls mitgegeben, respektieren; sonst neu)
     pid = incoming.get("id") or str(uuid.uuid4())
     incoming["id"] = pid
 
-    # sanitize + IDs
+    # sanitize + IDs (für Gruppen/Conditions)
     new_groups = []
     for g in incoming.get("condition_groups", []) or []:
         if isinstance(g, dict): new_groups.append(_sanitize_group(g))
     incoming["condition_groups"] = new_groups
 
+    # Upsert-by-Name (case-insensitiv, getrimmt)
+    target_name_key = _name_key(incoming.get("name"))
+    existing_idx = next((i for i, it in enumerate(profs) if _name_key((it or {}).get("name")) == target_name_key), None)
+
+    if existing_idx is not None:
+        before_norm = _sanitize_profiles([profs[existing_idx]])[0]
+        merged = _merge_ids(before_norm, deepcopy(incoming))
+        after_norm = _sanitize_profiles([merged])[0]
+        # Alte ID beibehalten
+        after_norm["id"] = before_norm.get("id") or after_norm["id"]
+
+        if json.dumps(before_norm, sort_keys=True, ensure_ascii=False) == json.dumps(after_norm, sort_keys=True, ensure_ascii=False):
+            print(f"[DEBUG] add_profile (upsert-by-name) -> NO CHANGE for name='{incoming.get('name')}' (id={after_norm['id']})")
+            _status_autofix_merge()
+            return {"status": "ok", "id": after_norm["id"], "updated": False, "upserted_by_name": True}
+
+        profs[existing_idx] = after_norm
+        save_json(PROFILES_NOTIFIER, profs)
+        _status_autofix_merge()
+        print(f"[DEBUG] add_profile (upsert-by-name) -> updated name='{incoming.get('name')}' id={after_norm['id']}")
+        return {"status": "updated", "id": after_norm["id"], "updated": True, "upserted_by_name": True}
+
+    # Neu anlegen
     print(f"[DEBUG] add_profile <- {json.dumps(incoming, ensure_ascii=False)[:800]}...")
     profs.append(incoming)
     save_json(PROFILES_NOTIFIER, profs)
+    _status_autofix_merge()
     print(f"[DEBUG] add_profile -> created id={pid} (total={len(profs)})")
-    return {"status": "ok", "id": pid}
+    return {"status": "ok", "id": pid, "created": True, "upserted_by_name": False}
 
 @router.put("/profiles/{pid}", response_model=dict)
 def update_profile(pid: str, p: ProfileUpdate):
@@ -793,11 +819,14 @@ def update_profile(pid: str, p: ProfileUpdate):
         if activate_flag or (not before_enabled and after_enabled):
             print(f"[DEBUG] update_profile -> run activation routine (no profile change) id={pid}")
             _run_activation_routine(after_norm, activate_flag=True, rebaseline=rebaseline_flag)
+        _status_autofix_merge()
         return {"status": "ok", "id": pid}
 
     # Persistiere Profil
     profs[idx] = after_norm
     save_json(PROFILES_NOTIFIER, profs)
+    _status_autofix_merge()
+
     print(f"[DEBUG] update_profile -> updated id={pid}")
 
     # ✨ NEU: Aktivierungs-Routine nur, wenn aktiviert wurde (Flag ODER false→true)
@@ -829,18 +858,15 @@ def _run_activation_routine(profile_obj: dict, activate_flag: bool, rebaseline: 
             continue
 
         slot = _ensure_ovr_slot(ovr, pid, gid)
-        # Setze nur, wenn sich was ändert → weniger Writes
         if slot.get("forced_off", False) or (slot.get("snooze_until") is not None):
             print(f"[DEBUG] activation: clear overrides pid={pid} gid={gid} (forced_off->False, snooze_until->None)")
         slot["forced_off"] = False
         slot["snooze_until"] = None
         changed += 1
 
-        # enqueue command (idempotent genug auf Evaluator-Seite; hier nicht dedupen)
         _enqueue_command(pid, gid, rearm=True, rebaseline=rebaseline)
         enq += 1
 
-    # Schreibe Overrides nur, wenn sich Slots berührt haben
     if changed > 0:
         _save_overrides(ovr)
         print(f"[DEBUG] activation: overrides saved (changed groups={changed})")
@@ -857,6 +883,8 @@ def delete_profile(pid: str):
     else:
         print(f"[DEBUG] delete_profile -> removed id={pid}")
     save_json(PROFILES_NOTIFIER, profs)
+    _status_autofix_merge()
+
     return {"status": "deleted", "id": pid}
 
 # ─────────────────────────────────────────────────────────────
@@ -939,6 +967,7 @@ def health():
         "alarms": _stat(ALARMS_NOTIFIER),
         "overrides": _stat(OVERRIDES_NOTIFIER),
         "commands": _stat(COMMANDS_NOTIFIER),
+        "status": _stat(STATUS_NOTIFIER),
         "lock_dir": str(_LOCK_DIR)
     }
 
@@ -978,10 +1007,24 @@ def _load_alarms() -> List[dict]:
         a.setdefault("reason", "")
         a.setdefault("reason_code", "")
         a.setdefault("matched", [])
+        # matched evtl. als String → Liste parsen
+        if isinstance(a["matched"], str):
+            try:
+                parsed = json.loads(a["matched"])
+                a["matched"] = parsed if isinstance(parsed, list) else []
+            except Exception:
+                a["matched"] = []
         a.setdefault("deactivate_applied", "")
         if a.get("deactivate_applied") not in {"", "true", "any_true"}:
             a["deactivate_applied"] = ""
         a.setdefault("meta", {})
+        # meta evtl. als String → Dict parsen
+        if isinstance(a["meta"], str):
+            try:
+                parsed_meta = json.loads(a["meta"])
+                a["meta"] = parsed_meta if isinstance(parsed_meta, dict) else {}
+            except Exception:
+                a["meta"] = {}
         out.append(a)
     return out
 
@@ -998,6 +1041,29 @@ def list_alarms():
 def add_alarm(a: AlarmIn):
     items = _load_alarms()
     payload = model_to_dict(a)
+
+    # matched härten
+    m = payload.get("matched", [])
+    if isinstance(m, str):
+        try:
+            m2 = json.loads(m)
+            payload["matched"] = m2 if isinstance(m2, list) else []
+        except Exception:
+            payload["matched"] = []
+    elif not isinstance(m, list):
+        payload["matched"] = []
+
+    # meta härten
+    meta = payload.get("meta", {})
+    if isinstance(meta, str):
+        try:
+            m3 = json.loads(meta)
+            payload["meta"] = m3 if isinstance(m3, dict) else {}
+        except Exception:
+            payload["meta"] = {}
+    elif not isinstance(meta, dict):
+        payload["meta"] = {}
+
     aid = payload.get("id") or _rand_id()
     payload["id"] = aid
 
@@ -1064,3 +1130,203 @@ def post_command(profile_id: str, group_id: str, body: CommandPost):
     rebaseline = bool(pb.get("rebaseline", False))
     _enqueue_command(profile_id, group_id, rearm=rearm, rebaseline=rebaseline)
     return {"status": "ok", "profile_id": profile_id, "group_id": group_id, "rearm": rearm, "rebaseline": rebaseline}
+
+# ─────────────────────────────────────────────────────────────
+# ✨ NEU: STATUS – Snapshot schreiben/lesen (für sofortigen UI-Refresh)
+# ─────────────────────────────────────────────────────────────
+def _build_status_skeleton_from_profiles(profiles: list[dict]) -> dict:
+    """Erzeuge einen frischen Status-Snapshot aus den aktuellen Profilen (ohne Evaluationswerte)."""
+    sanitized = _sanitize_profiles(profiles or [])
+    profiles_map: dict[str, dict] = {}
+    for p in sanitized:
+        pid = str(p.get("id") or "")
+        if not pid:
+            continue
+        gmap: dict[str, dict] = {}
+        for g in (p.get("condition_groups") or []):
+            gid = str(g.get("gid") or "")
+            if not gid:
+                continue
+            gmap[gid] = {
+                "name": g.get("name") or gid,
+                "group_active": bool(g.get("active", True)),
+                "effective_active": bool(g.get("active", True)),
+                "blockers": [],
+                "auto_disabled": False,
+                "cooldown_until": None,
+                "fresh": True,
+                "aggregate": {
+                    "min_true_ticks": g.get("min_true_ticks"),
+                },
+                "runtime": {
+                    "true_ticks": 0,
+                    "last_eval_ts": None,
+                },
+                "last_eval_ts": None,
+                "conditions": [],
+                "conditions_status": [],
+            }
+        profiles_map[pid] = {
+            "id": pid,
+            "name": p.get("name") or pid,
+            "profile_active": bool(p.get("enabled", True)),
+            "groups": gmap,
+        }
+    return {
+        "version": 1,                 # numerisch
+        "flavor": "notifier-api",     # Info
+        "updated_ts": _now_iso(),
+        "profiles": profiles_map,
+    }
+
+def _profiles_fingerprint(profiles: list[dict]) -> str:
+    try:
+        normalized = _sanitize_profiles(deepcopy(profiles))
+        payload = json.dumps(normalized, sort_keys=True, ensure_ascii=False)
+        return _sha256_bytes(payload.encode("utf-8"))
+    except Exception:
+        return ""
+
+def _load_status_any() -> Dict[str, Any]:
+    data = load_json_any(STATUS_NOTIFIER, {"version": 1, "flavor": "notifier-api", "updated_ts": _now_iso(), "profiles": {}})
+    if not isinstance(data, dict):
+        data = {"version": 1, "flavor": "notifier-api", "updated_ts": _now_iso(), "profiles": {}}
+    if "profiles" not in data or not isinstance(data["profiles"], dict):
+        data["profiles"] = {}
+    if "profiles_fp" not in data:
+        data["profiles_fp"] = ""
+    try:
+        data["version"] = int(data.get("version", 1))
+    except Exception:
+        data["version"] = 1
+    if "flavor" not in data:
+        data["flavor"] = "notifier-api"
+    return data
+
+def _save_status_any(data: Dict[str, Any]) -> None:
+    data = deepcopy(data)
+    data["updated_ts"] = _now_iso()
+    data.setdefault("profiles_fp", data.get("profiles_fp", ""))
+    try:
+        data["version"] = int(data.get("version", 1))
+    except Exception:
+        data["version"] = 1
+    data.setdefault("flavor", "notifier-api")
+    save_json_any(STATUS_NOTIFIER, data)
+
+def _merge_status_keep_runtime(old: Dict[str, Any], skel: Dict[str, Any]) -> Dict[str, Any]:
+    """Mergt skel in old, behält Runtime/Evaluationsfelder wenn vorhanden."""
+    out = deepcopy(old)
+    out.setdefault("version", 1)
+    out.setdefault("flavor", "notifier-api")
+    out.setdefault("profiles", {})
+
+    for pid, p_s in (skel.get("profiles") or {}).items():
+        p_o = (out["profiles"].get(pid) or {})
+        p_o["id"] = p_s.get("id", pid)
+        p_o["name"] = p_s.get("name") or p_o.get("name") or pid
+        p_o["profile_active"] = bool(p_s.get("profile_active", p_o.get("profile_active", True)))
+        p_o.setdefault("groups", {})
+        for gid, g_s in (p_s.get("groups") or {}).items():
+            g_o = p_o["groups"].get(gid, {})
+            g_o["name"] = g_s.get("name") or g_o.get("name") or gid
+            g_o["group_active"] = bool(g_s.get("group_active", g_o.get("group_active", True)))
+            g_o["effective_active"] = bool(g_s.get("effective_active", g_o.get("effective_active", True)))
+            g_o["blockers"] = g_o.get("blockers", [])
+            g_o["auto_disabled"] = bool(g_o.get("auto_disabled", False))
+            g_o["cooldown_until"] = g_o.get("cooldown_until", None)
+            g_o["fresh"] = g_o.get("fresh", True)
+            agg = g_o.get("aggregate", {})
+            agg["min_true_ticks"] = g_s.get("aggregate", {}).get("min_true_ticks", agg.get("min_true_ticks"))
+            g_o["aggregate"] = agg
+            rt = g_o.get("runtime", {})
+            if not isinstance(rt, dict):
+                rt = {}
+            g_o["runtime"] = rt
+            g_o.setdefault("conditions", g_o.get("conditions", []))
+            g_o.setdefault("conditions_status", g_o.get("conditions_status", []))
+            g_o["last_eval_ts"] = g_o.get("last_eval_ts", None)
+            p_o["groups"][gid] = g_o
+        out["profiles"][pid] = p_o
+    return out
+
+def _status_autofix_merge() -> None:
+    """
+    Nach jeder Profiländerung: baue Skeleton aus Profilen,
+    merge in bestehenden Status (Runtime-Werte bleiben erhalten),
+    aktualisiere Fingerprint und speichere.
+    """
+    profiles = load_json(PROFILES_NOTIFIER, [])
+    skeleton = _build_status_skeleton_from_profiles(profiles)
+    current  = _load_status_any()
+    merged   = _merge_status_keep_runtime(current, skeleton)
+    merged["profiles_fp"] = _profiles_fingerprint(profiles)
+    _save_status_any(merged)
+    print(f"[DEBUG] status auto-fix -> saved snapshot (profiles={len(merged.get('profiles', {}))})")
+
+
+@router.post("/status/sync", response_model=dict)
+def status_sync(body: Dict[str, Any] = Body(default=None)):
+    """
+    Sofort-Refresh des Status-Snapshots.
+    Frontend darf {profiles:[...]} mitsenden; sonst nehmen wir die gespeicherten Profile.
+    Merged nur Struktur/Metadaten hinein und BEHÄLT vorhandene Runtime/Evaluationswerte.
+    """
+    try:
+        incoming = body or {}
+        profiles = incoming.get("profiles")
+        if not isinstance(profiles, list):
+            profiles = load_json(PROFILES_NOTIFIER, [])
+        skeleton = _build_status_skeleton_from_profiles(profiles)
+        current = _load_status_any()
+        merged = _merge_status_keep_runtime(current, skeleton)
+        merged["profiles_fp"] = _profiles_fingerprint(profiles)
+        _save_status_any(merged)
+        print(f"[DEBUG] /status/sync -> merged skeleton into status (profiles={len(merged.get('profiles', {}))})")
+        return {"status": "ok", "profiles": len(merged.get("profiles", {}))}
+    except Exception as e:
+        print(f"💥 /status/sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/status")
+def get_status(force: Optional[int] = Query(default=0, description="1 = Status aus Profilen neu aufbauen & mergen")):
+    """
+    Liefert den zuletzt geschriebenen Status-Snapshot.
+    Falls force=1 ODER der Snapshot veraltet/leer ist, wird ein Skeleton aus den aktuellen Profilen
+    gebaut, in den bestehenden Status gemerged, gespeichert und dann zurückgegeben.
+    """
+    snap = _load_status_any()
+    try:
+        need_fix = bool(force)
+        profiles = load_json(PROFILES_NOTIFIER, [])
+        skeleton = _build_status_skeleton_from_profiles(profiles)
+        fp = _profiles_fingerprint(profiles)
+
+        if not need_fix:
+            if not snap.get("profiles"):
+                need_fix = True
+            else:
+                if snap.get("profiles_fp", "") != fp:
+                    need_fix = True
+                else:
+                    for pid, p_s in (skeleton.get("profiles") or {}).items():
+                        sp = (snap.get("profiles") or {}).get(pid, {})
+                        s_groups = (sp.get("groups") or {})
+                        for gid in (p_s.get("groups") or {}).keys():
+                            if gid not in s_groups:
+                                need_fix = True
+                                break
+                        if need_fix:
+                            break
+
+        if need_fix:
+            merged = _merge_status_keep_runtime(snap, skeleton)
+            merged["profiles_fp"] = fp
+            _save_status_any(merged)
+            print(f"[DEBUG] /status (auto-fix) -> merged & saved (profiles={len(merged.get('profiles', {}))})")
+            return merged
+
+        return snap
+    except Exception as e:
+        print(f"💥 /status failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
