@@ -25,12 +25,10 @@ PARSE_MODE: str = "Markdown"   # Legacy-Markdown (V1), Escaping angepasst
 MAX_MSG_LEN: int = 4096        # Telegram Limit
 SEND_DELAY_SEC: float = 0.25   # kleines Intervall gegen Rate-Limits
 COOLDOWN_SEC: int = int(os.getenv("ALARM_COOLDOWN_SEC", "300"))  # via ENV übersteuerbar
-DEBUG = True
+DEBUG = os.getenv("ALARM_DEBUG", "1").strip() in ("1","true","yes","on")
 BYPASS_COOLDOWN: bool = os.getenv("ALARM_BYPASS_COOLDOWN", "0").strip() in ("1","true","yes","on")
 
-
 STATE_FILE = Path(".alarm_checker_state.json")  # persistenter Dedupe-State
-DEBUG = True
 
 _TELEGRAM_BASE = "https://api.telegram.org"
 
@@ -66,7 +64,9 @@ def _http_json(method: str, url: str, *, params: Dict[str, Any] | None = None,
     for i in range(max(1, tries)):
         try:
             if DEBUG:
-                print(f"[DEBUG] {method} {url} try {i+1}/{tries}")
+                print(f"[DEBUG] HTTP {_fmt_try(i, tries)} {method} {url}")
+                if json_body is not None:
+                    print(f"[DEBUG]   payload: {json.dumps(json_body, ensure_ascii=False)[:400]}")
             r = sess.request(method, url, params=params, json=json_body, timeout=timeout)
 
             # 429 – respektiere Retry-After
@@ -91,7 +91,20 @@ def _http_json(method: str, url: str, *, params: Dict[str, Any] | None = None,
                 except Exception:
                     pass
                 r.raise_for_status()
-            return r.json() if r.text else {}
+
+            if not r.text:
+                if DEBUG:
+                    print("[DEBUG] HTTP ok: empty body -> {}")
+                return {}
+            try:
+                out = r.json()
+                if DEBUG:
+                    print(f"[DEBUG] HTTP ok: JSON len={len(r.text)}")
+                return out
+            except Exception:
+                if DEBUG:
+                    print(f"[DEBUG] Non-JSON response (len={len(r.text)}), returning text-wrapper")
+                return {"_text": r.text}
 
         except Exception as e:
             last_err = e
@@ -102,16 +115,23 @@ def _http_json(method: str, url: str, *, params: Dict[str, Any] | None = None,
         print(f"[DEBUG] HTTP failed after retries: {last_err}")
     return None
 
+def _fmt_try(i: int, tries: int) -> str:
+    return f"try {i+1}/{tries}"
+
 # ---------------------------------------------------------------------
 # State-Handling (Dedupe/Cooldown)
 # ---------------------------------------------------------------------
 def _load_state() -> Dict[str, float]:
     if not STATE_FILE.exists():
+        if DEBUG:
+            print(f"[DEBUG] state file missing -> {STATE_FILE} (starting fresh)")
         return {}
     try:
         with STATE_FILE.open("r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
+            if DEBUG:
+                print(f"[DEBUG] state loaded: {len(data)} keys")
             return {str(k): float(v) for k, v in data.items()}
     except Exception as e:
         if DEBUG:
@@ -122,6 +142,8 @@ def _save_state(state: Dict[str, float]) -> None:
     try:
         with STATE_FILE.open("w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
+        if DEBUG:
+            print(f"[DEBUG] state saved: {len(state)} keys -> {STATE_FILE}")
     except Exception as e:
         if DEBUG:
             print(f"[DEBUG] State save failed: {e}")
@@ -132,25 +154,35 @@ def _alarm_key(alarm: Dict[str, Any]) -> str:
     payload = {
         "single_mode": smode,
         "profile_id": alarm.get("profile_id"),
-        "group_id": alarm.get("group_id"),
+        # Bevorzugt group_id (stabiler als group_index, falls beide vorhanden)
+        "group_id": alarm.get("group_id") or alarm.get("group_index"),
         "symbol": (None if smode in ("group","everything") else alarm.get("symbol")),
         "interval": alarm.get("interval"),
-        "status": (alarm.get("status") or "FULL"),
+        "status": (alarm.get("status") or "FULL").upper(),
         "tick_id": tick_id,  # pro Kerze genau einmal
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
+    key = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    if DEBUG:
+        print(f"[DEBUG] dedupe payload={raw} -> key={key[:10]}…")
+    return key
 
 def _is_cooled_down(state: Dict[str, float], key: str, now: float) -> bool:
     if BYPASS_COOLDOWN:
-        if DEBUG: print(f"[DEBUG] cooldown bypass active → key={key[:10]}…")
+        if DEBUG:
+            print(f"[DEBUG] cooldown bypass active → key={key[:10]}…")
         return True
     last = state.get(key, 0.0)
-    return (now - last) >= COOLDOWN_SEC
+    cooled = (now - last) >= COOLDOWN_SEC
+    if DEBUG:
+        delta = now - last
+        print(f"[DEBUG] cooldown check key={key[:10]}… delta={int(delta)}s >= {COOLDOWN_SEC}? {cooled}")
+    return cooled
 
 def _mark_sent(state: Dict[str, float], key: str, now: float) -> None:
     state[key] = now
+    if DEBUG:
+        print(f"[DEBUG] mark sent key={key[:10]}… at ts={now}")
 
 # ---------------------------------------------------------------------
 # Markdown Escaping (Legacy Markdown)
@@ -158,6 +190,7 @@ def _mark_sent(state: Dict[str, float], key: str, now: float) -> None:
 def _escape_markdown(text: str) -> str:
     if not isinstance(text, str):
         text = str(text)
+    # Hinweis: V1-Markdown ist zickig; wir escapen breit, um Brüche zu vermeiden.
     replacements = [
         ("\\", "\\\\"),
         ("_", "\\_"),
@@ -176,7 +209,7 @@ def _escape_markdown(text: str) -> str:
         ("|", "\\|"),
         ("{", "\\{"),
         ("}", "\\}"),
-        (".", "\\."),
+        (".", "\\."),  # bleibt erhalten wie im Original
         ("!", "\\!"),
     ]
     out = text
@@ -194,7 +227,7 @@ def _telegram_post(token: str, payload: Dict[str, Any], timeout: float = 10.0, m
     for i in range(max_1 := max(1, max_tries)):
         try:
             if DEBUG:
-                print(f"[DEBUG] Telegram POST try {i+1}/{max_1} → chat_id={payload.get('chat_id')} len(text)={len(str(payload.get('text','')))}")
+                print(f"[DEBUG] Telegram {_fmt_try(i, max_1)} POST → chat_id={payload.get('chat_id')} len(text)={len(str(payload.get('text','')))}")
             r = sess.post(url, json=payload, timeout=timeout)
             if r.status_code == 429:
                 retry_after = int(r.headers.get("Retry-After", "1"))
@@ -283,8 +316,6 @@ def _fmt_cond_line(c: Dict[str, Any]) -> str:
     sym_tag = f"[{sym}] " if sym else ""
     return f"{emoji} {sym_tag}`{l_tag} {op} {r_tag}`  →  {l_val} vs {r_val}"
 
-
-
 def _derive_overrides(alarm: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """
     Liefert (chat_id, bot_token) aus Alarm, falls vorhanden.
@@ -350,28 +381,21 @@ def format_alarm_message(alarm: Dict[str, Any]) -> str:
 def _persist_alarm_via_api(alarm: Dict[str, Any]) -> None:
     try:
         url = f"{NOTIFIER_ENDPOINT}/alarms"
-        # group_id-Fallback
-        gid = alarm.get("group_id") or alarm.get("group_index")
 
-        gid = alarm.get("group_id") or alarm.get("group_index")
-        # alarm_checker._persist_alarm_via_api
         gid_raw = alarm.get("group_id")
         gid_fallback = alarm.get("group_index")
-
-        # immer String für die API
-        group_id_str = (
-            str(gid_raw) if gid_raw not in (None, "") else str(gid_fallback)
-        )
+        group_id_str = str(gid_raw) if gid_raw not in (None, "") else str(gid_fallback)
 
         payload = {
             "ts": alarm.get("ts"),
-            "profile_id": str(alarm.get("profile_id") or ""),  # safe-String
-            "group_id": group_id_str,                          # <<< wichtig
+            "profile_id": str(alarm.get("profile_id") or ""),
+            "group_id": group_id_str,
             "symbol": str(alarm.get("symbol") or ""),
             "interval": str(alarm.get("interval") or ""),
             "reason": alarm.get("reason") or "",
             "reason_code": alarm.get("reason_code") or "",
-            "matched": json.dumps(alarm.get("conditions") or []),
+            # WICHTIG: Liste schicken, nicht json.dumps(...)
+            "matched": list(alarm.get("conditions") or []),
             "deactivate_applied": alarm.get("deactivate_applied", ""),
             "meta": {
                 "status": alarm.get("status"),
@@ -385,9 +409,9 @@ def _persist_alarm_via_api(alarm: Dict[str, Any]) -> None:
                 "telegram_bot_token": alarm.get("telegram_bot_token"),
             },
         }
-        print(f"[DEBUG] persist payload group_id={payload['group_id']!r} (type={type(payload['group_id']).__name__})")
-
-
+        if DEBUG:
+            print(f"[DEBUG] persist payload group_id={payload['group_id']!r} (type={type(payload['group_id']).__name__})")
+            print(f"[DEBUG] persist payload matched_type={type(payload['matched']).__name__} len={len(payload['matched'])}")
 
         res = _http_json("POST", url, json_body=payload)
         if DEBUG:
@@ -395,15 +419,43 @@ def _persist_alarm_via_api(alarm: Dict[str, Any]) -> None:
     except Exception as e:
         print(f"[DEBUG] Persist alarm error: {e}")
 
+
+def _set_group_active(pid: Any, gid: Any, active: bool) -> bool:
+    """
+    Hartes Setzen von group.active über API:
+      PATCH /notifier/profiles/{pid}/groups/{gid}/active  { "active": <bool> }
+    """
+    try:
+        if pid in (None, "") or gid in (None, ""):
+            if DEBUG:
+                print(f"[DEBUG] _set_group_active skipped (missing pid/gid) pid={pid!r} gid={gid!r}")
+            return False
+        url = f"{NOTIFIER_ENDPOINT}/profiles/{pid}/groups/{gid}/active"
+        body = {"active": bool(active)}
+        if DEBUG:
+            print(f"[DEBUG] _set_group_active → PATCH {url} payload={body}")
+        res = _http_json("PATCH", url, json_body=body)
+        ok = res is not None
+        if DEBUG:
+            print(f"[DEBUG] _set_group_active result -> {'OK' if ok else 'FAIL'} (pid={pid}, gid={gid}, active={active})")
+        return ok
+    except Exception as e:
+        print(f"[DEBUG] _set_group_active error: {e}")
+        return False
+
 def _maybe_auto_deactivate_via_overrides(alarm: Dict[str, Any]) -> bool:
     """
     Setzt forced_off=true via API-Patch wenn deactivate_on-Regel greift.
-    Rückgabe: True, wenn Deaktivierung angewandt wurde.
+    Zusätzlich: setzt group.active=false über Profile-API.
+    Rückgabe: True, wenn mind. eine der Aktionen angewandt wurde.
     """
     mode = (alarm.get("notify_mode") or "").lower()    # "true" | "any_true" | "always"
     status = (alarm.get("status") or "").upper()       # "FULL" | "PARTIAL" | ...
     pid = alarm.get("profile_id")
     gid = alarm.get("group_id") or alarm.get("group_index")
+
+    if DEBUG:
+        print(f"[DEBUG] auto-deactivate check pid={pid} gid={gid} mode={mode} status={status}")
 
     if not pid or gid in (None, ""):
         if DEBUG:
@@ -423,65 +475,99 @@ def _maybe_auto_deactivate_via_overrides(alarm: Dict[str, Any]) -> bool:
             print(f"[DEBUG] auto-deactivate not applicable (mode={mode}, status={status})")
         return False
 
+    applied_any = False
+
+    # 1) Overrides: forced_off=true
     try:
         url = f"{NOTIFIER_ENDPOINT}/overrides/{pid}/{gid}"
         body = {"forced_off": True}
-        res = _http_json("PATCH", url, json_body=body)
         if DEBUG:
-            print(f"[DEBUG] overrides forced_off=true -> {'OK' if res is not None else 'FAIL'} pid={pid} gid={gid}")
-        return res is not None
+            print(f"[DEBUG] PATCH overrides → {url} payload={body}")
+        res = _http_json("PATCH", url, json_body=body)
+        ok = res is not None
+        if DEBUG:
+            print(f"[DEBUG] overrides forced_off=true -> {'OK' if ok else 'FAIL'} pid={pid} gid={gid}")
+        applied_any = applied_any or ok
     except Exception as e:
-        print(f"[DEBUG] auto-deactivate error: {e}")
-        return False
+        print(f"[DEBUG] auto-deactivate overrides error: {e}")
+
+    # 2) Profil-Gruppe aktiv=false (hart)
+    try:
+        ok2 = _set_group_active(pid, gid, False)
+        applied_any = applied_any or ok2
+    except Exception as e:
+        print(f"[DEBUG] auto-deactivate set active=false error: {e}")
+
+    return applied_any
+def _resolve_gid(pid: Any, gid_or_index: Any) -> Optional[str]:
+    """
+    Liefert die echte gid einer Gruppe. Akzeptiert bereits-gid oder group_index (int/str).
+    Holt /notifier/profiles/{pid} und mappt index->gid.
+    """
+    try:
+        if not pid:
+            return None
+        s = str(gid_or_index) if gid_or_index is not None else ""
+        # wenn schon wie eine gid aussieht (nicht rein numerisch), nimm sie direkt
+        if s and not s.isdigit():
+            return s
+
+        url = f"{NOTIFIER_ENDPOINT}/profiles/{pid}"
+        if DEBUG:
+            print(f"[DEBUG] _resolve_gid → GET {url}")
+        prof = _http_json("GET", url)
+        if not prof:
+            if DEBUG:
+                print("[DEBUG] _resolve_gid: profile fetch failed or empty")
+            return None
+
+        groups = prof.get("condition_groups") or []
+        idx = int(s) if s and s.isdigit() else None
+        if idx is not None and 0 <= idx < len(groups):
+            gid = groups[idx].get("gid")
+            if DEBUG:
+                print(f"[DEBUG] _resolve_gid: index {idx} -> gid {gid}")
+            return gid
+
+        # fallback: exakte gid
+        for g in groups:
+            if str(g.get("gid")) == s:
+                return s
+
+        if DEBUG:
+            print(f"[DEBUG] _resolve_gid: no match for pid={pid} key={s!r}")
+        return None
+    except Exception as e:
+        print(f"[DEBUG] _resolve_gid error: {e}")
+        return None
+
+# ---------------------------------------------------------------------
+# Bucketing
+# ---------------------------------------------------------------------
+def _build_buckets(triggered: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for a in (triggered or []):
+        gid = a.get("group_id") or a.get("group_index")
+        smode = (a.get("single_mode") or "symbol").strip().lower()
+        status = (a.get("status") or "FULL").upper()
+        tick_id = a.get("tick_id") or f"{a.get('interval','')}:{a.get('bar_ts') or a.get('ts')}"
+
+        if smode == "everything":
+            bkey = f"ALL::{a.get('profile_id')}::{tick_id}::{status}"
+        elif smode == "group":
+            bkey = f"GRP::{a.get('profile_id')}::{gid}::{tick_id}::{status}"
+        else:
+            bkey = f"SYM::{a.get('profile_id')}::{gid}::{a.get('symbol')}::{tick_id}::{status}"
+
+        if bkey not in buckets:
+            buckets[bkey] = {"proto": a, "items": [a]}
+        else:
+            buckets[bkey]["items"].append(a)
+    return buckets
 
 # ---------------------------------------------------------------------
 # Main-API
 # ---------------------------------------------------------------------
-def _merge_bucket(pack: Dict[str, Any]) -> Dict[str, Any]:
-    head = dict(pack["head"])
-    items = pack["items"]
-
-    # Aggregierte Conditions + Symbol-Liste
-    agg_conditions: List[Dict[str, Any]] = []
-    symbols: List[str] = []
-    for it in items:
-        sym = it.get("symbol") or "?"
-        symbols.append(sym)
-        for c in (it.get("conditions") or []):
-            cc = dict(c)
-            cc["symbol"] = sym  # damit die Zeile weiß, zu welchem Symbol sie gehört
-            agg_conditions.append(cc)
-
-    head["conditions"] = agg_conditions
-    # Mehrere Symbole im Header zusammenziehen
-    uniq_syms = sorted(set(symbols))
-    if len(uniq_syms) > 1:
-        head["symbol"] = ", ".join(uniq_syms)
-    # tick_id/single_mode aus head bleiben erhalten
-    return head
-
-def _compact_matched(conditions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for c in (conditions or []):
-        L = (c.get("left")  or {}) if isinstance(c.get("left"),  dict) else {}
-        R = (c.get("right") or {}) if isinstance(c.get("right"), dict) else {}
-        item = {
-            "left":  L.get("label") or L.get("spec") or "",
-            "right": R.get("label") or R.get("spec") or "",
-            "op":    c.get("op_norm") or c.get("op") or "",
-            "passed": bool(c.get("result")),
-            "left_value":  L.get("value"),
-            "right_value": R.get("value"),
-            "left_ts":  L.get("ts"),
-            "right_ts": R.get("ts"),
-        }
-        # optional: symbol anheften, falls vorhanden (für group/everything)
-        sym = R.get("symbol") or L.get("symbol") or c.get("symbol")
-        if sym: item["symbol"] = sym
-        out.append(item)
-    return out
-
-
 def run_alarm_checker(triggered: List[Dict[str, Any]]) -> None:
     """
     Nimmt die Liste ausgelöster Gruppen (vom Evaluator) und verschickt Telegram-Nachrichten.
@@ -502,58 +588,38 @@ def run_alarm_checker(triggered: List[Dict[str, Any]]) -> None:
     deactivated = 0
 
     # 1) Buckets bauen
-    buckets: Dict[str, Dict[str, Any]] = {}
-    for a in (triggered or []):
-        # Fallback gid
-        gid = a.get("group_id") or a.get("group_index")
-        smode = (a.get("single_mode") or "symbol").strip().lower()
-        status = (a.get("status") or "FULL").upper()
-        tick_id = a.get("tick_id") or f"{a.get('interval','')}:{a.get('bar_ts') or a.get('ts')}"
-        # Bucket-Key
-        if smode == "everything":
-            bkey = f"ALL::{a.get('profile_id')}::{tick_id}::{status}"
-        elif smode == "group":
-            bkey = f"GRP::{a.get('profile_id')}::{gid}::{tick_id}::{status}"
-        else:
-            bkey = f"SYM::{a.get('profile_id')}::{gid}::{a.get('symbol')}::{tick_id}::{status}"
-
-        if bkey not in buckets:
-            buckets[bkey] = {
-                "proto": a,         # eine Vorlage (für Meta/Chat/Token etc.)
-                "items": [a],       # alle Alarme in diesem Bucket
-            }
-        else:
-            buckets[bkey]["items"].append(a)
-
+    buckets = _build_buckets(triggered)
     if DEBUG:
         print(f"[DEBUG] built {len(buckets)} buckets")
 
-    # 2) Pro Bucket: Cooldown/Dedupe + Nachricht bauen + senden
-    for bkey, bundle in buckets.items():
+    # deterministische Reihenfolge (debug-freundlich)
+    for bkey in sorted(buckets.keys()):
+        bundle = buckets[bkey]
         proto = bundle["proto"]
         items: List[Dict[str, Any]] = bundle["items"]
+
         # Dedupe-Key pro Bucket
         dedupe_key = _alarm_key({
             "profile_id": proto.get("profile_id"),
-            "group_index": proto.get("group_index"),
-            "group_name": proto.get("group_name"),
+            "group_id": proto.get("group_id") or proto.get("group_index"),
             "symbol": proto.get("symbol"),  # bei group/everything egal
             "interval": proto.get("interval"),
             "status": (proto.get("status") or "FULL").upper(),
+            "single_mode": (proto.get("single_mode") or "symbol").lower(),
+            "tick_id": proto.get("tick_id") or f"{proto.get('interval','')}:{proto.get('bar_ts') or proto.get('ts')}",
         })
 
         cooled = _is_cooled_down(state, dedupe_key, now)
         if DEBUG:
-            print(f"[DEBUG] bucket {bkey[:40]}… cooled={cooled} items={len(items)}")
+            print(f"[DEBUG] bucket {bkey[:60]}… cooled={cooled} items={len(items)}")
         if not cooled:
             remaining = COOLDOWN_SEC - int(now - state.get(dedupe_key, 0.0))
-            if DEBUG: print(f"[DEBUG] skip bucket (cooldown {remaining}s): {bkey}")
+            if DEBUG:
+                print(f"[DEBUG] skip bucket (cooldown {remaining}s): {bkey}")
             continue
 
         # Nachricht zusammenbauen: Kopf vom proto, Body aus allen items
-        # Headline wie gehabt:
         msg_header = format_alarm_message(proto).split("\n\n", 1)[0]
-        # Body = Liste der kondensierten Condition-Lines
         lines: List[str] = []
         for it in items:
             for c in (it.get("conditions") or []):
@@ -562,9 +628,8 @@ def run_alarm_checker(triggered: List[Dict[str, Any]]) -> None:
 
         # Overrides pro Bucket aus proto
         chat_override, token_override = _derive_overrides(proto)
-        recipients: List[int | str]
         if chat_override:
-            recipients = [chat_override]
+            recipients: List[int | str] = [chat_override]
         else:
             recipients = _default_recipients()
         if not recipients:
@@ -586,28 +651,27 @@ def run_alarm_checker(triggered: List[Dict[str, Any]]) -> None:
             print("💥 Alarm send failed:", e)
             continue
 
-        # 4) Persistieren (alle items persistieren; zählt nur bei Erfolg)
+        # 4) Persistieren
         for it in items:
             try:
                 _persist_alarm_via_api(it)
                 persisted += 1
-            except Exception as _:
-                if DEBUG: print("[DEBUG] persist failed (not counting)")
+            except Exception:
+                if DEBUG:
+                    print("[DEBUG] persist failed (not counting)")
 
-        # 5) Optional: Auto-Deaktivierung (einmal pro item prüfen)
+        # 5) Optional: Auto-Deaktivierung (overrides + active=false)
         for it in items:
             try:
                 if _maybe_auto_deactivate_via_overrides(it):
                     deactivated += 1
                     it["deactivate_applied"] = (it.get("notify_mode") or "").lower() in ("true", "any_true")
-            except Exception as _:
-                if DEBUG: print("[DEBUG] auto-deactivate failed")
+            except Exception:
+                if DEBUG:
+                    print("[DEBUG] auto-deactivate failed")
 
         _mark_sent(state, dedupe_key, now)
         time.sleep(SEND_DELAY_SEC)
-
-    _save_state(state)
-    print(f"✅ Versand fertig. {sent} / {n} Nachricht(en) verschickt. Persistiert: {persisted}. Auto-deaktiviert: {deactivated}.")
 
     _save_state(state)
     print(f"✅ Versand fertig. {sent} / {n} Nachricht(en) verschickt. Persistiert: {persisted}. Auto-deaktiviert: {deactivated}.")

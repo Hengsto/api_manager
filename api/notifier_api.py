@@ -263,6 +263,10 @@ class ProfileUpdate(ProfileBaseIn):
     rebaseline: Optional[bool] = None
     pass
 
+# >>> NEU: Patch-Payload zum Setzen des Gruppen-Active-Flags
+class GroupActivePatch(ApiModel):
+    active: bool
+
 # ─────────────────────────────────────────────────────────────
 # Locks (außerhalb Projektbaum)
 # ─────────────────────────────────────────────────────────────
@@ -642,6 +646,66 @@ def _merge_ids(old_p: dict, new_p: dict) -> dict:
 
     return new_p
 
+def _resolve_gid_from_profile(profile: dict, gid_or_index: Any) -> Optional[str]:
+    """
+    Nimmt eine echte gid ODER einen numerischen Index und liefert die gid.
+    """
+    try:
+        key = str(gid_or_index) if gid_or_index is not None else ""
+        groups = (profile.get("condition_groups") or [])
+        # bereits echte gid?
+        if key and not key.isdigit():
+            # prüfen, ob sie im Profil existiert
+            if any(str(g.get("gid")) == key for g in groups):
+                return key
+            return None
+        # numerischer index?
+        if key.isdigit():
+            idx = int(key)
+            if 0 <= idx < len(groups):
+                return str(groups[idx].get("gid") or "")
+        return None
+    except Exception:
+        return None
+
+
+def _set_group_active_in_profiles(profile_id: str, gid_or_index: Any, active: bool) -> Optional[str]:
+    """
+    Setzt in notifier_profiles.json die Gruppe auf active=<active>.
+    Akzeptiert gid ODER group_index. Liefert die *echte* gid bei Erfolg, sonst None.
+    """
+    profs = load_json(PROFILES_NOTIFIER, [])
+    # pass 1: Profil finden
+    target: Optional[dict] = None
+    for p in profs:
+        if str(p.get("id")) == str(profile_id):
+            target = p
+            break
+    if target is None:
+        return None
+
+    # gid auflösen
+    real_gid = _resolve_gid_from_profile(target, gid_or_index)
+    if not real_gid:
+        return None
+
+    # pass 2: Gruppe finden + setzen
+    changed = False
+    for g in (target.get("condition_groups") or []):
+        if str(g.get("gid")) == str(real_gid):
+            old = bool(g.get("active", True))
+            g["active"] = bool(active)
+            changed = (old != g["active"])
+            break
+
+    if changed:
+        save_json(PROFILES_NOTIFIER, profs)
+        # Snapshot aktualisieren (UI-Refresh)
+        _status_autofix_merge()
+
+    return real_gid if changed or True else None  # auch wenn kein tatsächlicher Wechsel, gib die gid zurück
+
+
 # ─────────────────────────────────────────────────────────────
 # ✨ NEU: Overrides + Commands Helpers
 # ─────────────────────────────────────────────────────────────
@@ -691,6 +755,39 @@ def _enqueue_command(pid: str, gid: str, rearm: bool = True, rebaseline: bool = 
     print(f"[DEBUG] _enqueue_command -> {item}")
     cmds["queue"].append(item)
     _save_commands(cmds)
+
+# ─────────────────────────────────────────────────────────────
+# >>> NEU: Helper, der in der Profile-JSON "active" einer Gruppe hart setzt
+# ─────────────────────────────────────────────────────────────
+def _set_group_active(pid: Any, gid: Any, active: bool) -> bool:
+    """
+    Hartes Setzen von group.active über API:
+      PATCH /notifier/profiles/{pid}/groups/{gid}/active  { "active": <bool> }
+    """
+    try:
+        if pid in (None, ""):
+            if DEBUG:
+                print(f"[DEBUG] _set_group_active skipped (missing pid) pid={pid!r}")
+            return False
+
+        real_gid = _resolve_gid(pid, gid)
+        if not real_gid:
+            if DEBUG:
+                print(f"[DEBUG] _set_group_active: could not resolve gid from {gid!r}")
+            return False
+
+        url = f"{NOTIFIER_ENDPOINT}/profiles/{pid}/groups/{real_gid}/active"
+        body = {"active": bool(active)}
+        if DEBUG:
+            print(f"[DEBUG] _set_group_active → PATCH {url} payload={body}")
+        res = _http_json("PATCH", url, json_body=body)
+        ok = res is not None
+        if DEBUG:
+            print(f"[DEBUG] _set_group_active result -> {'OK' if ok else 'FAIL'} (pid={pid}, gid={real_gid}, active={active})")
+        return ok
+    except Exception as e:
+        print(f"[DEBUG] _set_group_active error: {e}")
+        return False
 
 # ─────────────────────────────────────────────────────────────
 # Endpunkte: PROFILES
@@ -837,6 +934,25 @@ def update_profile(pid: str, p: ProfileUpdate):
 
     return {"status": "updated", "id": pid}
 
+@router.patch("/profiles/{pid}/groups/{gid}/active", response_model=dict)
+def set_group_active(pid: str, gid: str, body: GroupActivePatch):
+    """
+    Setzt group.active via gid ODER group_index (wenn 'gid' numerisch ist).
+    """
+    try:
+        if body is None or body.active is None:
+            raise HTTPException(status_code=422, detail="Feld 'active' fehlt.")
+        real_gid = _set_group_active_in_profiles(pid, gid, bool(body.active))
+        if not real_gid:
+            raise HTTPException(status_code=404, detail=f"Gruppe '{gid}' in Profil '{pid}' nicht gefunden")
+        return {"status": "ok", "profile_id": pid, "group_id": real_gid, "active": bool(body.active)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"💥 set_group_active: error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def _run_activation_routine(profile_obj: dict, activate_flag: bool, rebaseline: bool) -> None:
     """
     Aktiviert alle 'aktiven' Gruppen des Profils deterministisch:
@@ -886,6 +1002,33 @@ def delete_profile(pid: str):
     _status_autofix_merge()
 
     return {"status": "deleted", "id": pid}
+
+# >>> NEU: Hartes Setzen von "active" in der Profil-JSON
+@router.patch("/profiles/{pid}/groups/{gid}/active", response_model=dict)
+def set_group_active(pid: str, gid: str, body: GroupActivePatch = Body(...)):
+    """
+    Setzt im Profil-JSON für Gruppe {gid} das Feld "active".
+    Erwartet Payload: {"active": true|false}
+    """
+    active_flag = bool(getattr(body, "active", False))
+    profs = load_json(PROFILES_NOTIFIER, [])
+
+    try:
+        changed = _set_group_active_in_profiles(profs, pid, gid, active_flag)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"💥 set_group_active: error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if changed:
+        save_json(PROFILES_NOTIFIER, profs)
+        _status_autofix_merge()
+        print(f"[DEBUG] set_group_active -> pid={pid} gid={gid} active={active_flag} (saved)")
+    else:
+        print(f"[DEBUG] set_group_active -> pid={pid} gid={gid} active={active_flag} (no change)")
+
+    return {"status": "ok", "profile_id": pid, "group_id": gid, "active": active_flag}
 
 # ─────────────────────────────────────────────────────────────
 # Endpunkte: REGISTRY
@@ -1108,15 +1251,38 @@ def patch_override(profile_id: str, group_id: str, body: OverridePatch):
     payload = model_to_dict(body)
     print(f"[DEBUG] PATCH overrides <- pid={profile_id} gid={group_id} {payload}")
 
+    # apply changes to override slot
+    changed_override = False
     if "forced_off" in payload and payload["forced_off"] is not None:
         slot["forced_off"] = bool(payload["forced_off"])
+        changed_override = True
     if "snooze_until" in payload:
         slot["snooze_until"] = payload["snooze_until"]  # ISO8601 oder None (UI entscheidet)
+        changed_override = True
     if "note" in payload and payload["note"] is not None:
         slot["note"] = str(payload["note"])
+        changed_override = True
 
-    _save_overrides(ovr)
-    print(f"[DEBUG] PATCH overrides -> saved pid={profile_id} gid={group_id}")
+    if changed_override:
+        _save_overrides(ovr)
+        print(f"[DEBUG] PATCH overrides -> saved pid={profile_id} gid={group_id}")
+    else:
+        print(f"[DEBUG] PATCH overrides -> no changes pid={profile_id} gid={group_id}")
+
+    # ✨ NEU: Wenn forced_off explizit True gesetzt wurde → Gruppe hart auf active=false flippen
+    try:
+        if "forced_off" in payload and payload["forced_off"] is True:
+            print(f"[DEBUG] PATCH overrides -> also set profile[{profile_id}].group[{group_id}].active=False")
+            profs = load_json(PROFILES_NOTIFIER, [])
+            if _set_group_active_in_profiles(profs, profile_id, group_id, False):
+                save_json(PROFILES_NOTIFIER, profs)
+                _status_autofix_merge()
+                print(f"[DEBUG] PATCH overrides -> active=false persisted (pid={profile_id}, gid={group_id})")
+    except HTTPException as he:
+        print(f"[DEBUG] PATCH overrides -> active flip failed: {he.detail}")
+    except Exception as e:
+        print(f"[DEBUG] PATCH overrides -> unexpected error during active flip: {e}")
+
     return {"status": "ok", "profile_id": profile_id, "group_id": group_id}
 
 class CommandPost(ApiModel):
