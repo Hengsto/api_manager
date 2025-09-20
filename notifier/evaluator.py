@@ -6,7 +6,6 @@ import os
 import json
 import logging
 import math
-import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Set
@@ -18,32 +17,41 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# WICHTIG: Gate importieren UND BENUTZEN
+# Gate: baut Trigger inkl. Streak/Gating
 from .gate import gate_and_build_triggers
 
 # ─────────────────────────────────────────────────────────────
-# Persistenz/Endpoints aus config
+# Persistenz/Endpoints aus config (mit robusten Fallbacks)
 # ─────────────────────────────────────────────────────────────
-from config import NOTIFIER_ENDPOINT, PRICE_API_ENDPOINT, CHART_API_ENDPOINT  # noqa: F401
+from config import (
+    NOTIFIER_ENDPOINT,      # z.B. http://127.0.0.1:8099/notifier
+    CHART_API_ENDPOINT,     # z.B. http://127.0.0.1:7004
+)
 
-# Optional: lokale Pfade
+# Optional verfügbare Pfade/Konfigurationen
 try:
-    from config import PROFILES_NOTIFIER  # type: ignore
+    from config import PROFILES_NOTIFIER  # Basis, um Sibling-Files abzuleiten
 except Exception:
     PROFILES_NOTIFIER = None  # type: ignore[assignment]
 
 try:
-    from config import STATUS_NOTIFIER  # type: ignore
+    from config import STATUS_NOTIFIER     # expliziter Status-Pfad
 except Exception:
     STATUS_NOTIFIER = None  # type: ignore[assignment]
 try:
-    from config import OVERRIDES_NOTIFIER  # type: ignore
+    from config import OVERRIDES_NOTIFIER  # expliziter Overrides-Pfad
 except Exception:
     OVERRIDES_NOTIFIER = None  # type: ignore[assignment]
 try:
-    from config import COMMANDS_NOTIFIER  # type: ignore
+    from config import COMMANDS_NOTIFIER   # expliziter Commands-Pfad
 except Exception:
     COMMANDS_NOTIFIER = None  # type: ignore[assignment]
+
+# Unified-Konfiguration (optional): dient nur als weiterer Commands-Bridge/Fallback
+try:
+    from config import NOTIFIER_UNIFIED
+except Exception:
+    NOTIFIER_UNIFIED = None  # type: ignore[assignment]
 
 # ─────────────────────────────────────────────────────────────
 # Logging & ENV
@@ -72,14 +80,38 @@ HTTP_TIMEOUT = float(_int_env("EVAL_HTTP_TIMEOUT", 15))
 HTTP_RETRIES = _int_env("EVAL_HTTP_RETRIES", 3)
 CACHE_MAX    = _int_env("EVAL_CACHE_MAX", 256)
 
+# NEW: Default für min_tick (Bars-Bestätigung) pro Gruppe
+DEFAULT_MIN_TICK = _int_env("EVAL_GROUP_MIN_TICK", 1)
+
+# NEW: konfigurierbare Gleichheitstoleranzen für eq/ne
+REL_TOL = float(os.getenv("EVAL_REL_TOL", "1e-6"))
+ABS_TOL = float(os.getenv("EVAL_ABS_TOL", "1e-9"))
+
+# NEW: /indicator Abrufgröße
+FETCH_COUNT = _int_env("EVAL_FETCH_COUNT", 5)
+
 # ─────────────────────────────────────────────────────────────
-# Pfade & Locks
+# Pfade & Locks (mit sinnvollen Fallbacks)
 # ─────────────────────────────────────────────────────────────
 def _to_path(p: Any | None) -> Optional[Path]:
     if p is None: return None
     return p if isinstance(p, Path) else Path(str(p)).expanduser().resolve()
 
-_BASE_DIR = _to_path(PROFILES_NOTIFIER).parent if _to_path(PROFILES_NOTIFIER) else Path(os.getcwd())
+# Bestmögliche Basis für Siblings bestimmen
+def _base_dir() -> Path:
+    if _to_path(STATUS_NOTIFIER):
+        return _to_path(STATUS_NOTIFIER).parent  # type: ignore[return-value]
+    if _to_path(OVERRIDES_NOTIFIER):
+        return _to_path(OVERRIDES_NOTIFIER).parent  # type: ignore[return-value]
+    if _to_path(COMMANDS_NOTIFIER):
+        return _to_path(COMMANDS_NOTIFIER).parent  # type: ignore[return-value]
+    if _to_path(NOTIFIER_UNIFIED):
+        return _to_path(NOTIFIER_UNIFIED).parent  # type: ignore[return-value]
+    if _to_path(PROFILES_NOTIFIER):
+        return _to_path(PROFILES_NOTIFIER).parent  # type: ignore[return-value]
+    return Path(os.getcwd())
+
+_BASE_DIR = _base_dir()
 
 _STATUS_PATH    = _to_path(STATUS_NOTIFIER)    or (_BASE_DIR / "notifier_status.json")
 _OVERRIDES_PATH = _to_path(OVERRIDES_NOTIFIER) or (_BASE_DIR / "notifier_overrides.json")
@@ -97,14 +129,24 @@ if DEBUG_VALUES:
     log.info(f"[DEBUG] Using lock dir: {_LOCK_DIR}")
 
 def _lock_path(path: Path) -> Path:
-    return _LOCK_DIR / (Path(path).name + ".lock")
+    # Kollisionssicher: Hash über den kanonischen Pfad (bytes!), basename egal
+    p = str(Path(path).expanduser().resolve())
+    h = hashlib.sha256(p.encode("utf-8")).hexdigest()
+    return _LOCK_DIR / f"{h[:16]}.lock"
 
 class FileLock:
-    def __init__(self, path: Path, timeout: float = 10.0, poll: float = 0.05):
+    def __init__(self, path: Path, timeout: float = 10.0, poll: float = 0.05, stale_after: float = 300.0):
         self.lockfile = _lock_path(path)
         self.timeout = timeout
         self.poll = poll
+        self.stale_after = stale_after
         self._acq = False
+    def _is_stale(self) -> bool:
+        try:
+            st = self.lockfile.stat()
+            return (time.time() - st.st_mtime) > self.stale_after
+        except FileNotFoundError:
+            return False
     def acquire(self):
         start = time.time()
         while True:
@@ -114,6 +156,13 @@ class FileLock:
                 if DEBUG_VALUES: log.debug(f"[LOCK] acquired {self.lockfile}")
                 return
             except FileExistsError:
+                if self._is_stale():
+                    try:
+                        os.unlink(self.lockfile)
+                        log.warning(f"[LOCK] stale removed {self.lockfile}")
+                    except FileNotFoundError:
+                        pass
+                    continue
                 if time.time() - start > self.timeout:
                     raise TimeoutError(f"Timeout acquiring lock: {self.lockfile}")
                 time.sleep(self.poll)
@@ -132,6 +181,9 @@ class FileLock:
 def _sha256_bytes(b: bytes) -> str:
     h = hashlib.sha256(); h.update(b); return h.hexdigest()
 
+# ─────────────────────────────────────────────────────────────
+# JSON IO (atomar, write-on-change via lock)
+# ─────────────────────────────────────────────────────────────
 def _json_load_any(path: Path, fallback: Any) -> Any:
     if not path.exists():
         if DEBUG_VALUES: log.debug(f"[IO] load {path} -> fallback")
@@ -153,7 +205,7 @@ def _json_save_any(path: Path, data: Any) -> None:
                     if DEBUG_VALUES: log.debug(f"[IO] save {path} -> SKIP (unchanged)")
                     return
         except Exception as e:
-            log.debug(f"[IO] compare failed for {path}: {e}")
+            if DEBUG_VALUES: log.debug(f"[IO] compare failed for {path}: {e}")
         with open(tmp, "wb") as f:
             f.write(payload); f.flush(); os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -167,7 +219,7 @@ def _json_save_any(path: Path, data: Any) -> None:
     if DEBUG_VALUES: log.debug(f"[IO] save {path} ok")
 
 # ─────────────────────────────────────────────────────────────
-# HTTP Session + unified JSON call
+# HTTP Session + robustes JSON
 # ─────────────────────────────────────────────────────────────
 _SESSION: Optional[requests.Session] = None
 def _get_session() -> requests.Session:
@@ -175,9 +227,13 @@ def _get_session() -> requests.Session:
     if _SESSION is None:
         s = requests.Session()
         retry = Retry(
-            total=HTTP_RETRIES, read=HTTP_RETRIES, connect=HTTP_RETRIES,
-            backoff_factor=0.3, status_forcelist=[429,500,502,503,504],
-            allowed_methods=["GET","POST","PUT"], raise_on_status=False,
+            total=HTTP_RETRIES,
+            read=HTTP_RETRIES,
+            connect=HTTP_RETRIES,
+            backoff_factor=0.3,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset({"GET","POST","PUT","PATCH","DELETE"}),
+            raise_on_status=False,
         )
         adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
         s.mount("http://", adapter); s.mount("https://", adapter)
@@ -195,11 +251,18 @@ def _http_json(method: str, url: str, *, params: Dict[str, Any] | None = None,
                 log.debug(f"[HTTP] {method} {url} params={params} json_keys={list((json_body or {}).keys())}")
             r = sess.request(method, url, params=params, json=json_body, timeout=timeout)
             if DEBUG_HTTP: log.debug(f"[HTTP] {r.status_code} {r.url}")
-            # treat 400/422 from /indicator gracefully to empty payload
+            # treat /indicator 400/422 gracefully to empty payload
             if url.endswith("/indicator") and r.status_code in (400, 422):
                 return {"data": []}
             r.raise_for_status()
-            return r.json() if r.text else {}
+            if not r.text:
+                return {}
+            try:
+                return r.json()
+            except ValueError:
+                if url.endswith("/indicator"):
+                    return {"data": []}
+                return {}
         except Exception as e:
             last_err = e
             log.warning(f"[HTTP] {method} {url} failed: {e} (try {i+1}/{tries})")
@@ -209,13 +272,17 @@ def _http_json(method: str, url: str, *, params: Dict[str, Any] | None = None,
 # ─────────────────────────────────────────────────────────────
 # Operatoren
 # ─────────────────────────────────────────────────────────────
-def _op_eq(a: float, b: float, rel_tol: float = 1e-6, abs_tol: float = 1e-9) -> bool:
-    try: return math.isclose(a, b, rel_tol=rel_tol, abs_tol=abs_tol)
-    except Exception: return False
+def _op_eq(a: float, b: float, rel_tol: float = REL_TOL, abs_tol: float = ABS_TOL) -> bool:
+    try:
+        return math.isclose(a, b, rel_tol=rel_tol, abs_tol=abs_tol)
+    except Exception:
+        return False
 
-def _op_ne(a: float, b: float, rel_tol: float = 1e-6, abs_tol: float = 1e-9) -> bool:
-    try: return not math.isclose(a, b, rel_tol=rel_tol, abs_tol=abs_tol)
-    except Exception: return False
+def _op_ne(a: float, b: float, rel_tol: float = REL_TOL, abs_tol: float = ABS_TOL) -> bool:
+    try:
+        return not math.isclose(a, b, rel_tol=rel_tol, abs_tol=abs_tol)
+    except Exception:
+        return False
 
 OPS = {
     "eq":  _op_eq,
@@ -241,7 +308,8 @@ def _load_profiles() -> List[Dict[str, Any]]:
     return data
 
 def _load_indicators_meta() -> Dict[str, Dict[str, Any]]:
-    items = _http_json("GET", f"{PRICE_API_ENDPOINT}/indicators")
+    # korrekt: aus CHART_API_ENDPOINT/indicators
+    items = _http_json("GET", f"{CHART_API_ENDPOINT}/indicators")
     if not isinstance(items, list):
         raise RuntimeError("/indicators lieferte kein List-JSON.")
     meta: Dict[str, Dict[str, Any]] = {}
@@ -254,9 +322,10 @@ def _load_indicators_meta() -> Dict[str, Dict[str, Any]]:
 # ─────────────────────────────────────────────────────────────
 # Legacy label parser
 # ─────────────────────────────────────────────────────────────
-_EMA_RE = re.compile(r"^EMA_(\d+)$", re.IGNORECASE)
-_RSI_RE = re.compile(r"^RSI_(\d+)$", re.IGNORECASE)
-_MACD_RE = re.compile(r"^MACD_(\d+)_(\d+)_(\d+)$", re.IGNORECASE)
+import re as _re
+_EMA_RE = _re.compile(r"^EMA_(\d+)$", _re.IGNORECASE)
+_RSI_RE = _re.compile(r"^RSI_(\d+)$", _re.IGNORECASE)
+_MACD_RE = _re.compile(r"^MACD_(\d+)_(\d+)_(\d+)$", _re.IGNORECASE)
 
 def _legacy_parse_label_if_needed(label: str) -> Optional[Tuple[str, Dict[str, Any]]]:
     s = (label or "").strip()
@@ -321,15 +390,22 @@ def resolve_spec_and_params(
 # Indicator fetching + caching
 # ─────────────────────────────────────────────────────────────
 _INDICATOR_CACHE: "OrderedDict[Tuple[str,str,str,str,str], Dict[str, Any]]" = OrderedDict()
+_CACHE_HIT = 0
+_CACHE_MISS = 0
 
 def _indicator_cache_key(name: str, symbol: str, chart_iv: str, ind_iv: str, params: Dict[str, Any]) -> Tuple[str,str,str,str,str]:
     pkey = json.dumps(params or {}, sort_keys=True, separators=(",", ":"))
     return (name.lower(), symbol, chart_iv, ind_iv, pkey)
 
 def _cache_get(key: Tuple[str,str,str,str,str]) -> Optional[Dict[str, Any]]:
+    global _CACHE_HIT, _CACHE_MISS
     val = _INDICATOR_CACHE.get(key)
-    if val is not None: _INDICATOR_CACHE.move_to_end(key)
-    return val
+    if val is not None:
+        _CACHE_HIT += 1
+        _INDICATOR_CACHE.move_to_end(key)
+        return val
+    _CACHE_MISS += 1
+    return None
 
 def _cache_put(key: Tuple[str,str,str,str,str], value: Dict[str, Any]) -> None:
     _INDICATOR_CACHE[key] = value
@@ -357,7 +433,6 @@ def _effective_intervals(chart_iv: Optional[str], ind_iv: Optional[str]) -> Tupl
 def _fetch_indicator_series(name: str, symbol: str, chart_iv: str, ind_iv: str, params: Dict[str, Any]) -> Dict[str, Any]:
     eff_ci, eff_ii = _effective_intervals(chart_iv, ind_iv)
     clean = _clean_params_for_api(params)
-    params_json = _stable_params_json(clean)
     key = _indicator_cache_key(name, symbol, eff_ci, eff_ii, clean)
     if (cached := _cache_get(key)) is not None:
         return cached
@@ -365,10 +440,11 @@ def _fetch_indicator_series(name: str, symbol: str, chart_iv: str, ind_iv: str, 
     query = {
         "name": name, "symbol": symbol,
         "chart_interval": eff_ci, "indicator_interval": eff_ii,
-        "params": params_json, "count": 5,
+        "params": _stable_params_json(clean), "count": max(2, FETCH_COUNT),
     }
     if DEBUG_VALUES:
-        log.debug(f"[FETCH] {name} sym={symbol} chart_iv={eff_ci} ind_iv={eff_ii} params={clean} count=5")
+        log.debug(f"[FETCH] {name} sym={symbol} chart_iv={eff_ci} ind_iv={eff_ii} params={clean} count={query['count']}")
+        print(f"[DBG] fetch name={name} sym={symbol} ci={eff_ci} ii={eff_ii}")
 
     t0 = time.perf_counter()
     try:
@@ -449,6 +525,18 @@ def _last_value_for_indicator(
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
+def _profiles_fingerprint(profiles: List[Dict[str, Any]]) -> str:
+    """
+    Stabile Fingerprint-Funktion analog zur API-Logik:
+    - JSON dump mit sort_keys=True
+    - sha256 über UTF-8 Bytes
+    """
+    try:
+        payload = json.dumps(profiles or [], sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
 def _resolve_right_side(cond: Dict[str, Any], main_symbol: str, main_interval: str) -> Tuple[str, str]:
     return ((cond.get("right_symbol") or "").strip() or main_symbol,
             (cond.get("right_interval") or "").strip() or main_interval)
@@ -458,7 +546,7 @@ def _numeric_or_none(x: Any) -> Optional[float]:
         return float(x) if x is not None else None
     except Exception:
         return None
-    
+
 def _to_int_or_none(v: Any) -> Optional[int]:
     try:
         if v is None:
@@ -468,21 +556,46 @@ def _to_int_or_none(v: Any) -> Optional[int]:
         log.warning(f"[EVAL] bad telegram_bot_id={v!r} -> using None ({e})")
         return None
 
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
 
-def _safe_max_iso(ts_list: List[Optional[str]], fallback: Optional[str] = None) -> Optional[str]:
-    vals = [t for t in ts_list if isinstance(t, str) and t]
-    if not vals: return fallback
+def _parse_iso(s: Optional[str]) -> Optional[datetime]:
+    """Akzeptiert ISO-Strings (mit/ohne Z) sowie Unix-Epoch in Sekunden oder Millisekunden."""
+    if s is None or s == "":
+        return None
     try:
-        def _parse(s: str) -> datetime:
-            if s.endswith("Z"): s = s[:-1] + "+00:00"
-            return datetime.fromisoformat(s).astimezone(timezone.utc)
-        return max(vals, key=_parse)
+        # numeric epoch? accept seconds or ms
+        if isinstance(s, (int, float)) or (isinstance(s, str) and str(s).isdigit()):
+            v = int(s)
+            if v > 10_000_000_000:  # ms
+                v = v // 1000
+            return datetime.fromtimestamp(v, tz=timezone.utc)
+        # string ISO with optional Z
+        s2 = str(s)
+        if s2.endswith("Z"):
+            s2 = s2[:-1] + "+00:00"
+        return datetime.fromisoformat(s2).astimezone(timezone.utc)
     except Exception:
-        try: return max(vals)
-        except Exception: return fallback
+        return None
+
+def _safe_max_iso(ts_list: List[Optional[str]], fallback: Optional[str] = None) -> Optional[str]:
+    vals = [t for t in ts_list if t not in (None, "")]
+    if not vals:
+        return fallback
+    try:
+        def _norm_to_dt(x: Any) -> datetime:
+            dt = _parse_iso(x)
+            return dt if dt else datetime.min.replace(tzinfo=timezone.utc)
+        best = max(vals, key=_norm_to_dt)
+        return str(best)
+    except Exception:
+        try:
+            return max(map(str, vals))
+        except Exception:
+            return fallback
+
+def _iso_now_dt() -> datetime:
+    return datetime.now(timezone.utc)
 
 def _normalize_notify_mode(group: Dict[str, Any]) -> str:
     val = group.get("deactivate_on")
@@ -501,17 +614,6 @@ def _min_true_ticks_of(group: Dict[str, Any]) -> Optional[int]:
         i = int(v); return i if i >= 1 else 1
     except Exception:
         return None
-
-def _parse_iso(s: Optional[str]) -> Optional[datetime]:
-    if not s: return None
-    try:
-        if s.endswith("Z"): s = s[:-1] + "+00:00"
-        return datetime.fromisoformat(s).astimezone(timezone.utc)
-    except Exception:
-        return None
-
-def _iso_now_dt() -> datetime:
-    return datetime.now(timezone.utc)
 
 def _ensure_required_params(meta: Dict[str, Dict[str, Any]], name: Optional[str], p: Dict[str, Any]) -> Dict[str, Any]:
     if not name: return p
@@ -534,7 +636,7 @@ def _label_only_conditions(group: Dict[str, Any]) -> List[Dict[str, Any]]:
             rinv = (c.get("right_interval") or "").strip()
             rout = (c.get("right_output") or "").strip()
             if rsym:
-                parts = [rsym]; 
+                parts = [rsym]
                 if rinv: parts.append(f"@{rinv}")
                 if rout: parts.append(f":{rout}")
                 right = "".join(parts)
@@ -552,6 +654,32 @@ def _label_only_conditions(group: Dict[str, Any]) -> List[Dict[str, Any]]:
         })
     return out
 
+# NEW: min_tick und Bar-Close-Heuristik
+def _group_min_tick(group: Dict[str, Any]) -> int:
+    try:
+        raw = group.get("min_tick", DEFAULT_MIN_TICK)
+        if raw in (None, "", "null"):
+            return DEFAULT_MIN_TICK
+        iv = int(raw)
+        return iv if iv >= 1 else 1
+    except Exception:
+        return max(1, DEFAULT_MIN_TICK)
+
+def _bar_close_info(bar_ts: Optional[str], interval: str, now_dt: datetime) -> Tuple[Optional[datetime], Optional[bool]]:
+    """
+    Sehr einfache Heuristik: wenn eine Timestamp vorhanden ist, betrachten wir die letzte Bar als "geschlossen".
+    Gating/Streak (gate.py) kümmert sich um echte Bestätigungen über mehrere Ticks.
+    """
+    if not bar_ts:
+        return None, None
+    try:
+        s = str(bar_ts)
+        if s.endswith("Z"): s = s[:-1] + "+00:00"
+        bar_dt = datetime.fromisoformat(s).astimezone(timezone.utc)
+    except Exception:
+        return None, None
+    return bar_dt, True
+
 # ─────────────────────────────────────────────────────────────
 # Condition Evaluation
 # ─────────────────────────────────────────────────────────────
@@ -564,7 +692,7 @@ def evaluate_condition_for_symbol(
     t0 = time.perf_counter()
     op_raw = (cond.get("op") or ""); op = _normalize_op(op_raw)
     if op not in OPS:
-        return False, {"error": f"unknown_operator:{op_raw}", "normalized": op}
+        return False, {"error": f"unknown_operator:{op_raw}", "normalized": op, "rid": cond.get("rid")}
 
     # LEFT
     left_label   = cond.get("left") or ""
@@ -572,7 +700,7 @@ def evaluate_condition_for_symbol(
     left_output  = (cond.get("left_output") or "").strip() or None
     mode_l, left_name, left_p, left_out = resolve_spec_and_params(left_label, left_params, left_output)
     if mode_l == "invalid":
-        return False, {"error": "invalid_left_label", "left": left_label}
+        return False, {"error": "invalid_left_label", "left": left_label, "rid": cond.get("rid")}
 
     left_val: Optional[float]; left_col: Optional[str]; left_ts: Optional[str]
     if mode_l == "const":
@@ -586,9 +714,9 @@ def evaluate_condition_for_symbol(
                 params=left_p, chosen_output=left_out,
             )
         except Exception as e:
-            return False, {"error": "left_indicator_fetch_failed", "exception": str(e), "left": left_label}
+            return False, {"error": "left_indicator_fetch_failed", "exception": str(e), "left": left_label, "rid": cond.get("rid")}
     if left_val is None:
-        return False, {"error": "left_value_none"}
+        return False, {"error": "left_value_none", "rid": cond.get("rid")}
 
     # RIGHT
     right_label   = cond.get("right") or ""
@@ -602,7 +730,11 @@ def evaluate_condition_for_symbol(
     if right_label.strip() == "":
         # Legacy ABS / ABS% mode
         if right_pct_legacy is not None and right_abs_legacy is None:
-            return False, {"error": "right_change_without_base", "hint": "right_absolut erforderlich oder right_label='change' verwenden"}
+            return False, {
+                "error": "right_change_without_base",
+                "hint": "right_absolut erforderlich oder right_label='change' verwenden",
+                "rid": cond.get("rid"),
+            }
         base = right_abs_legacy if right_abs_legacy is not None else 0.0
         if right_pct_legacy is not None:
             right_val = base * (1.0 + (right_pct_legacy / 100.0)); right_col = "ABS% (legacy)"
@@ -612,7 +744,10 @@ def evaluate_condition_for_symbol(
     else:
         mode_r, right_name, right_p, right_out = resolve_spec_and_params(right_label, right_params, right_output)
         if mode_r == "invalid":
-            return False, {"error": "invalid_right_label", "right": right_label}
+            return False, {"error": "invalid_right_label", "right": right_label, "rid": cond.get("rid")}
+        # Guard: nicht beides kombinieren
+        if (right_label or "").strip().lower() == "change" and _numeric_or_none(cond.get("right_change")) is not None:
+            return False, {"error": "mixed_change_modes", "hint": "Entweder right='change' (mit baseline/delta) ODER legacy right_absolut/right_change, nicht beides.", "rid": cond.get("rid")}
         if mode_r == "const":
             right_val = float((right_p or {}).get("value")); right_col = "CONST"; right_ts = None
         else:
@@ -624,9 +759,10 @@ def evaluate_condition_for_symbol(
                     params=right_p, chosen_output=right_out,
                 )
             except Exception as e:
-                return False, {"error": "right_indicator_fetch_failed", "exception": str(e), "right": right_label}
+                return False, {"error": "right_indicator_fetch_failed", "exception": str(e), "right": right_label, "rid": cond.get("rid")}
             if right_val is None:
-                return False, {"error": "right_value_none"}
+                return False, {"error": "right_value_none", "rid": cond.get("rid")}
+
         if (right_label or "").strip().lower() != "change" and right_pct_legacy is not None and right_val is not None:
             right_val = right_val * (1.0 + (right_pct_legacy / 100.0))
 
@@ -634,7 +770,7 @@ def evaluate_condition_for_symbol(
     try:
         result = bool(OPS[op](float(left_val), float(right_val)))  # type: ignore[arg-type]
     except Exception as e:
-        return False, {"error": "operator_error", "exception": str(e)}
+        return False, {"error": "operator_error", "exception": str(e), "rid": cond.get("rid")}
 
     dt = (time.perf_counter() - t0) * 1000.0
     details = {
@@ -656,9 +792,11 @@ def evaluate_condition_for_symbol(
         "op": (cond.get("op") or "").lower(),
         "op_norm": _normalize_op(cond.get("op") or ""),
         "result": result, "duration_ms": round(dt, 2),
+        "rid": (cond.get("rid") or None),
     }
     if DEBUG_VALUES:
         log.debug(f"[EVAL] {main_symbol}@{main_interval} {left_label} {details['op_norm']} {right_label} -> {result} ({dt:.1f} ms)")
+        print(f"[DBG] cond rid={details.get('rid')} res={result}")
     return result, details
 
 # ─────────────────────────────────────────────────────────────
@@ -670,19 +808,14 @@ def _eval_group_for_symbol(
     group: Dict[str, Any],
     symbol: str,
     group_index: int
-) -> Tuple[str, List[Dict[str, Any]], Optional[str], Optional[str]]:
-    """
-    Returns:
-      status ∈ {"FULL","PARTIAL","NONE"}
-      cond_details
-      bar_ts (max Timestamp_ISO)
-      error_str (falls harter Fehler)
-    """
-    t0 = time.perf_counter()
+) -> Tuple[str, List[Dict[str, Any]], Optional[str], Optional[str], bool]:
     conditions: List[Dict[str, Any]] = group.get("conditions") or []
     main_interval = (group.get("interval") or "").strip()
     if not main_interval:
-        return "NONE", [], None, "missing_interval"
+        return "NONE", [], None, "missing_interval", False
+
+    # per-group min_tick
+    min_tick = _group_min_tick(group)
 
     group_result: Optional[bool] = None
     any_true = False
@@ -695,13 +828,13 @@ def _eval_group_for_symbol(
         except Exception as e:
             res, details = False, {"error": "eval_exception", "exception": str(e)}
         details["idx"] = idx
-        details["rid"] = (cond.get("rid") or None)
-
         per_details.append(details)
 
         if details.get("error"): hard_error = details.get("error")
         any_true = any_true or bool(res)
-        group_result = res if group_result is None else ((group_result or res) if (cond.get("logic") or "and").strip().lower() == "or" else (group_result and res))
+        group_result = res if group_result is None else (
+            (group_result or res) if (cond.get("logic") or "and").strip().lower() == "or" else (group_result and res)
+        )
 
     status = "FULL" if bool(group_result) else ("PARTIAL" if any_true else "NONE")
 
@@ -715,10 +848,13 @@ def _eval_group_for_symbol(
             pass
     bar_ts = _safe_max_iso(ts_candidates, fallback=None)
 
-    dt = (time.perf_counter() - t0) * 1000.0
-    if DEBUG_VALUES:
-        log.debug(f"[GROUP] {profile.get('name')}[{group_index}] {symbol}@{main_interval} -> {status} (conds={len(conditions)}, {dt:.1f} ms)")
-    return status, per_details, bar_ts, hard_error
+    # tick confirmation (soft) – Gate/Streak kümmert sich um "mehrere nacheinander"
+    now_dt = _iso_now_dt()
+    _, confirmed_soft = _bar_close_info(bar_ts, main_interval, now_dt)
+    tick_confirmed = (confirmed_soft is True and min_tick <= 1)
+
+    # details fertig
+    return status, per_details, bar_ts, hard_error, tick_confirmed
 
 # ─────────────────────────────────────────────────────────────
 # Status/Commands/Overrides
@@ -743,7 +879,39 @@ def _load_commands() -> Dict[str, Any]:
     d = _json_load_any(_COMMANDS_PATH, _CMD_TEMPLATE)
     return d if isinstance(d, dict) and "queue" in d else {"queue": []}
 
-def _save_commands(d: Dict[str, Any]) -> None: _json_save_any(_COMMANDS_PATH, d)
+def _save_commands(d: Dict[str, Any]) -> None:
+    q = list(d.get("queue") or [])
+    if len(q) > 5000:  # Sicherheitslimit
+        q = q[-5000:]
+        d["queue"] = q
+    _json_save_any(_COMMANDS_PATH, d)
+
+# Unified bridge (optional)
+def _load_commands_unified() -> Dict[str, Any]:
+    if NOTIFIER_UNIFIED is None: return {"queue": []}
+    try:
+        u = _json_load_any(_to_path(NOTIFIER_UNIFIED), {})  # type: ignore[arg-type]
+        q = list(((u.get("commands") or {}).get("queue") or []))
+        return {"queue": q}
+    except Exception:
+        return {"queue": []}
+
+def _consume_commands_unified(consumed_ids: Set[str]) -> None:
+    if NOTIFIER_UNIFIED is None or not consumed_ids:
+        return
+    try:
+        path = _to_path(NOTIFIER_UNIFIED)  # type: ignore[arg-type]
+        u = _json_load_any(path, {})
+        cmds = (u.get("commands") or {})
+        q = list(cmds.get("queue") or [])
+        if not q:
+            return
+        q2 = [it for it in q if str(it.get("id") or "") not in consumed_ids]
+        u.setdefault("commands", {})["queue"] = q2
+        _json_save_any(path, u)
+    except Exception as e:
+        if DEBUG_VALUES:
+            log.debug(f"[BRIDGE] consume unified failed: {e}")
 
 def _prune_status_and_overrides(
     status: Dict[str, Any],
@@ -754,7 +922,6 @@ def _prune_status_and_overrides(
     Entfernt nicht mehr existierende Profile/Gruppen aus status & overrides.
     Rückgabe: (status_changed, overrides_changed)
     """
-    # Soll-Zustand aus aktuellen Profiles aufbauen
     wanted_pids: Set[str] = set()
     wanted_pg: Set[Tuple[str, str]] = set()
     for p in profiles or []:
@@ -765,8 +932,6 @@ def _prune_status_and_overrides(
         for g in (p.get("condition_groups") or []):
             gid = str(g.get("gid") or "").strip()
             if not gid:
-                # Fallback: index-based gid, aber UI/API sollte gid liefern
-                # Trotzdem defensiv: überspringen statt falsche Keys zu erzeugen
                 continue
             wanted_pg.add((pid, gid))
 
@@ -775,7 +940,6 @@ def _prune_status_and_overrides(
     status.setdefault("profiles", {})
     cur_profiles = status["profiles"]
 
-    # Profile löschen, die es nicht mehr gibt
     for pid in list(cur_profiles.keys()):
         if pid not in wanted_pids:
             if DEBUG_VALUES:
@@ -783,7 +947,6 @@ def _prune_status_and_overrides(
             del cur_profiles[pid]
             st_changed = True
             continue
-        # Gruppen in bestehenden Profilen prunen
         gmap = cur_profiles[pid].setdefault("groups", {})
         for gid in list(gmap.keys()):
             if (pid, gid) not in wanted_pg:
@@ -814,7 +977,6 @@ def _prune_status_and_overrides(
 
     return st_changed, ovr_changed
 
-
 def _skeleton_group_from_def(group: Dict[str, Any], g_idx: int) -> Dict[str, Any]:
     name = group.get("name") or f"group_{g_idx}"
     interval = (group.get("interval") or "").strip()
@@ -838,10 +1000,9 @@ def _skeleton_group_from_def(group: Dict[str, Any], g_idx: int) -> Dict[str, Any
             "min_true_ticks": min_ticks
         },
         "conditions": _label_only_conditions(group),
-        # 👉 details als leeres Array vorhanden, damit UI nie auf Fallback muss
+        # Details initial leer, damit UI nie auf Fallback muss
         "runtime": {"met": 0, "total": len(group.get("conditions") or []), "true_ticks": None, "details": []},
     }
-
 
 def sync_status_from_profiles(profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
     st = _load_status()
@@ -849,7 +1010,7 @@ def sync_status_from_profiles(profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     # Vor dem Auffüllen: prunen
     dummy_overrides = _load_overrides()
-    _prune_status_and_overrides(st, dummy_overrides, profiles)  # overrides hier nur zum konsistenten Verhalten
+    _prune_status_and_overrides(st, dummy_overrides, profiles)
     cur_profiles = st["profiles"]
 
     # Jetzt (re)anlegen/auffüllen
@@ -870,6 +1031,106 @@ def sync_status_from_profiles(profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
     _save_status(st)
     return st
 
+# ─────────────────────────────────────────────────────────────
+# Single-Symbol Values: Helpers (origin/latest je rid)
+# ─────────────────────────────────────────────────────────────
+def _ensure_values_slot(grp_st: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    """
+    Sorgt dafür, dass grp_st['runtime']['values'][symbol] existiert und liefert das dict zurück.
+    Struktur:
+      runtime.values[<symbol>][rid].left/right = {
+         value_origin, ts_origin, value_latest, ts_latest, col, output
+      }
+    """
+    rt = grp_st.setdefault("runtime", {})
+    vals = rt.setdefault("values", {})
+    return vals.setdefault(symbol, {})
+
+def _persist_single_symbol_values(grp_st: Dict[str, Any], symbol: str, per_symbol_evals: List[Dict[str, Any]]) -> None:
+    """
+    Persistiert für den Single-Symbol-Fall die Werte (origin/latest) je rid.
+    Nimmt das erste Event (repräsentativ) und schreibt left/right-Werte.
+    """
+    if not per_symbol_evals:
+        return
+    vals_sym = _ensure_values_slot(grp_st, symbol)
+    sample = per_symbol_evals[0]
+    for cd in (sample.get("conditions") or []):
+        rid = cd.get("rid") or "no_rid"
+
+        # LEFT
+        l = cd.get("left") or {}
+        lv, lts = l.get("value"), l.get("ts")
+        if lv is not None:
+            slot = vals_sym.setdefault(rid, {}).setdefault("left", {
+                "value_origin": None, "ts_origin": None,
+                "value_latest": None, "ts_latest": None,
+                "col": l.get("col"), "output": l.get("output"),
+            })
+            if slot["value_origin"] is None:
+                slot["value_origin"], slot["ts_origin"] = float(lv), lts
+            slot["value_latest"], slot["ts_latest"] = float(lv), lts
+            slot["col"], slot["output"] = l.get("col"), l.get("output")
+
+        # RIGHT
+        r = cd.get("right") or {}
+        rv, rts = r.get("value"), r.get("ts")
+        if rv is not None:
+            slot = vals_sym.setdefault(rid, {}).setdefault("right", {
+                "value_origin": None, "ts_origin": None,
+                "value_latest": None, "ts_latest": None,
+                "col": r.get("col"), "output": r.get("output"),
+            })
+            if slot["value_origin"] is None:
+                slot["value_origin"], slot["ts_origin"] = float(rv), rts
+            slot["value_latest"], slot["ts_latest"] = float(rv), rts
+            slot["col"], slot["output"] = r.get("col"), r.get("output")
+
+def _profiles_quick_summary(profiles: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    for p in profiles or []:
+        pid = str(p.get("id") or "")
+        pname = p.get("name") or ""
+        groups = p.get("condition_groups") or []
+        out.append(f"[PROF] id={pid} name={pname!r} groups={len(groups)} enabled={bool(p.get('enabled', True))}")
+        for gi, g in enumerate(groups):
+            gid = str(g.get("gid") or f"g{gi}")
+            iv  = (g.get("interval") or "").strip()
+            syms = [s for s in (g.get("symbols") or []) if isinstance(s, str) and s.strip()]
+            conds = g.get("conditions") or []
+            out.append(
+                f"  └─[GRP] gid={gid} name={g.get('name') or ''!r} interval={iv or '—'} symbols={len(syms)} "
+                f"conditions={len(conds)} active={bool(g.get('active', True))}"
+            )
+            if not iv or not syms:
+                out.append("     ⚠ misconfigured: interval und/oder symbols fehlen")
+            # Zeig die ersten zwei Conditions kurz an
+            for ci, c in enumerate(conds[:2]):
+                out.append(
+                    f"     · cond#{ci}: left={c.get('left')!r} op={c.get('op')!r} right={c.get('right')!r} "
+                    f"right_symbol={c.get('right_symbol')!r} right_interval={c.get('right_interval')!r}"
+                )
+    if not out:
+        out.append("[PROF] keine Profile vom Endpoint erhalten")
+    return out
+
+# ─────────────────────────────────────────────────────────────
+# /profiles payload-Check
+# ─────────────────────────────────────────────────────────────
+def _validate_profiles_payload(profiles: Any) -> List[Dict[str, Any]]:
+    if not isinstance(profiles, list):
+        raise RuntimeError("Profiles payload is not a list.")
+    out: List[Dict[str, Any]] = []
+    for i, p in enumerate(profiles):
+        if not isinstance(p, dict):
+            raise RuntimeError(f"Profile #{i} is not an object.")
+        cg = p.get("condition_groups")
+        if cg is None:
+            p = {**p, "condition_groups": []}
+        elif not isinstance(cg, list):
+            raise RuntimeError(f"Profile #{i} .condition_groups is not a list.")
+        out.append(p)
+    return out
 
 # ─────────────────────────────────────────────────────────────
 # Top-Level: run_check
@@ -880,45 +1141,77 @@ def run_check() -> List[Dict[str, Any]]:
     - Ermittelt je Gruppe+Symbol den Status: FULL / PARTIAL / NONE
     - Baut EVAL-Events (inkl. deactivate_on, min_true_ticks)
     - Übergibt an gate_and_build_triggers (Streak-Gate pro Modus)
-    - Schreibt Status & konsumiert Commands
+    - Schreibt Status & konsumiert Commands (Datei + optional Unified)
     """
+    global _CACHE_HIT, _CACHE_MISS
     _INDICATOR_CACHE.clear()
+    _CACHE_HIT = 0
+    _CACHE_MISS = 0
 
     status = _load_status()
     overrides = _load_overrides()
     commands = _load_commands()
+    unified_cmds = _load_commands_unified()
 
-    # Commands indexieren
+    # Commands indexieren (Merge: Datei + Unified)
     cmds_by_pg: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    for it in list(commands.get("queue") or []):
+    for it in list((commands.get("queue") or [])) + list((unified_cmds.get("queue") or [])):
         pid = str(it.get("profile_id") or ""); gid = str(it.get("group_id") or "")
-        if pid and gid: cmds_by_pg.setdefault((pid, gid), []).append(it)
+        if pid and gid:
+            cmds_by_pg.setdefault((pid, gid), []).append(it)
 
     t_start = time.perf_counter()
     try:
         profiles = _load_profiles()
     except Exception as e:
         log.error(f"⚠️ Fehler beim Laden der Profile: {e}")
+        print(f"[FATAL] profiles load failed: {e}")
         return []
+
+    # Validierung
+    try:
+        profiles = _validate_profiles_payload(profiles)
+    except Exception as e:
+        log.error(f"⚠️ /profiles validation failed: {e}")
+        print(f"[FATAL] profiles validation failed: {e}")
+        return []
+
+    try:
+        summary_lines = _profiles_quick_summary(profiles)
+        for line in summary_lines:
+            log.info(line)
+            print(line)
+        # Harter Hinweis, wenn 0 Gruppen:
+        total_groups = sum(len(p.get("condition_groups") or []) for p in profiles or [])
+        if total_groups == 0:
+            log.warning("❌ /notifier/profiles enthält KEINE condition_groups -> Status.groups bleibt leer.")
+            print("❌ HINWEIS: /notifier/profiles enthält KEINE condition_groups -> der Status kann keine groups haben.")
+    except Exception as e:
+        log.warning(f"[DBG] profiles summary failed: {e}")
+
     try:
         meta = _load_indicators_meta()
     except Exception as e:
         log.error(f"⚠️ Fehler beim Laden der Indikator-Metadaten: {e}")
+        print(f"[FATAL] indicators meta load failed: {e}")
         return []
 
-    # 🔧 PRUNE: Entferne alte Profile/Gruppen aus Status & Overrides
+    print(f"[EVAL] profiles={len(profiles)} ts={_now_iso()}")
+
+    # PRUNE
     st_changed, ovr_changed = _prune_status_and_overrides(status, overrides, profiles)
     if st_changed:
         status["version"] = int(status.get("version", 0)) + 1
         _save_status(status)
         if DEBUG_VALUES:
             log.debug("[PRUNE] status pruned & saved")
+            print("[DBG] pruned status")
     if ovr_changed:
         overrides["updated_ts"] = _now_iso()
         _json_save_any(_OVERRIDES_PATH, overrides)
         if DEBUG_VALUES:
             log.debug("[PRUNE] overrides pruned & saved")
-
+            print("[DBG] pruned overrides")
 
     evals: List[Dict[str, Any]] = []
     now_iso = _now_iso(); now_dt = _iso_now_dt()
@@ -931,15 +1224,18 @@ def run_check() -> List[Dict[str, Any]]:
 
     for p_idx, profile in enumerate(profiles):
         pid = str(profile.get("id") or "")
-        if not pid: continue
+        if not pid:
+            continue
 
         prof_st = cur_profiles.setdefault(pid, {})
         prof_st["profile_active"] = bool(profile.get("enabled", True))
-        prof_st["id"] = pid; prof_st["name"] = profile.get("name") or ""
+        prof_st["id"] = pid
+        prof_st["name"] = profile.get("name") or ""
         gmap = prof_st.setdefault("groups", {})
 
         if not profile.get("enabled", True):
-            if DEBUG_VALUES: log.debug(f"[ACTIVE] skip profile pid={pid} (enabled=0)")
+            if DEBUG_VALUES:
+                log.debug(f"[ACTIVE] skip profile pid={pid} (enabled=0)")
             continue
 
         for g_idx, group in enumerate(profile.get("condition_groups") or []):
@@ -960,18 +1256,23 @@ def run_check() -> List[Dict[str, Any]]:
             forced_off = bool(ov_slot.get("forced_off", False))
             snooze_until_dt = _parse_iso(ov_slot.get("snooze_until"))
 
-            # Commands anwenden
+            # Commands anwenden (aus beiden Quellen)
+            rebaseline_requested = False
             for cmd in cmds_by_pg.get((pid, gid), []):
                 cmd_id = str(cmd.get("id") or "")
-                if cmd_id in consumed_cmd_ids: continue
-                rearm = bool(cmd.get("rearm", True)); rebaseline = bool(cmd.get("rebaseline", False))
+                if cmd_id in consumed_cmd_ids:
+                    continue
+                rearm = bool(cmd.get("rearm", True))
+                rebaseline = bool(cmd.get("rebaseline", False))
                 if rearm:
                     auto_disabled = False
-                    cooldown_until_dt = now_dt
-                    cooldown_until_iso = now_iso
+                    # kein künstlicher Cooldown-Zeitpunkt setzen (intuitiveres Rearm)
                     if DEBUG_VALUES: log.debug(f"[COMMAND] REARM pid={pid} gid={gid}")
-                if rebaseline and DEBUG_VALUES:
-                    log.debug(f"[COMMAND] REBASELINE pid={pid} gid={gid} (handled down the chain)")
+                    print(f"[CMD] REARM pid={pid} gid={gid}")
+                if rebaseline:
+                    rebaseline_requested = True
+                    if DEBUG_VALUES: log.debug(f"[COMMAND] REBASELINE pid={pid} gid={gid}")
+                    print(f"[CMD] REBASELINE pid={pid} gid={gid}")
                 consumed_cmd_ids.add(cmd_id)
 
             # Inaktive Gruppe?
@@ -985,27 +1286,39 @@ def run_check() -> List[Dict[str, Any]]:
             main_interval = (group.get("interval") or "").strip()
             if (not symbols) or (not main_interval):
                 blockers.append("misconfigured")
+                # bestehenden runtime.values nicht verlieren
+                rt_prev = grp_st.get("runtime") or {}
                 grp_st.update({
                     "name": (group.get("name") or f"group_{g_idx}"),
-                    "effective_active": False, "blockers": blockers,
-                    "auto_disabled": auto_disabled, "cooldown_until": cooldown_until_iso,
+                    "effective_active": False,
+                    "blockers": blockers,
+                    "auto_disabled": auto_disabled,
+                    "cooldown_until": cooldown_until_iso,
                     "fresh": fresh,
                     "aggregate": {
-                        "logic": "AND", "passed": False,
+                        "logic": "AND",
+                        "passed": False,
                         "notify_mode": _normalize_notify_mode(group),
                         "min_true_ticks": _min_true_ticks_of(group) or 1,
                     },
                     "conditions": _label_only_conditions(group),
-                    "runtime": {"met": 0, "total": len(group.get("conditions") or []), "true_ticks": None},
+                    "runtime": {**{
+                        "met": 0,
+                        "total": len(group.get("conditions") or []),
+                        "true_ticks": None,
+                        "details": []
+                    }, **({"values": rt_prev.get("values")} if "values" in rt_prev else {})},
                 })
                 continue
 
-            effective_active = bool(profile.get("enabled", True)) \
-                               and bool(group.get("active", True)) \
-                               and (not forced_off) \
-                               and (not (snooze_until_dt and now_dt < snooze_until_dt)) \
-                               and (not auto_disabled) \
-                               and (not (cooldown_until_dt and now_dt < cooldown_until_dt))
+            effective_active = (
+                bool(profile.get("enabled", True))
+                and bool(group.get("active", True))
+                and (not forced_off)
+                and (not (snooze_until_dt and now_dt < snooze_until_dt))
+                and (not auto_disabled)
+                and (not (cooldown_until_dt and now_dt < cooldown_until_dt))
+            )
 
             notify_mode = _normalize_notify_mode(group)
             min_ticks = _min_true_ticks_of(group)
@@ -1014,30 +1327,39 @@ def run_check() -> List[Dict[str, Any]]:
 
             if effective_active:
                 for sym in symbols:
-                    status_str, cond_details, bar_ts, err = _eval_group_for_symbol(meta, profile, group, sym, g_idx)
+                    status_str, cond_details, bar_ts, err, tick_confirmed = _eval_group_for_symbol(meta, profile, group, sym, g_idx)
                     if err:
                         hard_error = err
 
-                    # 🔧 NEU: single_mode + tick_id + Vereinheitlichung auf notify_mode
+                    # single_mode optional (kompatibel; default "symbol")
                     single_mode = (group.get("single_mode") or "symbol").strip().lower()  # "symbol" | "group" | "everything"
                     tick_id = f"{main_interval}:{(bar_ts or now_iso)}"
 
                     ev = {
-                        "profile_id": pid, "profile_name": profile.get("name"),
-                        "group_id": gid, "group_index": g_idx, "group_name": group.get("name") or f"group_{g_idx}",
-                        "symbol": sym, "interval": main_interval, "exchange": group.get("exchange") or None,
+                        "profile_id": pid,
+                        "profile_name": profile.get("name"),
+                        "group_id": gid,
+                        "group_index": g_idx,
+                        "group_name": group.get("name") or f"group_{g_idx}",
+                        "symbol": sym,
+                        "interval": main_interval,
+                        "exchange": group.get("exchange") or None,
                         "telegram_bot_id": _to_int_or_none(group.get("telegram_bot_id")),
                         "telegram_bot_token": group.get("telegram_bot_token") or None,
                         "telegram_chat_id": group.get("telegram_chat_id") or None,
-
                         "description": group.get("description") or None,
-                        "ts": now_iso, "bar_ts": bar_ts or now_iso, "tick_id": tick_id,
-                        "status": status_str, "notify_mode": notify_mode, "min_true_ticks": min_ticks,
+                        "ts": now_iso,
+                        "bar_ts": bar_ts or now_iso,
+                        "tick_id": tick_id,
+                        "status": status_str,
+                        "notify_mode": notify_mode,
+                        "min_true_ticks": min_ticks,
+                        "min_tick": _group_min_tick(group),
+                        "tick_confirmed": tick_confirmed,
                         "single_mode": single_mode,
                         "conditions": cond_details,
                     }
 
-                    # ✅ WICHTIG: Events sammeln (du hattest das vergessen)
                     per_symbol_evals.append(ev)
                     evals.append(ev)
                     if bar_ts:
@@ -1048,37 +1370,45 @@ def run_check() -> List[Dict[str, Any]]:
                             f"[EVAL-EVENT] pid={pid} gid={gid} sym={sym} "
                             f"status={status_str} mode={notify_mode} single={single_mode} tick={tick_id}"
                         )
-
+                        print(f"[DBG] event pid={pid} gid={gid} sym={sym} status={status_str}")
             else:
-                if DEBUG_VALUES: log.debug(f"[ACTIVE] skip evaluation pid={pid} gid={gid} due blockers={blockers}")
+                if DEBUG_VALUES:
+                    log.debug(f"[ACTIVE] skip evaluation pid={pid} gid={gid} due blockers={blockers}")
+                    print(f"[DBG] skip pid={pid} gid={gid} blockers={blockers}")
                 grp_st["conditions"] = _label_only_conditions(group)
 
             if hard_error:
-                blockers.append("error"); fresh = False
+                blockers.append("error")
+                fresh = False
 
-            effective_active = effective_active and fresh and not any(b in ("forced_off","snooze","auto_disabled","cooldown","group_inactive","misconfigured") for b in blockers)
+            effective_active = effective_active and fresh and not any(
+                b in ("forced_off", "snooze", "auto_disabled", "cooldown", "group_inactive", "misconfigured")
+                for b in blockers
+            )
 
             met = total = 0
             if per_symbol_evals:
                 try:
                     sample_conds = per_symbol_evals[0].get("conditions") or []
-                    total = len(sample_conds); met = sum(1 for c in sample_conds if c and bool(c.get("result")))
+                    total = len(sample_conds)
+                    met = sum(1 for c in sample_conds if c and bool(c.get("result")))
                 except Exception:
                     pass
             else:
-                total = len(group.get("conditions") or []); met = 0
+                total = len(group.get("conditions") or [])
+                met = 0
 
-            # 👉 Bedingungen + Details aus erstem Symbol (repräsentativ) ableiten
+            # Bedingungen + Details aus erstem Symbol (repräsentativ)
             conditions_list: List[Dict[str, Any]] = []
             details_list: List[Dict[str, Any]] = []
             if per_symbol_evals:
                 try:
                     sample = per_symbol_evals[0]
                     for cd in (sample.get("conditions") or []):
-                        left  = cd.get("left")  if isinstance(cd.get("left"), dict)  else {}
+                        left = cd.get("left") if isinstance(cd.get("left"), dict) else {}
                         right = cd.get("right") if isinstance(cd.get("right"), dict) else {}
 
-                        # UI-freundliche Kurzform (conditions) – wie bisher
+                        # UI-Kurzform (conditions)
                         conditions_list.append({
                             "left": left.get("label"),
                             "right": right.get("label"),
@@ -1098,31 +1428,31 @@ def run_check() -> List[Dict[str, Any]]:
                             "error": cd.get("error"),
                         })
 
-                        # 🔥 Vollständige Details (runtime.details) – damit UI echte Werte hat
+                        # Tiefe Details (runtime.details)
                         details_list.append({
                             "rid": cd.get("rid") or None,
                             "op": cd.get("op_norm") or cd.get("op"),
                             "result": bool(cd.get("result")),
                             "left": {
-                                "label":  left.get("label"),
-                                "spec":   left.get("spec"),
+                                "label": left.get("label"),
+                                "spec": left.get("spec"),
                                 "output": left.get("output"),
-                                "col":    left.get("col"),
-                                "value":  left.get("value"),
+                                "col": left.get("col"),
+                                "value": left.get("value"),
                                 "symbol": left.get("symbol"),
                                 "interval": left.get("interval"),
-                                "ts":     left.get("ts"),
+                                "ts": left.get("ts"),
                                 "params": left.get("params") or {},
                             },
                             "right": {
-                                "label":  right.get("label"),
-                                "spec":   right.get("spec"),
+                                "label": right.get("label"),
+                                "spec": right.get("spec"),
                                 "output": right.get("output"),
-                                "col":    right.get("col"),
-                                "value":  right.get("value"),
+                                "col": right.get("col"),
+                                "value": right.get("value"),
                                 "symbol": right.get("symbol"),
                                 "interval": right.get("interval"),
-                                "ts":     right.get("ts"),
+                                "ts": right.get("ts"),
                                 "params": right.get("params") or {},
                                 "right_absolut": right.get("right_absolut"),
                                 "right_change_legacy_pct": right.get("right_change_legacy_pct"),
@@ -1133,13 +1463,37 @@ def run_check() -> List[Dict[str, Any]]:
                 except Exception as e:
                     log.debug(f"[STATUS] details build failed pid={pid} gid={gid}: {e}")
 
-            # Vorhandene true_ticks erhalten (Gate setzt die später evtl. noch)
-            prev_true_ticks = None
-            try:
-                prev_true_ticks = (grp_st.get("runtime") or {}).get("true_ticks")
-            except Exception:
-                prev_true_ticks = None
+            # Single-Symbol-Werte speichern (origin/latest) je rid
+            if len(symbols) == 1 and per_symbol_evals:
+                try:
+                    _persist_single_symbol_values(grp_st, symbols[0], per_symbol_evals)
+                except Exception as e:
+                    if DEBUG_VALUES:
+                        log.debug(f"[VALUES] persist failed pid={pid} gid={gid}: {e}")
 
+            # Rebaseline anwenden (origin := latest) — nur Single-Symbol-Gruppen
+            if len(symbols) == 1 and rebaseline_requested:
+                try:
+                    rt_vals = (grp_st.get("runtime") or {}).get("values") or {}
+                    vals_sym = rt_vals.get(symbols[0]) or {}
+                    for rid, sides in vals_sym.items():
+                        for side in ("left", "right"):
+                            slot = sides.get(side)
+                            if not isinstance(slot, dict):
+                                continue
+                            if slot.get("value_latest") is not None:
+                                slot["value_origin"] = slot["value_latest"]
+                                slot["ts_origin"] = slot.get("ts_latest")
+                    if DEBUG_VALUES:
+                        log.debug(f"[VALUES] rebaseline applied pid={pid} gid={gid} sym={symbols[0]}")
+                        print(f"[DBG] rebaseline applied pid={pid} gid={gid} sym={symbols[0]}")
+                except Exception as e:
+                    if DEBUG_VALUES:
+                        log.debug(f"[VALUES] rebaseline failed pid={pid} gid={gid}: {e}")
+
+            # Vorhandene true_ticks und values erhalten
+            rt_prev = grp_st.get("runtime") or {}
+            prev_true_ticks = rt_prev.get("true_ticks")
             grp_st.update({
                 "name": (group.get("name") or f"group_{g_idx}"),
                 "effective_active": bool(effective_active),
@@ -1153,45 +1507,103 @@ def run_check() -> List[Dict[str, Any]]:
                     "logic": "AND",
                     "passed": any(
                         (ev["status"] == "FULL")
-                        or (notify_mode == "any_true" and ev["status"] in ("FULL","PARTIAL"))
+                        or (_normalize_notify_mode(group) == "any_true" and ev["status"] in ("FULL", "PARTIAL"))
                         for ev in per_symbol_evals
                     ),
-                    "notify_mode": notify_mode,
+                    "notify_mode": _normalize_notify_mode(group),
                     "min_true_ticks": (min_ticks if min_ticks is not None else 1),
                 },
+                # Klar im Status hinterlegen
+                "min_tick": _group_min_tick(group),
+                # Conditions Digest (wie gehabt):
                 "conditions": conditions_list if conditions_list else _label_only_conditions(group),
                 "runtime": {
                     "met": met,
                     "total": total,
                     "true_ticks": prev_true_ticks,
-                    "details": details_list,  # 👉 das will die UI sehen
+                    "details": details_list,
+                    **({"values": rt_prev.get("values")} if "values" in rt_prev else {}),
+                    # runtime timestamps for auditability
+                    "created_ts": (rt_prev.get("created_ts") or now_iso),
+                    "updated_ts": now_iso,
+                    # dedupe / alarm bookkeeping hooks (Gate/Alarm kann sie setzen)
+                    "last_alarm_tick_id": (rt_prev.get("last_alarm_tick_id") if isinstance(rt_prev, dict) else None),
+                    "last_alarm_ts": (rt_prev.get("last_alarm_ts") if isinstance(rt_prev, dict) else None),
                 },
+                # Storage-Block Layout Marker (Selbstbeschreibung)
+                "storage_layout": "unified-config-runtime",
             })
 
             if DEBUG_VALUES:
                 log.debug(f"[STATUS] pid={pid} gid={gid} conds={len(conditions_list)} details={len(details_list)}")
 
+    # Gating + Trigger bauen
     triggered = gate_and_build_triggers(evals)
 
-    if cmds := {str(it.get("id") or "") for it in (commands.get("queue") or [])}:
-        if consumed_cmd_ids:
+    # Commands konsumieren (Datei)
+    if consumed_cmd_ids:
+        # Datei-Commands
+        if (commands.get("queue")):
             commands["queue"] = [it for it in (commands.get("queue") or []) if str(it.get("id") or "") not in consumed_cmd_ids]
             _save_commands(commands)
-            if DEBUG_VALUES: log.debug(f"[COMMAND] consumed={len(consumed_cmd_ids)} left={len(commands['queue'])}")
+            if DEBUG_VALUES: log.debug(f"[COMMAND] consumed(file)={len(consumed_cmd_ids)} left={len(commands.get('queue') or [])}")
+            print(f"[DBG] consumed(file)={len(consumed_cmd_ids)}")
+        # Unified-Commands
+        _consume_commands_unified(consumed_cmd_ids)
 
+    # API-kompatible Metadaten setzen, damit /notifier/status nicht "autofixed"
+    # und unsere Gruppen/Conditions nicht überschreibt.
+    try:
+        fp = _profiles_fingerprint(profiles)
+    except Exception:
+        fp = ""
+    status["flavor"] = "notifier-api"
+    status["profiles_fp"] = fp
     status["version"] = int(prev_version) + 1
     _save_status(status)
 
     dt_total = (time.perf_counter() - t_start) * 1000.0
     log.info(f"Evals={len(evals)} → Trigger={len(triggered)} — Status v{status['version']} geschrieben — Laufzeit: {dt_total:.1f} ms")
     if triggered and DEBUG_VALUES:
-        try: log.debug(json.dumps(triggered[:2], ensure_ascii=False, indent=2))
-        except Exception: pass
+        try:
+            log.debug(json.dumps(triggered[:2], ensure_ascii=False, indent=2))
+        except Exception:
+            pass
+
+    # Cache-Stats
+    try:
+        log.info(f"cache: hit={_CACHE_HIT} miss={_CACHE_MISS} size={len(_INDICATOR_CACHE)}")
+        print(f"[DBG] cache hit={_CACHE_HIT} miss={_CACHE_MISS} size={len(_INDICATOR_CACHE)}")
+    except Exception:
+        pass
+
     return triggered
 
 # ─────────────────────────────────────────────────────────────
 # CLI Helper
 # ─────────────────────────────────────────────────────────────
+def run_evaluator_once() -> int:
+    try:
+        events = run_check()
+        return len(events)
+    except Exception as e:
+        log.exception("run_evaluator_once failed: %s", e)
+        return -1
+
+def run_evaluator_loop(period_seconds: int = 60):
+    """
+    Einfacher Loop ohne Async – ruft alle X Sekunden run_check() auf.
+    Bricht nur bei KeyboardInterrupt ab.
+    """
+    log.info("⏱️ evaluator loop started period=%ss", period_seconds)
+    try:
+        while True:
+            n = run_evaluator_once()
+            log.info("tick done: events=%s", n)
+            time.sleep(max(5, int(period_seconds)))
+    except KeyboardInterrupt:
+        log.info("evaluator loop stopped by user")
+
 def run_evaluator() -> None:
     print("🔄 Evaluator startet …")
     try:
