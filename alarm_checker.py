@@ -617,6 +617,16 @@ def run_alarm_checker(triggered: List[Dict[str, Any]]) -> None:
             if DEBUG:
                 print(f"[DEBUG] skip bucket (cooldown {remaining}s): {bkey}")
             continue
+        else:
+            if DEBUG:
+                # Frühes Sichtbarmachen der Eckdaten dieses Buckets
+                print(f"[DEBUG] cooled bucket: {bkey} "
+                      f"mode={(bundle['proto'].get('notify_mode') or '').lower()} "
+                      f"status={(bundle['proto'].get('status') or '').upper()} "
+                      f"streak={int(bundle['proto'].get('streak') or 0)}/"
+                      f"{int(bundle['proto'].get('min_true_ticks') or 1)} "
+                      f"tick_conf={bool(bundle['proto'].get('tick_confirmed', True))}")
+
 
         # Nachricht zusammenbauen: Kopf vom proto, Body aus allen items
         msg_header = format_alarm_message(proto).split("\n\n", 1)[0]
@@ -639,6 +649,37 @@ def run_alarm_checker(triggered: List[Dict[str, Any]]) -> None:
             token_used = "<override>" if token_override else "<default>"
             print(f"[DEBUG] sending bucket → {bkey} items={len(items)} recips={recipients} token={token_used} len={len(msg)}")
 
+        # --- Sende-Entscheidung: notify_mode steuert Versand, Tick-Gate nur bei mode=true ---
+        mode    = (proto.get("notify_mode") or "").strip().lower()   # "true" | "any_true" | "always"
+        status  = (proto.get("status") or "").strip().upper()        # "FULL" | "PARTIAL" | "NONE"
+        streak  = int(proto.get("streak") or 0)                      # vom Gate (FULL-only)
+        mtt     = int(proto.get("min_true_ticks") or 1)
+        tconf   = bool(proto.get("tick_confirmed", True))            # vom Evaluator (Bar-Heuristik)
+
+        should_send = False
+        reason = ""
+
+        if mode == "true":
+            # Nur wenn vollständig erfüllt UND Kerze bestätigt UND Streak erreicht
+            should_send = (status == "FULL") and tconf and (streak >= mtt)
+            reason = f"mode=true status={status} tconf={tconf} streak={streak}/{mtt}"
+        elif mode == "any_true":
+            # Zwischenstand senden (ohne Tick-Gate): PARTIAL oder FULL reicht
+            should_send = (status in ("PARTIAL", "FULL"))
+            reason = f"mode=any_true status={status}"
+        else:
+            # "always" (oder unbekannt) → immer senden
+            should_send = True
+            reason = f"mode={mode or 'always'} status={status}"
+
+        if DEBUG:
+            print(f"[DEBUG] send-decision: {should_send} ({reason})")
+
+        if not should_send:
+            if DEBUG:
+                print(f"[DEBUG] skip bucket (send=false): {bkey}")
+            continue
+
         # 3) Senden
         try:
             _send_tg_text(
@@ -651,27 +692,6 @@ def run_alarm_checker(triggered: List[Dict[str, Any]]) -> None:
             print("💥 Alarm send failed:", e)
             continue
 
-        # 4) Persistieren
-        for it in items:
-            try:
-                _persist_alarm_via_api(it)
-                persisted += 1
-            except Exception:
-                if DEBUG:
-                    print("[DEBUG] persist failed (not counting)")
-
-        # 5) Optional: Auto-Deaktivierung (overrides + active=false)
-        for it in items:
-            try:
-                if _maybe_auto_deactivate_via_overrides(it):
-                    deactivated += 1
-                    it["deactivate_applied"] = (it.get("notify_mode") or "").lower() in ("true", "any_true")
-            except Exception:
-                if DEBUG:
-                    print("[DEBUG] auto-deactivate failed")
-
-        _mark_sent(state, dedupe_key, now)
-        time.sleep(SEND_DELAY_SEC)
 
     _save_state(state)
     print(f"✅ Versand fertig. {sent} / {n} Nachricht(en) verschickt. Persistiert: {persisted}. Auto-deaktiviert: {deactivated}.")

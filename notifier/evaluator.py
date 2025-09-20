@@ -848,7 +848,7 @@ def _eval_group_for_symbol(
             pass
     bar_ts = _safe_max_iso(ts_candidates, fallback=None)
 
-    # tick confirmation (soft) – Gate/Streak kümmert sich um "mehrere nacheinander"
+    # tick confirmation (soft) – Gate/Streak kümmert sich um "mehrere Ticks in Folge"
     now_dt = _iso_now_dt()
     _, confirmed_soft = _bar_close_info(bar_ts, main_interval, now_dt)
     tick_confirmed = (confirmed_soft is True and min_tick <= 1)
@@ -996,7 +996,7 @@ def _skeleton_group_from_def(group: Dict[str, Any], g_idx: int) -> Dict[str, Any
         "aggregate": {
             "logic": "AND",
             "passed": False,
-            "notify_mode": notify_mode,
+            "deactivate_on": notify_mode,  
             "min_true_ticks": min_ticks
         },
         "conditions": _label_only_conditions(group),
@@ -1072,6 +1072,7 @@ def _persist_single_symbol_values(grp_st: Dict[str, Any], symbol: str, per_symbo
             slot["value_latest"], slot["ts_latest"] = float(lv), lts
             slot["col"], slot["output"] = l.get("col"), l.get("output")
 
+
         # RIGHT
         r = cd.get("right") or {}
         rv, rts = r.get("value"), r.get("ts")
@@ -1085,6 +1086,9 @@ def _persist_single_symbol_values(grp_st: Dict[str, Any], symbol: str, per_symbo
                 slot["value_origin"], slot["ts_origin"] = float(rv), rts
             slot["value_latest"], slot["ts_latest"] = float(rv), rts
             slot["col"], slot["output"] = r.get("col"), r.get("output")
+
+from typing import Optional
+
 
 def _profiles_quick_summary(profiles: List[Dict[str, Any]]) -> List[str]:
     out: List[str] = []
@@ -1114,6 +1118,7 @@ def _profiles_quick_summary(profiles: List[Dict[str, Any]]) -> List[str]:
         out.append("[PROF] keine Profile vom Endpoint erhalten")
     return out
 
+
 # ─────────────────────────────────────────────────────────────
 # /profiles payload-Check
 # ─────────────────────────────────────────────────────────────
@@ -1131,6 +1136,99 @@ def _validate_profiles_payload(profiles: Any) -> List[Dict[str, Any]]:
             raise RuntimeError(f"Profile #{i} .condition_groups is not a list.")
         out.append(p)
     return out
+
+# ─────────────────────────────────────────────────────────────
+# Reset Alarm
+# ─────────────────────────────────────────────────────────────
+def _apply_alarm_resets(status: Dict[str, Any], triggered: List[Dict[str, Any]]) -> None:
+    """
+    Nach ausgelöstem Alarm:
+      - runtime.true_ticks -> 0
+      - last_alarm_tick_id / last_alarm_ts setzen
+      - Baselines (origin) auf latest schieben (value_origin := value_latest, ts_origin := ts_latest)
+      - last_bar_ts auf den Bar des Alarms setzen (falls vorhanden)
+    Wir nehmen pro (profile_id, group_id, symbol) den jüngsten tick_id aus dieser Runde.
+    """
+    def _tid(ev: Dict[str, Any]) -> str:
+        return str(ev.get("tick_id") or "")
+
+    latest_ev_by_pgs: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for ev in (triggered or []):
+        pid = str(ev.get("profile_id") or "")
+        gid = str(ev.get("group_id") or ev.get("group_index") or "")
+        sym = str(ev.get("symbol") or "")
+        if not pid or not gid or not sym:
+            continue
+        k = (pid, gid, sym)
+        prev = latest_ev_by_pgs.get(k)
+        if prev is None or _tid(ev) > _tid(prev):
+            latest_ev_by_pgs[k] = ev
+
+    if not latest_ev_by_pgs:
+        return
+
+    profiles = status.setdefault("profiles", {})
+    for (pid, gid, sym), ev in latest_ev_by_pgs.items():
+        pobj = profiles.get(pid)
+        if not isinstance(pobj, dict):
+            continue
+        gmap = (pobj.get("groups") or {})
+        grp_st = gmap.get(gid)
+        if not isinstance(grp_st, dict):
+            continue
+
+        rt = grp_st.setdefault("runtime", {})
+
+        # 1) Streak resetten + Alarmmarker setzen
+        rt["true_ticks"] = 0
+        rt["last_alarm_tick_id"] = ev.get("tick_id")
+        rt["last_alarm_ts"] = ev.get("ts")
+
+        # 2) Baselines je rid/side (nur wenn values vorhanden sind – typ. Single-Symbol-Gruppen)
+        vals_all = rt.get("values") or {}
+        vals_sym = vals_all.get(sym) or {}
+        for _rid, sides in list(vals_sym.items()):
+            for side in ("left", "right"):
+                slot = sides.get(side)
+                if isinstance(slot, dict) and (slot.get("value_latest") is not None):
+                    slot["value_origin"] = slot["value_latest"]
+                    slot["ts_origin"] = slot.get("ts_latest")
+
+        # optional: den Gruppen-last_bar_ts auf den Alarm-Bar setzen
+        if ev.get("bar_ts"):
+            grp_st["last_bar_ts"] = ev.get("bar_ts")
+
+# ─────────────────────────────────────────────────────────────
+# Auto-Deaktivierung (optional – lokal)
+# ─────────────────────────────────────────────────────────────
+def _should_auto_deactivate(ev: Dict[str, Any]) -> bool:
+    mode = (ev.get("deactivate_on") or ev.get("notify_mode") or "").lower()
+    st   = (ev.get("status") or "").upper()
+    return (mode == "true" and st == "FULL") or (mode == "any_true" and st in ("FULL", "PARTIAL"))
+
+
+def _set_group_active(pid: str, gid: str, active: bool) -> bool:
+    if not pid or not gid:
+        return False
+    try:
+        url = f"{NOTIFIER_ENDPOINT}/profiles/{pid}/groups/{gid}/active"
+        _http_json("PATCH", url, json_body={"active": bool(active)})
+        return True
+    except Exception as e:
+        if DEBUG_VALUES:
+            log.debug(f"[DEACT] PATCH failed pid={pid} gid={gid} -> {e}")
+        return False
+
+def _auto_deactivate_from_triggered(triggered: List[Dict[str, Any]]) -> None:
+    for ev in (triggered or []):
+        try:
+            if _should_auto_deactivate(ev):
+                pid = str(ev.get("profile_id") or "")
+                gid = str(ev.get("group_id") or ev.get("group_index") or "")
+                if _set_group_active(pid, gid, False) and DEBUG_VALUES:
+                    print(f"[DEACT] pid={pid} gid={gid} set active=false")
+        except Exception:
+            pass
 
 # ─────────────────────────────────────────────────────────────
 # Top-Level: run_check
@@ -1287,6 +1385,7 @@ def run_check() -> List[Dict[str, Any]]:
             if (not symbols) or (not main_interval):
                 blockers.append("misconfigured")
                 # bestehenden runtime.values nicht verlieren
+
                 rt_prev = grp_st.get("runtime") or {}
                 grp_st.update({
                     "name": (group.get("name") or f"group_{g_idx}"),
@@ -1298,17 +1397,21 @@ def run_check() -> List[Dict[str, Any]]:
                     "aggregate": {
                         "logic": "AND",
                         "passed": False,
-                        "notify_mode": _normalize_notify_mode(group),
-                        "min_true_ticks": _min_true_ticks_of(group) or 1,
+                        "deactivate_on": _normalize_notify_mode(group),  # für gate.py
+                        "min_true_ticks": (_min_true_ticks_of(group) or 1),
                     },
                     "conditions": _label_only_conditions(group),
-                    "runtime": {**{
-                        "met": 0,
-                        "total": len(group.get("conditions") or []),
-                        "true_ticks": None,
-                        "details": []
-                    }, **({"values": rt_prev.get("values")} if "values" in rt_prev else {})},
+                    "runtime": {
+                        **{
+                            "met": 0,
+                            "total": len(group.get("conditions") or []),
+                            "true_ticks": None,
+                            "details": []
+                        },
+                        **({"values": rt_prev.get("values")} if "values" in rt_prev else {}),
+                    },
                 })
+
                 continue
 
             effective_active = (
@@ -1352,7 +1455,8 @@ def run_check() -> List[Dict[str, Any]]:
                         "bar_ts": bar_ts or now_iso,
                         "tick_id": tick_id,
                         "status": status_str,
-                        "notify_mode": notify_mode,
+                        "deactivate_on": notify_mode,     
+                        "notify_mode": notify_mode,      
                         "min_true_ticks": min_ticks,
                         "min_tick": _group_min_tick(group),
                         "tick_confirmed": tick_confirmed,
@@ -1539,6 +1643,84 @@ def run_check() -> List[Dict[str, Any]]:
 
     # Gating + Trigger bauen
     triggered = gate_and_build_triggers(evals)
+
+    # --- Streaks (true_ticks) aus Gate/Ereignissen in den Status zurückschreiben
+    # Wir sammeln Streaks pro (profile_id, group_id)
+    streak_by_pg: Dict[Tuple[str, str], int] = {}
+
+    def _acc(ev: Dict[str, Any]) -> None:
+        pid = str(ev.get("profile_id") or "")
+        gid = str(ev.get("group_id") or ev.get("group_index") or "")
+        if not pid or not gid:
+            return
+        s = ev.get("streak")
+        if s is None:
+            return
+        try:
+            s_int = int(s)
+        except Exception:
+            return
+        key = (pid, gid)
+        prev = streak_by_pg.get(key, 0)
+        if s_int > prev:
+            streak_by_pg[key] = s_int
+
+    # Falls das Gate die originalen evals mutiert → zuerst daraus lesen
+    for ev in (evals or []):
+        _acc(ev)
+    # Zusätzlich aus den getriggerten Events lesen (falls Gate Streak nur dort anhängt)
+    for ev in (triggered or []):
+        _acc(ev)
+
+    # Fallback: Wenn Gate keine Streaks lieferte (oder einzelne Gruppen fehlen), selbst zählen
+    prev_true_by_pg: Dict[Tuple[str,str], int] = {}
+    status.setdefault("profiles", {})
+    for pid, pobj in (status["profiles"] or {}).items():
+        for gid, grp_st in ((pobj or {}).get("groups") or {}).items():
+            prev = (grp_st.get("runtime") or {}).get("true_ticks")
+            try:
+                prev_true_by_pg[(str(pid), str(gid))] = int(prev) if prev is not None else 0
+            except Exception:
+                prev_true_by_pg[(str(pid), str(gid))] = 0
+
+    passed_by_pg: Dict[Tuple[str,str], bool] = {}
+    confirmed_by_pg: Dict[Tuple[str,str], bool] = {}
+    for ev in (evals or []):
+        pid = str(ev.get("profile_id") or "")
+        gid = str(ev.get("group_id") or ev.get("group_index") or "")
+        if not pid or not gid:
+            continue
+        mode = (ev.get("deactivate_on") or ev.get("notify_mode") or "").lower()
+
+        st = (ev.get("status") or "").upper()  # FULL / PARTIAL / NONE
+        passed = (st == "FULL") or (mode == "any_true" and st in ("FULL", "PARTIAL"))
+
+        key = (pid, gid)
+        passed_by_pg[key] = passed_by_pg.get(key, False) or bool(passed)
+        confirmed_by_pg[key] = confirmed_by_pg.get(key, False) or bool(ev.get("tick_confirmed"))
+
+    # Setze Streaks: Gate-Werte haben Vorrang; sonst Fallback aus prev_true + passed + confirmed
+    for key, prev_val in prev_true_by_pg.items():
+        if key not in streak_by_pg:
+            if passed_by_pg.get(key) and confirmed_by_pg.get(key):
+                streak_by_pg[key] = prev_val + 1
+            else:
+                streak_by_pg[key] = 0
+
+    # In den Status mappen (runtime.true_ticks aktualisieren)
+    for pid, pobj in (status["profiles"] or {}).items():
+        gmap = (pobj or {}).get("groups") or {}
+        for gid, grp_st in gmap.items():
+            key = (str(pid), str(gid))
+            if key in streak_by_pg:
+                rt = grp_st.setdefault("runtime", {})
+                rt["true_ticks"] = streak_by_pg[key]
+
+    # Nach Triggern: Baselines/true_ticks/last_alarm_* resetten
+    _apply_alarm_resets(status, triggered)
+
+    # (Optional) Sofortige Auto-Deaktivierung lokal per PATCH
+    _auto_deactivate_from_triggered(triggered)
 
     # Commands konsumieren (Datei)
     if consumed_cmd_ids:
