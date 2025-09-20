@@ -73,6 +73,25 @@ def _int_env(key: str, default: int) -> int:
     except Exception:
         return default
 
+# Robust: Strings wie "false"/"0"/"no" werden korrekt zu False
+def _as_bool(x: Any, default: bool = False) -> bool:
+    if isinstance(x, bool):
+        return x
+    if x is None:
+        return default
+    if isinstance(x, (int, float)):
+        try:
+            return bool(int(x))
+        except Exception:
+            return default
+    if isinstance(x, str):
+        s = x.strip().lower()
+        if s in {"1","true","yes","y","on"}:
+            return True
+        if s in {"0","false","no","n","off"}:
+            return False
+    return default
+
 DEBUG_HTTP   = _bool_env("EVAL_DEBUG_HTTP", True)
 DEBUG_VALUES = _bool_env("EVAL_DEBUG_VALUES", True)
 
@@ -985,7 +1004,7 @@ def _skeleton_group_from_def(group: Dict[str, Any], g_idx: int) -> Dict[str, Any
     notify_mode = _normalize_notify_mode(group)
     min_ticks   = _min_true_ticks_of(group) or 1
     return {
-        "group_active": bool(group.get("active", True)),
+        "group_active": _as_bool(group.get("active", True), True),
         "last_eval_ts": None,
         "effective_active": False,
         "blockers": (["misconfigured"] if misconfigured else []),
@@ -996,7 +1015,7 @@ def _skeleton_group_from_def(group: Dict[str, Any], g_idx: int) -> Dict[str, Any
         "aggregate": {
             "logic": "AND",
             "passed": False,
-            "deactivate_on": notify_mode,  
+            "deactivate_on": notify_mode,  # für gate.py
             "min_true_ticks": min_ticks
         },
         "conditions": _label_only_conditions(group),
@@ -1019,13 +1038,15 @@ def sync_status_from_profiles(profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not pid:
             continue
         pobj = cur_profiles.setdefault(pid, {})
-        pobj["profile_active"] = bool(p.get("enabled", True))
+        pobj["profile_active"] = _as_bool(p.get("enabled", True), True)
         pobj["id"] = pid
         pobj["name"] = p.get("name") or ""
         gmap = pobj.setdefault("groups", {})
         for g_idx, g in enumerate(p.get("condition_groups") or []):
             gid = str(g.get("gid") or "").strip() or f"g{g_idx}"
             gmap[gid] = {**gmap.get(gid, {}), **_skeleton_group_from_def(g, g_idx)}
+            if DEBUG_VALUES:
+                print(f"[DBG] sync_status: pid={pid} gid={gid} active={_as_bool(g.get('active', True), True)}")
 
     st["version"] = int(st.get("version", 0)) + 1
     _save_status(st)
@@ -1072,7 +1093,6 @@ def _persist_single_symbol_values(grp_st: Dict[str, Any], symbol: str, per_symbo
             slot["value_latest"], slot["ts_latest"] = float(lv), lts
             slot["col"], slot["output"] = l.get("col"), l.get("output")
 
-
         # RIGHT
         r = cd.get("right") or {}
         rv, rts = r.get("value"), r.get("ts")
@@ -1096,7 +1116,8 @@ def _profiles_quick_summary(profiles: List[Dict[str, Any]]) -> List[str]:
         pid = str(p.get("id") or "")
         pname = p.get("name") or ""
         groups = p.get("condition_groups") or []
-        out.append(f"[PROF] id={pid} name={pname!r} groups={len(groups)} enabled={bool(p.get('enabled', True))}")
+        out.append(f"[PROF] id={pid} name={pname!r} groups={len(groups)} enabled={_as_bool(p.get('enabled', True), True)}")
+
         for gi, g in enumerate(groups):
             gid = str(g.get("gid") or f"g{gi}")
             iv  = (g.get("interval") or "").strip()
@@ -1104,8 +1125,9 @@ def _profiles_quick_summary(profiles: List[Dict[str, Any]]) -> List[str]:
             conds = g.get("conditions") or []
             out.append(
                 f"  └─[GRP] gid={gid} name={g.get('name') or ''!r} interval={iv or '—'} symbols={len(syms)} "
-                f"conditions={len(conds)} active={bool(g.get('active', True))}"
+                f"conditions={len(conds)} active={_as_bool(g.get('active', True), True)}"
             )
+
             if not iv or not syms:
                 out.append("     ⚠ misconfigured: interval und/oder symbols fehlen")
             # Zeig die ersten zwei Conditions kurz an
@@ -1134,6 +1156,10 @@ def _validate_profiles_payload(profiles: Any) -> List[Dict[str, Any]]:
             p = {**p, "condition_groups": []}
         elif not isinstance(cg, list):
             raise RuntimeError(f"Profile #{i} .condition_groups is not a list.")
+        # ⚙️ Normiere Booleans direkt hier
+        p["enabled"] = _as_bool(p.get("enabled", True), True)
+        for g in (p.get("condition_groups") or []):
+            g["active"] = _as_bool(g.get("active", True), True)
         out.append(p)
     return out
 
@@ -1206,18 +1232,24 @@ def _should_auto_deactivate(ev: Dict[str, Any]) -> bool:
     st   = (ev.get("status") or "").upper()
     return (mode == "true" and st == "FULL") or (mode == "any_true" and st in ("FULL", "PARTIAL"))
 
-
 def _set_group_active(pid: str, gid: str, active: bool) -> bool:
     if not pid or not gid:
+        if DEBUG_VALUES:
+            print(f"[DEACT][SKIP] invalid ids pid={pid!r} gid={gid!r}")
         return False
+    url = f"{NOTIFIER_ENDPOINT}/profiles/{pid}/groups/{gid}/active"
     try:
-        url = f"{NOTIFIER_ENDPOINT}/profiles/{pid}/groups/{gid}/active"
+        if DEBUG_VALUES:
+            print(f"[DEACT][PATCH] → {url} body={{'active': {bool(active)}}}")
         _http_json("PATCH", url, json_body={"active": bool(active)})
+        if DEBUG_VALUES:
+            print(f"[DEACT][OK] pid={pid} gid={gid} set active={bool(active)}")
         return True
     except Exception as e:
-        if DEBUG_VALUES:
-            log.debug(f"[DEACT] PATCH failed pid={pid} gid={gid} -> {e}")
+        print(f"[DEACT][ERR] pid={pid} gid={gid} url={url} error={e!r}")
         return False
+
+
 
 def _auto_deactivate_from_triggered(triggered: List[Dict[str, Any]]) -> None:
     for ev in (triggered or []):
@@ -1225,8 +1257,10 @@ def _auto_deactivate_from_triggered(triggered: List[Dict[str, Any]]) -> None:
             if _should_auto_deactivate(ev):
                 pid = str(ev.get("profile_id") or "")
                 gid = str(ev.get("group_id") or ev.get("group_index") or "")
-                if _set_group_active(pid, gid, False) and DEBUG_VALUES:
-                    print(f"[DEACT] pid={pid} gid={gid} set active=false")
+                ok = _set_group_active(pid, gid, False)
+                if DEBUG_VALUES:
+                    print(f"[DEACT] pid={pid} gid={gid} result={'OK' if ok else 'FAIL'} mode=true")
+
         except Exception:
             pass
 
@@ -1319,6 +1353,10 @@ def run_check() -> List[Dict[str, Any]]:
     cur_profiles = status["profiles"]
 
     consumed_cmd_ids: Set[str] = set()
+    # Map: (profile_id, group_index) -> group_id (gid)
+    gid_by_idx: Dict[Tuple[str, int], str] = {}
+
+
 
     for p_idx, profile in enumerate(profiles):
         pid = str(profile.get("id") or "")
@@ -1326,20 +1364,30 @@ def run_check() -> List[Dict[str, Any]]:
             continue
 
         prof_st = cur_profiles.setdefault(pid, {})
-        prof_st["profile_active"] = bool(profile.get("enabled", True))
+        prof_st["profile_active"] = _as_bool(profile.get("enabled", True), True)
+
         prof_st["id"] = pid
         prof_st["name"] = profile.get("name") or ""
         gmap = prof_st.setdefault("groups", {})
 
-        if not profile.get("enabled", True):
+        if not _as_bool(profile.get("enabled", True), True):
             if DEBUG_VALUES:
                 log.debug(f"[ACTIVE] skip profile pid={pid} (enabled=0)")
+                print(f"[DBG] skip profile pid={pid} reason=profile_disabled")
             continue
+
 
         for g_idx, group in enumerate(profile.get("condition_groups") or []):
             gid = str(group.get("gid") or f"g{g_idx}") or f"g{g_idx}"
+            # Merke Mapping für spätere Auto-Deaktivierung (Gate-Events verlieren group_id)
+            try:
+                gid_by_idx[(pid, int(g_idx))] = gid
+            except Exception:
+                pass
+
             grp_st = gmap.setdefault(gid, {})
-            grp_st["group_active"] = bool(group.get("active", True))
+            grp_st["group_active"] = _as_bool(group.get("active", True), True)
+
             grp_st["last_eval_ts"] = now_iso
 
             blockers: List[str] = []
@@ -1374,7 +1422,11 @@ def run_check() -> List[Dict[str, Any]]:
                 consumed_cmd_ids.add(cmd_id)
 
             # Inaktive Gruppe?
-            if not group.get("active", True): blockers.append("group_inactive")
+            if not _as_bool(group.get("active", True), True):
+                blockers.append("group_inactive")
+                if DEBUG_VALUES:
+                    print(f"[DBG] group_inactive pid={pid} gid={gid} active={group.get('active')!r}")
+
             if forced_off: blockers.append("forced_off")
             if snooze_until_dt and now_dt < snooze_until_dt: blockers.append("snooze")
             if auto_disabled: blockers.append("auto_disabled")
@@ -1389,6 +1441,7 @@ def run_check() -> List[Dict[str, Any]]:
                 rt_prev = grp_st.get("runtime") or {}
                 grp_st.update({
                     "name": (group.get("name") or f"group_{g_idx}"),
+                    "group_active": _as_bool(group.get("active", True), True),
                     "effective_active": False,
                     "blockers": blockers,
                     "auto_disabled": auto_disabled,
@@ -1412,16 +1465,28 @@ def run_check() -> List[Dict[str, Any]]:
                     },
                 })
 
+
                 continue
 
             effective_active = (
-                bool(profile.get("enabled", True))
-                and bool(group.get("active", True))
+                _as_bool(profile.get("enabled", True), True)
+                and _as_bool(group.get("active", True), True)
                 and (not forced_off)
                 and (not (snooze_until_dt and now_dt < snooze_until_dt))
                 and (not auto_disabled)
                 and (not (cooldown_until_dt and now_dt < cooldown_until_dt))
             )
+            if DEBUG_VALUES:
+                print(
+                    f"[DBG] effective_active pid={pid} gid={gid} "
+                    f"enabled={_as_bool(profile.get('enabled', True), True)} "
+                    f"active={_as_bool(group.get('active', True), True)} "
+                    f"forced_off={forced_off} "
+                    f"snooze={bool(snooze_until_dt and now_dt < snooze_until_dt)} "
+                    f"auto_dis={auto_disabled} "
+                    f"cooldown={bool(cooldown_until_dt and now_dt < cooldown_until_dt)}"
+                )
+
 
             notify_mode = _normalize_notify_mode(group)
             min_ticks = _min_true_ticks_of(group)
@@ -1478,7 +1543,8 @@ def run_check() -> List[Dict[str, Any]]:
             else:
                 if DEBUG_VALUES:
                     log.debug(f"[ACTIVE] skip evaluation pid={pid} gid={gid} due blockers={blockers}")
-                    print(f"[DBG] skip pid={pid} gid={gid} blockers={blockers}")
+                    print(f"[DBG] skip pid={pid} gid={gid} active={_as_bool(group.get('active', True), True)} blockers={blockers}")
+
                 grp_st["conditions"] = _label_only_conditions(group)
 
             if hard_error:
@@ -1643,6 +1709,30 @@ def run_check() -> List[Dict[str, Any]]:
 
     # Gating + Trigger bauen
     triggered = gate_and_build_triggers(evals)
+
+    # 🔧 Backfill group_id in getriggerten Events, falls Gate es entfernt hat
+    for ev in (triggered or []):
+        try:
+            pid = str(ev.get("profile_id") or "")
+            gid = str(ev.get("group_id") or "")
+            gi  = ev.get("group_index", None)
+            if (not gid) and (pid) and (gi is not None):
+                try:
+                    gi_int = int(gi)
+                    gid_fix = gid_by_idx.get((pid, gi_int))
+                except Exception:
+                    gid_fix = None
+                if gid_fix:
+                    ev["group_id"] = gid_fix
+                    if DEBUG_VALUES:
+                        print(f"[DEACT][BACKFILL] pid={pid} group_index={gi} -> group_id={gid_fix}")
+                else:
+                    if DEBUG_VALUES:
+                        print(f"[DEACT][BACKFILL][MISS] pid={pid} group_index={gi} (kein Mapping)")
+        except Exception as _e:
+            if DEBUG_VALUES:
+                print(f"[DEACT][BACKFILL][ERR] {_e!r}")
+
 
     # --- Streaks (true_ticks) aus Gate/Ereignissen in den Status zurückschreiben
     # Wir sammeln Streaks pro (profile_id, group_id)
