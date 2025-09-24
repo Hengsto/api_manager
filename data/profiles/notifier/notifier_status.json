@@ -1,0 +1,136 @@
+{
+  "version": 513,
+  "flavor": "notifier-api",
+  "profiles": {
+    "2c9ccb88-5360-452b-85d2-84d221cb0a09": {
+      "id": "2c9ccb88-5360-452b-85d2-84d221cb0a09",
+      "name": "1",
+      "profile_active": true,
+      "groups": {
+        "a0b080": {
+          "name": "Elena3",
+          "group_active": false,
+          "effective_active": false,
+          "blockers": [
+            "group_inactive"
+          ],
+          "auto_disabled": false,
+          "cooldown_until": null,
+          "fresh": true,
+          "aggregate": {
+            "logic": "AND",
+            "passed": false,
+            "notify_mode": "true",
+            "min_true_ticks": 5
+          },
+          "runtime": {
+            "met": 0,
+            "total": 1,
+            "true_ticks": 0,
+            "details": [],
+            "values": {
+              "BTCUSDC": {
+                "b8c7cd": {
+                  "left": {
+                    "value_origin": 116030.7890625,
+                    "ts_origin": "2025-09-20 13:45:00.000000",
+                    "value_latest": 116030.7890625,
+                    "ts_latest": "2025-09-20 13:45:00.000000",
+                    "col": "bb_upper",
+                    "output": "bb_upper"
+                  },
+                  "right": {
+                    "value_origin": 116030.7890625,
+                    "ts_origin": "2025-09-20 13:45:00.000000",
+                    "value_latest": 116030.7890625,
+                    "ts_latest": "2025-09-20 13:45:00.000000",
+                    "col": "bb_upper",
+                    "output": "bb_upper"
+                  }
+                }
+              }
+            },
+            "created_ts": "2025-09-20 13:48:15.138502Z",
+            "updated_ts": "2025-09-24 00:02:45.572861Z",
+            "last_alarm_tick_id": null,
+            "last_alarm_ts": "2025-09-20 13:52:15.747158Z"
+          },
+          "conditions": [
+            {
+              "left": "bbands",
+              "right": "bbands",
+              "left_spec": null,
+              "right_spec": null,
+              "left_output": null,
+              "right_output": null,
+              "left_col": null,
+              "right_col": null,
+              "op": "gte",
+              "passed": false,
+              "left_value": null,
+              "right_value": null,
+              "left_ts": null,
+              "right_ts": null,
+              "eval_ms": null,
+              "error": null
+            }
+          ],
+          "conditions_status": [],
+          "last_eval_ts": "2025-09-24 00:02:45.572861Z",
+          "last_bar_ts": null,
+          "min_tick": 1,
+          "storage_layout": "unified-config-runtime"
+        },
+        "1ee258": {
+          "name": "Fotze1",
+          "group_active": false,
+          "effective_active": false,
+          "blockers": [
+            "group_inactive",
+            "misconfigured"
+          ],
+          "auto_disabled": false,
+          "cooldown_until": null,
+          "fresh": true,
+          "aggregate": {
+            "logic": "AND",
+            "passed": false,
+            "deactivate_on": "always",
+            "min_true_ticks": 1
+          },
+          "runtime": {
+            "met": 0,
+            "total": 1,
+            "true_ticks": 0,
+            "details": []
+          },
+          "conditions": [
+            {
+              "left": "—",
+              "right": "bbands",
+              "left_spec": null,
+              "right_spec": null,
+              "left_output": null,
+              "right_output": null,
+              "left_col": null,
+              "right_col": null,
+              "op": "gt",
+              "passed": false,
+              "left_value": null,
+              "right_value": null,
+              "left_ts": null,
+              "right_ts": null,
+              "eval_ms": null,
+              "error": null
+            }
+          ],
+          "conditions_status": [],
+          "last_eval_ts": "2025-09-24 00:02:45.572861Z",
+          "last_bar_ts": null
+        }
+      }
+    }
+  },
+  "profiles_fp": "cfbab1657813782032adae81b6e7d3e9bfccffdb24ece99051b769a631868a86",
+  "updated_ts": "2025-09-24 00:02:45.573854Z"
+}
