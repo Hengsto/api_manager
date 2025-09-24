@@ -29,10 +29,19 @@ try:
 except Exception:
     print("[DEBUG] kein alarms_api gefunden (optional).")
 
+# ── Registry (optional mounten) ───────────────────────────────────────────────
+registry_app = None
+try:
+    # Erwartet: registry_api.py im PYTHONPATH mit "app = FastAPI(...)"
+    from api.registry_api import app as registry_app  # type: ignore
+    print("[DEBUG] registry_api gefunden → /registry wird gemountet.")
+except Exception as e:
+    print(f"[DEBUG] kein registry_api gefunden (optional). {e}")
+
 # ── Notifier-Worker (Dateiwächter & Evaluator) ───────────────────────────────
 from notifier.watch_profiles import run as watch_profiles_run
 from notifier.evaluator import run_check as evaluator_run_check
-from alarm_checker import run_alarm_checker
+from notifier.alarm_checker import run_alarm_checker
 
 def _start_profile_watcher_if_enabled() -> None:
     enabled = str(getattr(cfg, "ENABLE_PROFILE_WATCH", os.getenv("ENABLE_PROFILE_WATCH", "0"))).lower() in ("1", "true", "yes", "on")
@@ -101,15 +110,25 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Notifier API", version="1.0.0", lifespan=lifespan)
 
+# Registry-Subapp mounten (wenn vorhanden)
+if registry_app:
+    app.mount("/registry", registry_app)
+
 if notifier_router:
-    app.include_router(notifier_router) 
+    app.include_router(notifier_router)
 
 if alarms_router:
     app.include_router(alarms_router, prefix="/alarms")
 
 @app.get("/health")
-def health(): return {"status":"ok"}
-
+def health():
+    return {
+        "status": "ok",
+        "notifier_router": notifier_router is not None,
+        "alarms_router": alarms_router is not None,
+        "registry_mounted": registry_app is not None,
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+    }
 
 def _port_from_config(default: int = 8000) -> int:
     try:

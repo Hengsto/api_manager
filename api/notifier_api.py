@@ -866,7 +866,11 @@ def _build_status_skeleton_from_profiles(profiles: list[dict]) -> dict:
                 "fresh": True,
                 "aggregate": {
                     "min_true_ticks": g.get("min_true_ticks"),
-                    "notify_mode": (_normalize_deactivate_value(g.get("deactivate_on")) or ("true" if g.get("auto_deactivate") else "always"))
+                    # ⬇️ neu: deactivate_on (vormals notify_mode)
+                    "deactivate_on": (
+                        _normalize_deactivate_value(g.get("deactivate_on"))
+                        or ("true" if g.get("auto_deactivate") else "always")
+                    ),
                 },
                 "runtime": {
                     "true_ticks": None,
@@ -891,6 +895,7 @@ def _build_status_skeleton_from_profiles(profiles: list[dict]) -> dict:
         "updated_ts": _now_iso(),
         "profiles": profiles_map,
     }
+
 
 def _label_only_conditions(group: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -952,29 +957,16 @@ def _profiles_fingerprint(profiles: list[dict]) -> str:
         return ""
 
 def _merge_status_keep_runtime(old: Dict[str, Any], skel: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Prune-semantics:
-    - Nur PIDs/GIDs, die im Skeleton existieren, werden in 'new_out' übernommen.
-    - Runtime-Felder (runtime, conditions_status, last_* ) werden, falls vorhanden, gemerged/erhalten.
-    - Alte, nicht mehr existierende Gruppen/Profile werden bewusst FALLENGELASSEN.
-    """
-    # Defensive Typ-Guards
-    old_profiles: Dict[str, Any] = {}
-    if isinstance(old, dict) and isinstance(old.get("profiles"), dict):
-        old_profiles = old["profiles"]  # type: ignore[assignment]
+    # defensive
+    old_profiles = old.get("profiles") if isinstance(old.get("profiles"), dict) else {}
+    skel_profiles = skel.get("profiles") if isinstance(skel.get("profiles"), dict) else {}
 
-    skel_profiles: Dict[str, Any] = {}
-    if isinstance(skel, dict) and isinstance(skel.get("profiles"), dict):
-        skel_profiles = skel["profiles"]  # type: ignore[assignment]
-
-    # Basis
     new_out: Dict[str, Any] = {
         "version": int(old.get("version", 1)) if isinstance(old.get("version"), int) else 1,
         "flavor": "notifier-api",
         "profiles": {}
     }
 
-    # Build new structure strictly from skeleton, while merging runtime from old
     for pid, p_s in (skel_profiles or {}).items():
         old_p = old_profiles.get(pid) or {}
         new_p = {
@@ -984,43 +976,66 @@ def _merge_status_keep_runtime(old: Dict[str, Any], skel: Dict[str, Any]) -> Dic
             "groups": {}
         }
 
-        old_groups = old_p.get("groups") or {}
-        if not isinstance(old_groups, dict):
-            old_groups = {}
+        old_groups = old_p.get("groups") if isinstance(old_p.get("groups"), dict) else {}
+        skel_groups = p_s.get("groups") if isinstance(p_s.get("groups"), dict) else {}
 
-        skel_groups = (p_s.get("groups") or {})
-        if not isinstance(skel_groups, dict):
-            skel_groups = {}
+        for gid, g_s in (skel_groups or {}).items():
+            old_g   = old_groups.get(gid) or {}
+            agg_old = old_g.get("aggregate") if isinstance(old_g.get("aggregate"), dict) else {}
+            rt_old  = old_g.get("runtime")   if isinstance(old_g.get("runtime"), dict)   else {}
 
-        for gid, g_s in skel_groups.items():
-            old_g = old_groups.get(gid) or {}
-            agg_old = old_g.get("aggregate", {}) if isinstance(old_g.get("aggregate"), dict) else {}
-            rt_old  = old_g.get("runtime",   {}) if isinstance(old_g.get("runtime"),   dict) else {}
+            agg_s   = g_s.get("aggregate")   if isinstance(g_s.get("aggregate"), dict)   else {}
 
-            agg_s = g_s.get("aggregate", {}) if isinstance(g_s.get("aggregate"), dict) else {}
+            # Legacy-Fallback: notify_mode (alt) -> deactivate_on (neu)
+            old_deactivate_on = (
+                agg_old.get("deactivate_on")
+                if "deactivate_on" in (agg_old or {})
+                else (agg_old.get("notify_mode") if isinstance(agg_old, dict) else None)
+            )
+            new_deactivate_on = (
+                agg_s.get("deactivate_on")
+                if "deactivate_on" in (agg_s or {})
+                else old_deactivate_on
+            ) or "always"
 
             new_g = {
                 "name": g_s.get("name") or old_g.get("name") or gid,
                 "group_active": bool(g_s.get("group_active", old_g.get("group_active", True))),
                 "effective_active": bool(g_s.get("effective_active", old_g.get("effective_active", True))),
-                "blockers": old_g.get("blockers", []) if isinstance(old_g.get("blockers", []), list) else [],
+                "blockers": old_g.get("blockers", []) if isinstance(old_g.get("blockers"), list) else [],
                 "auto_disabled": bool(old_g.get("auto_disabled", False)),
                 "cooldown_until": old_g.get("cooldown_until", None),
                 "fresh": bool(old_g.get("fresh", True)),
+
                 "aggregate": {
                     "min_true_ticks": agg_s.get("min_true_ticks", agg_old.get("min_true_ticks")),
-                    "notify_mode":    agg_s.get("notify_mode",    agg_old.get("notify_mode", "always")),
+                    # ⬇️ nur noch deactivate_on persistieren
+                    "deactivate_on": new_deactivate_on,
                 },
-                # Runtime wird erhalten
+
+                # Runtime unverändert beibehalten
                 "runtime": rt_old,
-                "conditions": old_g.get("conditions", []) if isinstance(old_g.get("conditions", []), list) else [],
-                "conditions_status": old_g.get("conditions_status", []) if isinstance(old_g.get("conditions_status", []), list) else [],
+
+                # ⬇️ WICHTIG: Bedingungen aus dem Skeleton (aktuelle Profil-Definition)
+                "conditions": g_s.get("conditions", []),
+
+                "conditions_status": old_g.get("conditions_status", []) if isinstance(old_g.get("conditions_status"), list) else [],
                 "last_eval_ts": old_g.get("last_eval_ts", None),
                 "last_bar_ts": old_g.get("last_bar_ts", None),
             }
+
+            # (Optional/Empfohlen) zusätzliche Felder aus Skeleton übernehmen:
+            if "min_tick" in g_s:
+                new_g["min_tick"] = g_s.get("min_tick")
+            if "single_mode" in g_s:
+                new_g["single_mode"] = g_s.get("single_mode")
+
             new_p["groups"][gid] = new_g
 
         new_out["profiles"][pid] = new_p
+
+    return new_out
+
 
     # ---- Diagnostics: was wurde gepruned? ----
     old_pids = set(old_profiles.keys())
