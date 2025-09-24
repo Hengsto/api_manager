@@ -45,6 +45,7 @@ MAIN_IP = os.getenv("MAIN_IP", "127.0.0.1")
 
 # Eigener Notifier (UI spricht hierauf)
 NOTIFIER_PORT = int(os.getenv("NOTIFIER_PORT", "8099"))
+REGISTRY_PORT = int(os.getenv("REGISTRY_PORT", "8098"))
 # WICHTIG: /notifier am Ende, damit Evaluator-PATCH /profiles/{pid}/groups/{gid}/active landet
 NOTIFIER_ENDPOINT = f"http://{MAIN_IP}:{NOTIFIER_PORT}/notifier"
 

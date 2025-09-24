@@ -1,59 +1,65 @@
-# ingest/base.py
+# registry_manager/sources/base.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
+import abc
 import logging
-from pathlib import Path
-from typing import Dict, Any
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
-import requests
+log = logging.getLogger("registry_manager.sources.base")
 
-log = logging.getLogger("ingest.base")
+# ── Basis-Klassen ────────────────────────────────────────────────────────────
 
-# ── Env Keys ────────────────────────────────────────────────────────────────
-API_KEY_EODHD = os.getenv("API_KEY_EODHD", "").strip()  # ← dein Key
-if not API_KEY_EODHD:
-    log.warning("⚠️  Kein API_KEY_EODHD gesetzt! EODHD-Importer wird scheitern.")
+@dataclass
+class Listing:
+    """Eine konkrete Notierung eines Assets auf einer Börse."""
+    source: str                   # z. B. "EODHD"
+    symbol: str                   # z. B. "MSFT"
+    exchange: str                 # z. B. "XNAS"
+    mic: Optional[str] = None     # Market Identifier Code (optional, hilfreich)
+    isin: Optional[str] = None    # ISIN, wenn vorhanden
+    note: Optional[str] = None    # Freitext-Notiz, z. B. "Common Stock USD"
 
-# Registry Endpoint (ENV oder Config-Fallback)
-REGISTRY_ENDPOINT = os.getenv("REGISTRY_ENDPOINT", "http://127.0.0.1:8099/registry").rstrip("/")
+@dataclass
+class AssetDraft:
+    """Ein Asset-Entwurf, der in die Registry geschrieben werden kann."""
+    id: str                       # Kanonische, stabile ID, z. B. "asset:msft"
+    type: str                     # z. B. "equity", "index", "commodity"
+    name: str                     # Voller Name, z. B. "Microsoft Corp."
+    primary_category: str         # Ober-Kategorie, z. B. "Stocks"
+    status: str                   # "active", "unsorted", ...
+    country: Optional[str] = None
+    sector: Optional[str] = None
+    listings: List[Listing] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)
+    identifiers: List[Dict[str, Any]] = field(default_factory=list)  # ISIN, CUSIP, WKN ...
 
-# ── Registry Client ─────────────────────────────────────────────────────────
-_session = requests.Session()
-_session.headers.update({"Content-Type": "application/json"})
+class SourceAdapter(abc.ABC):
+    """Abstrakte Basisklasse für jede Quelle (z. B. EODHD, Binance, etc.)."""
 
-def registry_health() -> bool:
-    """Check ob Registry erreichbar ist."""
-    try:
-        r = _session.get(f"{REGISTRY_ENDPOINT}/health", timeout=5)
-        return r.ok
-    except Exception as e:
-        log.error(f"[REG][HEALTH] Fehler: {e}")
-        return False
+    @abc.abstractmethod
+    def name(self) -> str:
+        """Kurzname der Quelle, z. B. 'eodhd'."""
+        raise NotImplementedError
 
-def registry_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """POST an Registry-API mit Fehler-Log."""
-    url = f"{REGISTRY_ENDPOINT}{path}"
-    try:
-        r = _session.post(url, json=payload, timeout=10)
-        if not r.ok:
-            log.error(f"[REG][POST] {url} → {r.status_code} {r.text}")
-            r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log.error(f"[REG][POST] Exception {url}: {e}")
-        raise
+    @abc.abstractmethod
+    def exchanges(self) -> List[Dict[str, Any]]:
+        """Liefert Liste aller Exchanges dieser Quelle."""
+        raise NotImplementedError
 
-def registry_get(path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    """GET an Registry-API mit Fehler-Log."""
-    url = f"{REGISTRY_ENDPOINT}{path}"
-    try:
-        r = _session.get(url, params=params, timeout=10)
-        if not r.ok:
-            log.error(f"[REG][GET] {url} → {r.status_code} {r.text}")
-            r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log.error(f"[REG][GET] Exception {url}: {e}")
-        raise
+    @abc.abstractmethod
+    def symbols(self, exchange_code: str) -> List[Dict[str, Any]]:
+        """Liefert alle Symbole für eine Exchange."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def normalize(
+        self, exchange_code: str, raw: Dict[str, Any], mic_map: Dict[str, str]
+    ) -> tuple[AssetDraft, str]:
+        """
+        Wandelt Rohdaten (z. B. von der API) in einen AssetDraft um.
+        Gibt außerdem einen 'match_key' zurück (z. B. ISIN oder Symbol),
+        mit dem erkannt wird, ob ein Asset bereits existiert.
+        """
+        raise NotImplementedError
