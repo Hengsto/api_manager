@@ -5,9 +5,12 @@ Registry/GroupManager API (SQLite, SQLAlchemy, FastAPI)
 - Kanonische Assets (1 Eintrag je wirtschaftliches Objekt)
 - Listings (mehrere Börsen/Quellen/Ticker pro Asset)
 - Tags (n:m)
+- Sectors (n:m)  ⬅ NEU
 - Custom Gruppen (Members referenzieren asset_id, optional source/mic/exchange)
+- Profiles (JSON) für Group-Manager/Notifier  ⬅ NEU
 - Resolver: asset_id + source/(exchange|mic) -> Symbol
-- Suche: einfache Filter + Volltext-ähnliche LIKE-Suche
+- Suche: einfache Filter + LIKE-Suche (Assets/Listings/Identifiers/Tags)
+- Meta: /meta/types|categories|tags|sectors (distinct, filterbar)
 
 Start:
     uvicorn registry_api:app --reload --port 8098
@@ -15,28 +18,29 @@ Start:
 ENV:
     REGISTRY_DB_URL=sqlite:///./registry.db   (default)
     LOG_LEVEL=DEBUG|INFO                       (default: INFO)
+    REGISTRY_API_TOKEN=...                     (optional; schützt schreibende Calls)
 """
 
 from __future__ import annotations
 
 import os
-import sys
 import logging
-from typing import Any, Dict, List, Optional, Tuple
-
-from fastapi import FastAPI, Depends, HTTPException, Query, Body, Path as FPath
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Optional
+from enum import Enum
 from datetime import datetime
+from uuid import uuid4
+
+from fastapi import FastAPI, Depends, HTTPException, Query, Body, Path as FPath, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, validator
 
 from sqlalchemy import (
-    create_engine, Column, String, Integer, Text, DateTime, ForeignKey, UniqueConstraint,
-    Index, event
+    create_engine, Column, String, Integer, Text, DateTime, ForeignKey,
+    UniqueConstraint, Index, event, or_, distinct
 )
-from sqlalchemy.orm import (
-    sessionmaker, declarative_base, relationship, Session
-)
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.types import JSON
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -49,66 +53,103 @@ logging.basicConfig(
 log = logging.getLogger("registry")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DB Setup (SQLite WAL) – Pfad aus config.REGISTRY_DB → data/Symbol_Manager/registry.sqlite
+# DB Setup (SQLite WAL) – Pfad aus config.REGISTRY_DB (oder ENV)
 # ──────────────────────────────────────────────────────────────────────────────
 from pathlib import Path
 import config as cfg
 
-# Stelle sicher, dass der Ordner existiert
 Path(cfg.REGISTRY_DB).parent.mkdir(parents=True, exist_ok=True)
 
-# ENV override bleibt möglich; sonst nimm den Pfad aus config
 DB_URL = os.getenv("REGISTRY_DB_URL", f"sqlite:///{cfg.REGISTRY_DB}")
 IS_SQLITE = DB_URL.startswith("sqlite")
 
-# check_same_thread=False: FastAPI worker threads teilen dieselbe ConnectionFactory
-engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if IS_SQLITE else {})
+engine = create_engine(
+    DB_URL,
+    connect_args={"check_same_thread": False} if IS_SQLITE else {},
+    json_serializer=None, json_deserializer=None,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 def _now() -> datetime:
     return datetime.utcnow()
 
-
 @event.listens_for(engine, "connect")
 def _set_sqlite_pragma(dbapi_connection, connection_record):
     if not IS_SQLITE:
         return
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL;")
-    cursor.execute("PRAGMA synchronous=NORMAL;")
-    cursor.execute("PRAGMA foreign_keys=ON;")
-    cursor.close()
+    cur = dbapi_connection.cursor()
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute("PRAGMA synchronous=NORMAL;")
+    cur.execute("PRAGMA foreign_keys=ON;")
+    cur.close()
     log.debug("[DB] SQLite pragmas set (WAL, synchronous=NORMAL, foreign_keys=ON)")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Auth (optional via REGISTRY_API_TOKEN)
+# ──────────────────────────────────────────────────────────────────────────────
+API_TOKEN = os.getenv("REGISTRY_API_TOKEN", "").strip()
+AUTH_ENABLED = bool(API_TOKEN)
+
+def require_auth(authorization: Optional[str] = Header(None)):
+    if not AUTH_ENABLED:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    if token != API_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid token")
+
+if AUTH_ENABLED:
+    log.info("[AUTH] REGISTRY_API_TOKEN present → write operations require Bearer token")
+else:
+    log.warning("[AUTH] No REGISTRY_API_TOKEN set → ALL endpoints are open (DEV mode)")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ORM Modelle
 # ──────────────────────────────────────────────────────────────────────────────
+
+class AssetType(str, Enum):
+    equity = "equity"
+    crypto = "crypto"
+    commodity = "commodity"
+    index = "index"
+    forex = "forex"
+    etf = "etf"
+    bond = "bond"
+    other = "other"
+    unknown = "unknown"
+
+class AssetStatus(str, Enum):
+    active = "active"
+    unsorted = "unsorted"
+    inactive = "inactive"
+
 class Asset(Base):
     __tablename__ = "assets"
     id = Column(String, primary_key=True)  # "asset:msft" slug oder uuid
-    type = Column(String, nullable=False)  # equity|crypto|commodity|index|forex|etf|bond|other|unknown
+    type = Column(String, nullable=False)
     name = Column(String, nullable=True)
     country = Column(String, nullable=True)
-    sector = Column(String, nullable=True)
-    primary_category = Column(String, nullable=False)  # genau eine
-    status = Column(String, nullable=False, default="active")  # active|unsorted|inactive
+    sector = Column(String, nullable=True)  # legacy single sector (bleibt)
+    primary_category = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="active")
     created_ts = Column(DateTime, default=_now, nullable=False)
     updated_ts = Column(DateTime, default=_now, onupdate=_now, nullable=False)
 
     listings = relationship("Listing", back_populates="asset", cascade="all, delete-orphan")
     tags = relationship("AssetTag", back_populates="asset", cascade="all, delete-orphan")
     identifiers = relationship("Identifier", back_populates="asset", cascade="all, delete-orphan")
-
+    sectors = relationship("AssetSector", back_populates="asset", cascade="all, delete-orphan")  # NEU
 
 class Listing(Base):
     __tablename__ = "listings"
     id = Column(Integer, primary_key=True, autoincrement=True)
     asset_id = Column(String, ForeignKey("assets.id", ondelete="CASCADE"), nullable=False)
-    source = Column(String, nullable=False)       # EODHD|BINANCE|YF|...
-    exchange = Column(String, nullable=True)      # "NASDAQ"
-    mic = Column(String, nullable=True)           # "XNAS"
-    symbol = Column(String, nullable=False)       # "MSFT" / "BTCUSDT"
+    source = Column(String, nullable=False)
+    exchange = Column(String, nullable=True)
+    mic = Column(String, nullable=True)
+    symbol = Column(String, nullable=False)
     isin = Column(String, nullable=True)
     cusip = Column(String, nullable=True)
     figi = Column(String, nullable=True)
@@ -117,7 +158,6 @@ class Listing(Base):
     asset = relationship("Asset", back_populates="listings")
 
     __table_args__ = (
-        # Quelle + Symbol i. d. R. eindeutig; Exchange/MIC verbessern Eindeutigkeit
         UniqueConstraint("source", "symbol", "mic", name="uq_listings_source_symbol_mic"),
         Index("idx_listings_symbol", "symbol"),
         Index("idx_listings_source", "source"),
@@ -125,58 +165,75 @@ class Listing(Base):
         Index("idx_listings_exchange", "exchange"),
     )
 
-
 class Tag(Base):
     __tablename__ = "tags"
     tag = Column(String, primary_key=True)
-
 
 class AssetTag(Base):
     __tablename__ = "asset_tags"
     asset_id = Column(String, ForeignKey("assets.id", ondelete="CASCADE"), primary_key=True)
     tag = Column(String, ForeignKey("tags.tag", ondelete="CASCADE"), primary_key=True)
-
     asset = relationship("Asset", back_populates="tags")
-    # relation zu Tag nicht nötig für API, spart Join-Overhead
 
+# ── Sectors (n:m) ────────────────────────────────────────────────────────────
+class Sector(Base):
+    __tablename__ = "sectors"
+    sector = Column(String, primary_key=True)  # z.B. "Tech", "Energy", "Defense"
+
+class AssetSector(Base):
+    __tablename__ = "asset_sectors"
+    asset_id = Column(String, ForeignKey("assets.id", ondelete="CASCADE"), primary_key=True)
+    sector = Column(String, ForeignKey("sectors.sector", ondelete="CASCADE"), primary_key=True)
+    asset = relationship("Asset", back_populates="sectors")
 
 class Identifier(Base):
     __tablename__ = "identifiers"
     asset_id = Column(String, ForeignKey("assets.id", ondelete="CASCADE"), primary_key=True)
-    key = Column(String, primary_key=True)    # "isin"|"cusip"|"figi"|...
+    key = Column(String, primary_key=True)
     value = Column(String, nullable=False)
-
     asset = relationship("Asset", back_populates="identifiers")
 
+    __table_args__ = (
+        UniqueConstraint("asset_id", "key", name="uq_identifiers_asset_key"),
+        Index("idx_identifiers_value", "value"),
+    )
 
 class Group(Base):
     __tablename__ = "groups"
-    id = Column(String, primary_key=True)  # "group:my_tech_watchlist" oder UUID
+    id = Column(String, primary_key=True)  # "group:my_watchlist" oder UUID/slg
     name = Column(String, nullable=False)
     default_source = Column(String, nullable=True)
     created_ts = Column(DateTime, default=_now, nullable=False)
     updated_ts = Column(DateTime, default=_now, onupdate=_now, nullable=False)
-
     members = relationship("GroupMember", back_populates="group", cascade="all, delete-orphan")
-
 
 class GroupMember(Base):
     __tablename__ = "group_members"
     group_id = Column(String, ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True)
     asset_id = Column(String, ForeignKey("assets.id", ondelete="CASCADE"), primary_key=True)
-    source = Column(String, nullable=True)    # optional override
+    source = Column(String, nullable=True)
     exchange = Column(String, nullable=True)
     mic = Column(String, nullable=True)
     position = Column(Integer, nullable=True)
-
     group = relationship("Group", back_populates="members")
     asset = relationship("Asset")
 
-# Zusätzliche sinnvolle Indizes
+# ── Profiles (JSON) ──────────────────────────────────────────────────────────
+class Profile(Base):
+    __tablename__ = "profiles"
+    id = Column(String, primary_key=True)               # "profile:<uuid>" oder slug
+    name = Column(String, nullable=False)
+    payload = Column(JSON, nullable=False, default={})  # freies JSON für UI/Notifier
+    created_ts = Column(DateTime, default=_now, nullable=False)
+    updated_ts = Column(DateTime, default=_now, onupdate=_now, nullable=False)
+
+# Zusätzliche Indizes
 Index("idx_assets_primary_category", Asset.primary_category)
 Index("idx_assets_status", Asset.status)
 Index("idx_assets_type", Asset.type)
 Index("idx_asset_name", Asset.name)
+Index("idx_sector_sector", Sector.sector)
+Index("idx_asset_sector_sector", AssetSector.sector)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pydantic Schemas
@@ -194,6 +251,20 @@ class ListingIn(BaseModel):
 class ListingOut(ListingIn):
     id: int
 
+class ListingPatch(BaseModel):
+    source: Optional[str] = None
+    symbol: Optional[str] = None
+    exchange: Optional[str] = None
+    mic: Optional[str] = None
+    isin: Optional[str] = None
+    cusip: Optional[str] = None
+    figi: Optional[str] = None
+    note: Optional[str] = None
+
+    @validator("*", pre=True)
+    def _empty_to_none(cls, v):
+        return v if v != "" else None
+
 class IdentifierIn(BaseModel):
     key: str
     value: str
@@ -203,24 +274,26 @@ class IdentifierOut(IdentifierIn):
 
 class AssetIn(BaseModel):
     id: str = Field(..., description='z. B. "asset:msft" (slug) oder UUID')
-    type: str
+    type: AssetType
     name: Optional[str] = None
     country: Optional[str] = None
-    sector: Optional[str] = None
+    sector: Optional[str] = None                    # legacy Einzelwert (optional)
     primary_category: str
-    status: str = "active"
+    status: AssetStatus = AssetStatus.active
     listings: List[ListingIn] = []
     tags: List[str] = []
     identifiers: List[IdentifierIn] = []
+    sectors: List[str] = []                         # NEU n:m Liste
 
 class AssetOut(BaseModel):
     id: str
-    type: str
+    type: AssetType
     name: Optional[str]
     country: Optional[str]
-    sector: Optional[str]
+    sector: Optional[str]              # legacy
+    sectors: List[str]                 # NEU
     primary_category: str
-    status: str
+    status: AssetStatus
     created_ts: datetime
     updated_ts: datetime
     listings: List[ListingOut]
@@ -228,12 +301,12 @@ class AssetOut(BaseModel):
     identifiers: Dict[str, str]
 
 class AssetPatch(BaseModel):
-    type: Optional[str] = None
+    type: Optional[AssetType] = None
     name: Optional[str] = None
     country: Optional[str] = None
     sector: Optional[str] = None
     primary_category: Optional[str] = None
-    status: Optional[str] = None
+    status: Optional[AssetStatus] = None
 
 class GroupIn(BaseModel):
     id: str
@@ -255,10 +328,36 @@ class GroupMemberIn(BaseModel):
     mic: Optional[str] = None
     position: Optional[int] = None
 
+class GroupMemberPatch(BaseModel):
+    source: Optional[str] = None
+    exchange: Optional[str] = None
+    mic: Optional[str] = None
+    position: Optional[int] = None
+
+class ReorderItem(BaseModel):
+    asset_id: str
+    position: Optional[int] = None
+
+class ReorderPayload(BaseModel):
+    items: List[ReorderItem]
+
+# Profiles
+class ProfileIn(BaseModel):
+    id: Optional[str] = Field(None, description='optional; wenn leer → "profile:<uuid>"')
+    name: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+class ProfileOut(BaseModel):
+    id: str
+    name: str
+    payload: Dict[str, Any]
+    created_ts: datetime
+    updated_ts: datetime
+
 # ──────────────────────────────────────────────────────────────────────────────
 # FastAPI App
 # ──────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Registry/GroupManager API", version="1.0.0")
+app = FastAPI(title="Registry/GroupManager API", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -287,12 +386,13 @@ log.info("[BOOT] Tables ensured.")
 def _asset_to_out(a: Asset) -> AssetOut:
     return AssetOut(
         id=a.id,
-        type=a.type,
+        type=AssetType(a.type) if a.type in AssetType._value2member_map_ else AssetType.unknown,
         name=a.name,
         country=a.country,
         sector=a.sector,
+        sectors=[s.sector for s in a.sectors],
         primary_category=a.primary_category,
-        status=a.status,
+        status=AssetStatus(a.status) if a.status in AssetStatus._value2member_map_ else AssetStatus.active,
         created_ts=a.created_ts,
         updated_ts=a.updated_ts,
         listings=[ListingOut(
@@ -307,22 +407,11 @@ def _norm(s: Optional[str]) -> Optional[str]:
     return s.strip().upper() if isinstance(s, str) else s
 
 def resolve_symbol(db: Session, asset_id: str, source: Optional[str], exchange: Optional[str], mic: Optional[str]) -> Dict[str, Any]:
-    """
-    Resolver: findet das passende Listing & Symbol.
-    Strategie:
-      1) Wenn source+mic -> exakter Treffer
-      2) Wenn source+exchange -> exakter Treffer
-      3) Wenn nur source -> erstes Listing dieser Quelle
-      4) Sonst: erstes Listing überhaupt
-    """
     a = db.query(Asset).filter(Asset.id == asset_id).first()
     if not a:
         raise HTTPException(status_code=404, detail=f"Asset not found: {asset_id}")
 
-    src = _norm(source)
-    ex = _norm(exchange)
-    mi = _norm(mic)
-
+    src = _norm(source); ex = _norm(exchange); mi = _norm(mic)
     candidates: List[Listing] = a.listings
 
     if src and mi:
@@ -353,10 +442,13 @@ def resolve_symbol(db: Session, asset_id: str, source: Optional[str], exchange: 
 @app.get("/assets", response_model=List[AssetOut])
 def list_assets(
     q: Optional[str] = Query(None, description="LIKE-Suche über name und id"),
-    type: Optional[str] = Query(None),
+    type: Optional[AssetType] = Query(None),
     primary_category: Optional[str] = Query(None),
-    status: Optional[str] = Query(None),
+    status: Optional[AssetStatus] = Query(None),
     tag: Optional[str] = Query(None, description="Filter auf einen Tag"),
+    sector: Optional[str] = Query(None, description="Filter auf Sektor (n:m oder legacy)"),
+    order_by: str = Query("id", regex="^(id|name|updated_ts|created_ts)$"),
+    order_dir: str = Query("asc", regex="^(asc|desc)$"),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -366,52 +458,81 @@ def list_assets(
         like = f"%{q}%"
         qry = qry.filter((Asset.name.ilike(like)) | (Asset.id.ilike(like)))
     if type:
-        qry = qry.filter(Asset.type == type)
+        qry = qry.filter(Asset.type == type.value)
     if primary_category:
         qry = qry.filter(Asset.primary_category == primary_category)
     if status:
-        qry = qry.filter(Asset.status == status)
+        qry = qry.filter(Asset.status == status.value)
     if tag:
         qry = qry.join(Asset.tags).filter(AssetTag.tag == tag)
-    items = qry.order_by(Asset.id).offset(offset).limit(limit).all()
-    log.debug(f"[ASSETS][LIST] n={len(items)} q={q} type={type} cat={primary_category} tag={tag}")
+    if sector:
+        qry = qry.outerjoin(AssetSector, AssetSector.asset_id == Asset.id)\
+                 .filter(or_(AssetSector.sector == sector, Asset.sector == sector))
+
+    # Order
+    order_col = {"id": Asset.id, "name": Asset.name, "updated_ts": Asset.updated_ts, "created_ts": Asset.created_ts}[order_by]
+    if order_dir == "desc":
+        order_col = order_col.desc()
+
+    items = qry.order_by(order_col).offset(offset).limit(limit).all()
+    log.debug(f"[ASSETS][LIST] n={len(items)} q={q} type={type} cat={primary_category} tag={tag} sector={sector} order={order_by} {order_dir} off={offset} lim={limit}")
     return [_asset_to_out(a) for a in items]
 
-
-@app.post("/assets", response_model=AssetOut, status_code=201)
+@app.post("/assets", response_model=AssetOut, status_code=201, dependencies=[Depends(require_auth)])
 def create_asset(payload: AssetIn, db: Session = Depends(get_db)):
     if db.query(Asset).filter(Asset.id == payload.id).first():
         raise HTTPException(status_code=409, detail="Asset id exists")
     a = Asset(
         id=payload.id,
-        type=payload.type,
+        type=payload.type.value,
         name=payload.name,
         country=payload.country,
-        sector=payload.sector,
+        sector=payload.sector,  # legacy string passt durch
         primary_category=payload.primary_category,
-        status=payload.status or "active",
+        status=payload.status.value if isinstance(payload.status, AssetStatus) else str(payload.status or "active"),
     )
     db.add(a)
+
     # listings
     for l in payload.listings:
         db.add(Listing(
             asset_id=a.id, source=l.source, symbol=l.symbol, exchange=l.exchange,
             mic=l.mic, isin=l.isin, cusip=l.cusip, figi=l.figi, note=l.note
         ))
+
     # tags
     for tg in payload.tags:
         if not db.query(Tag).filter(Tag.tag == tg).first():
             db.add(Tag(tag=tg))
         db.add(AssetTag(asset_id=a.id, tag=tg))
+
     # identifiers
     for ident in payload.identifiers:
         db.add(Identifier(asset_id=a.id, key=ident.key, value=ident.value))
 
+    # sectors n:m
+    seen = set()
+    for sec in (payload.sectors or []):
+        s = sec.strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        if not db.query(Sector).filter(Sector.sector == s).first():
+            db.add(Sector(sector=s))
+        db.add(AssetSector(asset_id=a.id, sector=s))
+
+    # optionaler Backfill aus legacy single sector
+    if payload.sector and payload.sector.strip():
+        s = payload.sector.strip()
+        if s not in seen:
+            if not db.query(Sector).filter(Sector.sector == s).first():
+                db.add(Sector(sector=s))
+            db.add(AssetSector(asset_id=a.id, sector=s))
+
     db.flush()
-    log.info(f"[ASSETS][CREATE] id={a.id} listings={len(a.listings)} tags={len(a.tags)}")
+    log.info(f"[ASSETS][CREATE] id={a.id} listings={len(a.listings)} tags={len(a.tags)} sectors={len(a.sectors)}")
     db.refresh(a)
     return _asset_to_out(a)
-
 
 @app.get("/assets/{asset_id}", response_model=AssetOut)
 def get_asset(asset_id: str = FPath(...), db: Session = Depends(get_db)):
@@ -420,8 +541,7 @@ def get_asset(asset_id: str = FPath(...), db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Not found")
     return _asset_to_out(a)
 
-
-@app.patch("/assets/{asset_id}", response_model=AssetOut)
+@app.patch("/assets/{asset_id}", response_model=AssetOut, dependencies=[Depends(require_auth)])
 def patch_asset(asset_id: str, payload: AssetPatch, db: Session = Depends(get_db)):
     a = db.query(Asset).filter(Asset.id == asset_id).first()
     if not a:
@@ -430,15 +550,14 @@ def patch_asset(asset_id: str, payload: AssetPatch, db: Session = Depends(get_db
     for field in ("type", "name", "country", "sector", "primary_category", "status"):
         val = getattr(payload, field)
         if val is not None:
-            setattr(a, field, val)
+            setattr(a, field, val.value if isinstance(val, (AssetType, AssetStatus)) else val)
             updated.append(field)
     log.info(f"[ASSETS][PATCH] id={asset_id} fields={updated}")
     db.flush()
     db.refresh(a)
     return _asset_to_out(a)
 
-
-@app.delete("/assets/{asset_id}", status_code=204)
+@app.delete("/assets/{asset_id}", status_code=204, dependencies=[Depends(require_auth)])
 def delete_asset(asset_id: str, db: Session = Depends(get_db)):
     a = db.query(Asset).filter(Asset.id == asset_id).first()
     if not a:
@@ -448,7 +567,7 @@ def delete_asset(asset_id: str, db: Session = Depends(get_db)):
     return
 
 # ─ Listings CRUD ─
-@app.post("/assets/{asset_id}/listings", response_model=ListingOut, status_code=201)
+@app.post("/assets/{asset_id}/listings", response_model=ListingOut, status_code=201, dependencies=[Depends(require_auth)])
 def add_listing(asset_id: str, payload: ListingIn, db: Session = Depends(get_db)):
     a = db.query(Asset).filter(Asset.id == asset_id).first()
     if not a:
@@ -463,12 +582,40 @@ def add_listing(asset_id: str, payload: ListingIn, db: Session = Depends(get_db)
         db.flush()
     except IntegrityError as e:
         db.rollback()
+        log.warning(f"[LISTINGS][ADD][DUP] asset={asset_id} {payload.source}:{payload.symbol} {payload.mic or payload.exchange or ''}")
         raise HTTPException(status_code=409, detail="Listing duplicate (source/symbol/mic)") from e
     db.refresh(l)
     log.info(f"[LISTINGS][ADD] asset={asset_id} -> {payload.source}:{payload.symbol} {payload.mic or payload.exchange or ''}")
     return ListingOut(**{**payload.dict(), "id": l.id})
 
-@app.delete("/listings/{listing_id}", status_code=204)
+@app.patch("/listings/{listing_id}", response_model=ListingOut, dependencies=[Depends(require_auth)])
+def patch_listing(listing_id: int, payload: ListingPatch, db: Session = Depends(get_db)):
+    l = db.query(Listing).filter(Listing.id == listing_id).first()
+    if not l:
+        raise HTTPException(status_code=404, detail="Not found")
+    before = (l.source, l.symbol, l.mic)
+    if payload.source is not None: l.source = payload.source
+    if payload.symbol is not None: l.symbol = payload.symbol
+    if payload.exchange is not None: l.exchange = payload.exchange
+    if payload.mic is not None: l.mic = payload.mic
+    if payload.isin is not None: l.isin = payload.isin
+    if payload.cusip is not None: l.cusip = payload.cusip
+    if payload.figi is not None: l.figi = payload.figi
+    if payload.note is not None: l.note = payload.note
+    try:
+        db.flush()
+    except IntegrityError as e:
+        db.rollback()
+        log.warning(f"[LISTINGS][PATCH][DUP] id={listing_id} tried {l.source}:{l.symbol}:{l.mic}")
+        raise HTTPException(status_code=409, detail="Listing duplicate (source/symbol/mic)") from e
+    db.refresh(l)
+    log.info(f"[LISTINGS][PATCH] id={listing_id} {before} -> {(l.source,l.symbol,l.mic)}")
+    return ListingOut(
+        id=l.id, source=l.source, symbol=l.symbol, exchange=l.exchange, mic=l.mic,
+        isin=l.isin, cusip=l.cusip, figi=l.figi, note=l.note
+    )
+
+@app.delete("/listings/{listing_id}", status_code=204, dependencies=[Depends(require_auth)])
 def delete_listing(listing_id: int, db: Session = Depends(get_db)):
     l = db.query(Listing).filter(Listing.id == listing_id).first()
     if not l:
@@ -482,7 +629,7 @@ def delete_listing(listing_id: int, db: Session = Depends(get_db)):
 def list_tags(db: Session = Depends(get_db)):
     return [t.tag for t in db.query(Tag).order_by(Tag.tag).all()]
 
-@app.post("/assets/{asset_id}/tags/{tag}", status_code=204)
+@app.post("/assets/{asset_id}/tags/{tag}", status_code=204, dependencies=[Depends(require_auth)])
 def add_tag(asset_id: str, tag: str, db: Session = Depends(get_db)):
     if not db.query(Asset).filter(Asset.id == asset_id).first():
         raise HTTPException(status_code=404, detail="Asset not found")
@@ -493,7 +640,7 @@ def add_tag(asset_id: str, tag: str, db: Session = Depends(get_db)):
         log.info(f"[TAGS][ADD] asset={asset_id} tag={tag}")
     return
 
-@app.delete("/assets/{asset_id}/tags/{tag}", status_code=204)
+@app.delete("/assets/{asset_id}/tags/{tag}", status_code=204, dependencies=[Depends(require_auth)])
 def remove_tag(asset_id: str, tag: str, db: Session = Depends(get_db)):
     at = db.query(AssetTag).filter(AssetTag.asset_id == asset_id, AssetTag.tag == tag).first()
     if not at:
@@ -502,8 +649,33 @@ def remove_tag(asset_id: str, tag: str, db: Session = Depends(get_db)):
     log.info(f"[TAGS][DEL] asset={asset_id} tag={tag}")
     return
 
+# ─ Sectors CRUD ─
+@app.get("/sectors", response_model=List[str])
+def list_sectors(db: Session = Depends(get_db)):
+    return [s.sector for s in db.query(Sector).order_by(Sector.sector).all()]
+
+@app.post("/assets/{asset_id}/sectors/{sector}", status_code=204, dependencies=[Depends(require_auth)])
+def add_sector(asset_id: str, sector: str, db: Session = Depends(get_db)):
+    if not db.query(Asset).filter(Asset.id == asset_id).first():
+        raise HTTPException(status_code=404, detail="Asset not found")
+    if not db.query(Sector).filter(Sector.sector == sector).first():
+        db.add(Sector(sector=sector))
+    if not db.query(AssetSector).filter(AssetSector.asset_id == asset_id, AssetSector.sector == sector).first():
+        db.add(AssetSector(asset_id=asset_id, sector=sector))
+        log.info(f"[SECTORS][ADD] asset={asset_id} sector={sector}")
+    return
+
+@app.delete("/assets/{asset_id}/sectors/{sector}", status_code=204, dependencies=[Depends(require_auth)])
+def remove_sector(asset_id: str, sector: str, db: Session = Depends(get_db)):
+    asx = db.query(AssetSector).filter(AssetSector.asset_id == asset_id, AssetSector.sector == sector).first()
+    if not asx:
+        raise HTTPException(status_code=404, detail="Not found")
+    db.delete(asx)
+    log.info(f"[SECTORS][DEL] asset={asset_id} sector={sector}")
+    return
+
 # ─ Identifiers CRUD ─
-@app.post("/assets/{asset_id}/identifiers", status_code=204)
+@app.post("/assets/{asset_id}/identifiers", status_code=204, dependencies=[Depends(require_auth)])
 def upsert_identifier(asset_id: str, payload: IdentifierIn, db: Session = Depends(get_db)):
     if not db.query(Asset).filter(Asset.id == asset_id).first():
         raise HTTPException(status_code=404, detail="Asset not found")
@@ -516,7 +688,7 @@ def upsert_identifier(asset_id: str, payload: IdentifierIn, db: Session = Depend
         log.info(f"[IDENT][ADD] asset={asset_id} {payload.key}={payload.value}")
     return
 
-@app.delete("/assets/{asset_id}/identifiers/{key}", status_code=204)
+@app.delete("/assets/{asset_id}/identifiers/{key}", status_code=204, dependencies=[Depends(require_auth)])
 def delete_identifier(asset_id: str, key: str, db: Session = Depends(get_db)):
     idt = db.query(Identifier).filter(Identifier.asset_id == asset_id, Identifier.key == key).first()
     if not idt:
@@ -529,8 +701,16 @@ def delete_identifier(asset_id: str, key: str, db: Session = Depends(get_db)):
 # Endpunkte: Groups
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/groups", response_model=List[GroupOut])
-def list_groups(db: Session = Depends(get_db)):
-    gs = db.query(Group).order_by(Group.id).all()
+def list_groups(
+    limit: int = Query(1000, ge=1, le=10000),  # höheres Limit erlaubt
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db)
+):
+    # zusätzliche Sicherheitsklemme, falls du später dynamisch limit änderst
+    if limit > 10000:
+        limit = 10000
+
+    gs = db.query(Group).order_by(Group.id).offset(offset).limit(limit).all()
     out: List[GroupOut] = []
     for g in gs:
         out.append(GroupOut(
@@ -541,20 +721,19 @@ def list_groups(db: Session = Depends(get_db)):
                 "mic": m.mic, "position": m.position
             } for m in sorted(g.members, key=lambda x: (x.position or 0, x.asset_id))]
         ))
+    log.debug(f"[GROUPS][LIST] n={len(out)} off={offset} lim={limit}")
     return out
 
-@app.post("/groups", response_model=GroupOut, status_code=201)
+@app.post("/groups", response_model=GroupOut, status_code=201, dependencies=[Depends(require_auth)])
 def create_group(payload: GroupIn, db: Session = Depends(get_db)):
     if db.query(Group).filter(Group.id == payload.id).first():
         raise HTTPException(status_code=409, detail="Group id exists")
     g = Group(id=payload.id, name=payload.name, default_source=payload.default_source)
-    db.add(g)
-    db.flush()
-    db.refresh(g)
+    db.add(g); db.flush(); db.refresh(g)
     log.info(f"[GROUP][CREATE] id={g.id}")
-    return list_groups(db=db)[-1] if list_groups(db=db) else GroupOut(
-        id=g.id, name=g.name, default_source=g.default_source, created_ts=g.created_ts,
-        updated_ts=g.updated_ts, members=[]
+    return GroupOut(
+        id=g.id, name=g.name, default_source=g.default_source,
+        created_ts=g.created_ts, updated_ts=g.updated_ts, members=[]
     )
 
 @app.get("/groups/{group_id}", response_model=GroupOut)
@@ -562,9 +741,16 @@ def get_group(group_id: str, db: Session = Depends(get_db)):
     g = db.query(Group).filter(Group.id == group_id).first()
     if not g:
         raise HTTPException(status_code=404, detail="Not found")
-    return list_groups(db=db)[[x.id for x in db.query(Group).order_by(Group.id).all()].index(group_id)]
+    return GroupOut(
+        id=g.id, name=g.name, default_source=g.default_source,
+        created_ts=g.created_ts, updated_ts=g.updated_ts,
+        members=[{
+            "asset_id": m.asset_id, "source": m.source, "exchange": m.exchange,
+            "mic": m.mic, "position": m.position
+        } for m in sorted(g.members, key=lambda x: (x.position or 0, x.asset_id))]
+    )
 
-@app.post("/groups/{group_id}/members", status_code=204)
+@app.post("/groups/{group_id}/members", status_code=204, dependencies=[Depends(require_auth)])
 def add_group_member(group_id: str, member: GroupMemberIn, db: Session = Depends(get_db)):
     g = db.query(Group).filter(Group.id == group_id).first()
     if not g:
@@ -577,10 +763,36 @@ def add_group_member(group_id: str, member: GroupMemberIn, db: Session = Depends
         group_id=group_id, asset_id=member.asset_id, source=member.source,
         exchange=member.exchange, mic=member.mic, position=member.position
     ))
-    log.info(f"[GROUP][ADD] group={group_id} asset={member.asset_id}")
+    log.info(f"[GROUP][ADD] group={group_id} asset={member.asset_id} pos={member.position} src={member.source} ex={member.exchange} mic={member.mic}")
     return
 
-@app.delete("/groups/{group_id}/members/{asset_id}", status_code=204)
+@app.patch("/groups/{group_id}/members/{asset_id}", status_code=204, dependencies=[Depends(require_auth)])
+def patch_group_member(group_id: str, asset_id: str, payload: GroupMemberPatch, db: Session = Depends(get_db)):
+    m = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.asset_id == asset_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Not found")
+    before = (m.position, m.source, m.exchange, m.mic)
+    if payload.position is not None: m.position = payload.position
+    if payload.source is not None:   m.source = payload.source
+    if payload.exchange is not None: m.exchange = payload.exchange
+    if payload.mic is not None:      m.mic = payload.mic
+    db.flush()
+    log.info(f"[GROUP][MEMBER][PATCH] group={group_id} asset={asset_id} {before} -> {(m.position,m.source,m.exchange,m.mic)}")
+    return
+
+@app.post("/groups/{group_id}/members/reorder", status_code=204, dependencies=[Depends(require_auth)])
+def reorder_group_members(group_id: str, payload: ReorderPayload, db: Session = Depends(get_db)):
+    updated = 0
+    for item in payload.items:
+        m = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.asset_id == item.asset_id).first()
+        if m:
+            m.position = item.position
+            updated += 1
+    db.flush()
+    log.info(f"[GROUP][REORDER] group={group_id} items={len(payload.items)} updated={updated}")
+    return
+
+@app.delete("/groups/{group_id}/members/{asset_id}", status_code=204, dependencies=[Depends(require_auth)])
 def remove_group_member(group_id: str, asset_id: str, db: Session = Depends(get_db)):
     m = db.query(GroupMember).filter(GroupMember.group_id == group_id, GroupMember.asset_id == asset_id).first()
     if not m:
@@ -589,23 +801,88 @@ def remove_group_member(group_id: str, asset_id: str, db: Session = Depends(get_
     log.info(f"[GROUP][DEL] group={group_id} asset={asset_id}")
     return
 
-@app.patch("/groups/{group_id}", status_code=204)
+@app.patch("/groups/{group_id}", status_code=204, dependencies=[Depends(require_auth)])
 def patch_group(group_id: str, payload: GroupIn, db: Session = Depends(get_db)):
     g = db.query(Group).filter(Group.id == group_id).first()
     if not g:
         raise HTTPException(status_code=404, detail="Not found")
     g.name = payload.name or g.name
     g.default_source = payload.default_source if payload.default_source is not None else g.default_source
-    log.info(f"[GROUP][PATCH] id={group_id}")
+    log.info(f"[GROUP][PATCH] id={group_id} name={g.name} default_source={g.default_source}")
     return
 
-@app.delete("/groups/{group_id}", status_code=204)
+@app.delete("/groups/{group_id}", status_code=204, dependencies=[Depends(require_auth)])
 def delete_group(group_id: str, db: Session = Depends(get_db)):
     g = db.query(Group).filter(Group.id == group_id).first()
     if not g:
         raise HTTPException(status_code=404, detail="Not found")
     db.delete(g)
     log.info(f"[GROUP][DELETE] id={group_id}")
+    return
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Profiles (JSON) – Speichern/Laden/Löschen für Group-Manager/Notifier
+# ──────────────────────────────────────────────────────────────────────────────
+@app.get("/profiles", response_model=List[ProfileOut])
+def list_profiles(
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    q: Optional[str] = Query(None, description="LIKE auf name/id"),
+    db: Session = Depends(get_db),
+):
+    qry = db.query(Profile)
+    if q:
+        like = f"%{q}%"
+        qry = qry.filter(or_(Profile.name.ilike(like), Profile.id.ilike(like)))
+    rows = qry.order_by(Profile.name).offset(offset).limit(limit).all()
+    out: List[ProfileOut] = [
+        ProfileOut(id=p.id, name=p.name, payload=p.payload or {}, created_ts=p.created_ts, updated_ts=p.updated_ts)
+        for p in rows
+    ]
+    log.debug(f"[PROFILES][LIST] n={len(out)} off={offset} lim={limit} q={q}")
+    return out
+
+@app.post("/profiles", response_model=ProfileOut, status_code=201, dependencies=[Depends(require_auth)])
+def create_profile(payload: ProfileIn, db: Session = Depends(get_db)):
+    pid = payload.id.strip() if (payload.id and payload.id.strip()) else f"profile:{uuid4().hex}"
+    if db.query(Profile).filter(Profile.id == pid).first():
+        raise HTTPException(status_code=409, detail="Profile id exists")
+    p = Profile(id=pid, name=payload.name, payload=payload.payload or {})
+    db.add(p); db.flush(); db.refresh(p)
+    log.info(f"[PROFILES][CREATE] id={p.id} name={p.name}")
+    return ProfileOut(id=p.id, name=p.name, payload=p.payload or {}, created_ts=p.created_ts, updated_ts=p.updated_ts)
+
+@app.get("/profiles/{profile_id}", response_model=ProfileOut)
+def get_profile(profile_id: str, db: Session = Depends(get_db)):
+    p = db.query(Profile).filter(Profile.id == profile_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Not found")
+    return ProfileOut(id=p.id, name=p.name, payload=p.payload or {}, created_ts=p.created_ts, updated_ts=p.updated_ts)
+
+class ProfilePatch(BaseModel):
+    name: Optional[str] = None
+    payload: Optional[Dict[str, Any]] = None
+
+@app.patch("/profiles/{profile_id}", response_model=ProfileOut, dependencies=[Depends(require_auth)])
+def patch_profile(profile_id: str, payload: ProfilePatch, db: Session = Depends(get_db)):
+    p = db.query(Profile).filter(Profile.id == profile_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Not found")
+    if payload.name is not None:
+        p.name = payload.name
+    if payload.payload is not None:
+        p.payload = payload.payload
+    db.flush(); db.refresh(p)
+    log.info(f"[PROFILES][PATCH] id={p.id} name={p.name}")
+    return ProfileOut(id=p.id, name=p.name, payload=p.payload or {}, created_ts=p.created_ts, updated_ts=p.updated_ts)
+
+@app.delete("/profiles/{profile_id}", status_code=204, dependencies=[Depends(require_auth)])
+def delete_profile(profile_id: str, db: Session = Depends(get_db)):
+    p = db.query(Profile).filter(Profile.id == profile_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Not found")
+    db.delete(p)
+    log.info(f"[PROFILES][DELETE] id={profile_id}")
     return
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -625,22 +902,29 @@ def resolve_endpoint(
 
 @app.get("/search")
 def search(
-    q: str = Query(..., description="LIKE-Suche über asset.name, listing.symbol, identifiers"),
+    q: str = Query(..., description="LIKE: asset.name/id/country/sector, listing.symbol, identifiers, tags"),
     limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
     like = f"%{q}%"
-    # Einfacher Ansatz: erst Asset-Namen, dann Listings, dann Identifiers
-    assets = db.query(Asset).filter(Asset.name.ilike(like)).limit(limit).all()
-    listings = db.query(Listing).filter(Listing.symbol.ilike(like)).limit(limit).all()
-    idents = db.query(Identifier).filter(Identifier.value.ilike(like)).limit(limit).all()
+    assets = db.query(Asset).filter(
+        or_(Asset.name.ilike(like), Asset.id.ilike(like), Asset.country.ilike(like), Asset.sector.ilike(like))
+    ).offset(offset).limit(limit).all()
+
+    listings = db.query(Listing).filter(Listing.symbol.ilike(like)).offset(offset).limit(limit).all()
+    idents = db.query(Identifier).filter(Identifier.value.ilike(like)).offset(offset).limit(limit).all()
+    tags = db.query(Tag).filter(Tag.tag.ilike(like)).offset(offset).limit(limit).all()
 
     out: Dict[str, Any] = {
         "assets": [a.id for a in assets],
         "listings": [{"asset_id": l.asset_id, "source": l.source, "symbol": l.symbol, "mic": l.mic, "exchange": l.exchange} for l in listings],
         "identifiers": [{"asset_id": i.asset_id, "key": i.key, "value": i.value} for i in idents],
+        "tags": [t.tag for t in tags],
+        "offset": offset,
+        "limit": limit,
     }
-    log.debug(f"[SEARCH] q={q} -> a={len(assets)} l={len(listings)} i={len(idents)}")
+    log.debug(f"[SEARCH] q={q} -> a={len(assets)} l={len(listings)} i={len(idents)} t={len(tags)} off={offset} lim={limit}")
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -654,5 +938,67 @@ def health():
         "db_path": cfg.REGISTRY_DB if IS_SQLITE else None,
         "engine": "sqlite-wal" if IS_SQLITE else "sqlalchemy",
         "time": datetime.utcnow().isoformat() + "Z",
-        "version": "1.0.0"
+        "version": "1.2.0",
+        "auth": "enabled" if AUTH_ENABLED else "disabled",
     }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Meta: Distinct Types, Categories, Tags, Sectors (filterbar)
+# ──────────────────────────────────────────────────────────────────────────────
+@app.get("/meta/types", response_model=List[str])
+def meta_types(db: Session = Depends(get_db)):
+    rows = db.query(distinct(Asset.type)).order_by(Asset.type).all()
+    types = [r[0] for r in rows if r[0]]
+    log.debug(f"[META][TYPES] n={len(types)} -> {types}")
+    return types
+
+@app.get("/meta/categories", response_model=List[str])
+def meta_categories(
+    type: Optional[AssetType] = Query(None, description="optional: filter by asset type"),
+    db: Session = Depends(get_db)
+):
+    qry = db.query(distinct(Asset.primary_category))
+    if type:
+        qry = qry.filter(Asset.type == type.value)
+    rows = qry.order_by(Asset.primary_category).all()
+    cats = [r[0] for r in rows if r[0]]
+    log.debug(f"[META][CATS] type={type} n={len(cats)} -> {cats}")
+    return cats
+
+@app.get("/meta/tags", response_model=List[str])
+def meta_tags(
+    type: Optional[AssetType] = Query(None, description="optional: filter by asset type"),
+    primary_category: Optional[str] = Query(None, description="optional: filter by primary_category"),
+    db: Session = Depends(get_db)
+):
+    qry = db.query(distinct(AssetTag.tag)).join(Asset, Asset.id == AssetTag.asset_id)
+    if type:
+        qry = qry.filter(Asset.type == type.value)
+    if primary_category:
+        qry = qry.filter(Asset.primary_category == primary_category)
+    rows = qry.order_by(AssetTag.tag).all()
+    tags = [r[0] for r in rows if r[0]]
+    log.debug(f"[META][TAGS] type={type} cat={primary_category} n={len(tags)} -> {tags}")
+    return tags
+ 
+@app.get("/meta/sectors", response_model=List[str])
+def meta_sectors(
+    type: Optional[AssetType] = Query(None, description="optional: filter by asset type"),
+    primary_category: Optional[str] = Query(None, description="optional: filter by primary_category"),
+    db: Session = Depends(get_db)
+):
+    # n:m
+    q_nm = db.query(distinct(AssetSector.sector)).join(Asset, Asset.id == AssetSector.asset_id)
+    if type: q_nm = q_nm.filter(Asset.type == type.value)
+    if primary_category: q_nm = q_nm.filter(Asset.primary_category == primary_category)
+    nm = [r[0] for r in q_nm.all() if r[0]]
+
+    # legacy single string
+    q_legacy = db.query(distinct(Asset.sector))
+    if type: q_legacy = q_legacy.filter(Asset.type == type.value)
+    if primary_category: q_legacy = q_legacy.filter(Asset.primary_category == primary_category)
+    legacy = [r[0] for r in q_legacy.all() if r[0]]
+
+    merged = sorted({*nm, *legacy}, key=lambda s: s.lower())
+    log.debug(f"[META][SECTORS] type={type} cat={primary_category} n={len(merged)}")
+    return merged

@@ -12,6 +12,8 @@ DATA_DIR = BASE_DIR / "data"
 PROFILE_DIR = DATA_DIR / "profiles" / "notifier"
 PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
+GROUPMANAGER_PROFILE_DIR = DATA_DIR / "profiles" / "group_manager"
+
 # Unified-JSON: ENV hat Vorrang; sonst ./data/profiles/notifier/notifier.json
 # Tipp (Docker): NOTIFIER_UNIFIED=/data/profiles/notifier/notifier.json
 _ENV_UNIFIED = os.getenv("NOTIFIER_UNIFIED", "").strip()
