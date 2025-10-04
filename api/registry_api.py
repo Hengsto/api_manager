@@ -32,7 +32,8 @@ from enum import Enum
 from datetime import datetime
 from uuid import uuid4
 
-from fastapi import FastAPI, Depends, HTTPException, Query, Body, Path as FPath, Header
+from fastapi import FastAPI, Depends, HTTPException, Query, Body, Path as FPath, Header, Response
+
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 
@@ -245,6 +246,8 @@ Index("idx_assets_type", Asset.type)
 Index("idx_asset_name", Asset.name)
 Index("idx_sector_sector", Sector.sector)
 Index("idx_asset_sector_sector", AssetSector.sector)
+Index("idx_asset_tag_tag", AssetTag.tag)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pydantic Schemas
@@ -363,6 +366,17 @@ class ReorderItem(BaseModel):
 
 class ReorderPayload(BaseModel):
     items: List[ReorderItem]
+
+class AssetTagsPut(BaseModel):
+    tags: List[str] = Field(default_factory=list)
+    version: Optional[str] = None
+
+
+class TagDeleteReport(BaseModel):
+    removed_from_assets: int        # Anzahl Assets, aus denen der Tag entfernt wurde (distinct)
+    deleted_links: int              # Anzahl gelöschter AssetTag-Zeilen
+    deleted_catalog_entry: bool     # Katalogeintrag aus 'tags' gelöscht?
+    bumped_assets: int              # Anzahl Assets, deren Version erhöht wurde
 
 # Bulk
 class BulkAddItem(GroupMemberIn):
@@ -739,6 +753,20 @@ def delete_listing(listing_id: int, db: Session = Depends(get_db)):
 def list_tags(db: Session = Depends(get_db)):
     return [t.tag for t in db.query(Tag).order_by(Tag.tag).all()]
 
+
+@app.post("/tags/{tag}", status_code=204, dependencies=[Depends(require_auth)])
+def create_tag(tag: str, db: Session = Depends(get_db)):
+    t = (tag or "").strip()
+    if not t:
+        raise HTTPException(status_code=400, detail="Empty tag")
+    exists = db.query(Tag).filter(Tag.tag == t).first()
+    if not exists:
+        db.add(Tag(tag=t))
+        log.info(f"[TAGS][CREATE] tag={t}")
+    # idempotent: 204, auch wenn's ihn schon gab
+    return Response(status_code=204)
+
+
 @app.post("/assets/{asset_id}/tags/{tag}", status_code=204, dependencies=[Depends(require_auth)])
 def add_tag(asset_id: str, tag: str, db: Session = Depends(get_db)):
     if not db.query(Asset).filter(Asset.id == asset_id).first():
@@ -770,6 +798,191 @@ def remove_tag(asset_id: str, tag: str, db: Session = Depends(get_db)):
 def list_sectors(db: Session = Depends(get_db)):
     return [s.sector for s in db.query(Sector).order_by(Sector.sector).all()]
 
+
+
+# Katalog: Sektor anlegen (idempotent)
+@app.post("/sectors/{sector}", status_code=204, dependencies=[Depends(require_auth)])
+def create_sector(sector: str, db: Session = Depends(get_db)):
+    s = (sector or "").strip()
+    if not s:
+        raise HTTPException(status_code=400, detail="Empty sector")
+    exists = db.query(Sector).filter(Sector.sector == s).first()
+    if not exists:
+        db.add(Sector(sector=s))
+        log.info(f"[SECTORS][CREATE] sector={s}")
+    # idempotent: 204, auch wenn's ihn schon gab
+    return Response(status_code=204)
+
+
+# Report für globales Löschen
+class SectorDeleteReport(BaseModel):
+    removed_from_assets: int       # Anzahl Assets, aus denen der Sektor in n:m entfernt wurde (distinct)
+    legacy_cleared: int            # Anzahl Assets, bei denen legacy Asset.sector auf NULL gesetzt wurde
+    deleted_links: int             # Anzahl gelöschter AssetSector-Zeilen
+    deleted_catalog_entry: bool    # Katalogeintrag aus 'sectors' gelöscht?
+    bumped_assets: int             # Anzahl Assets, deren Version erhöht wurde
+
+
+# Katalog: Sektor löschen; optional global purgen
+@app.delete("/sectors/{sector}", response_model=SectorDeleteReport, dependencies=[Depends(require_auth)])
+def delete_sector(
+    sector: str,
+    purge: bool = Query(False, alias="purge", description="true = global: aus allen Assets entfernen + Katalogeintrag löschen"),
+    db: Session = Depends(get_db),
+):
+    s = (sector or "").strip()
+    if not s:
+        raise HTTPException(status_code=400, detail="Empty sector")
+
+    # Nutzung zählen
+    in_use_nm = db.query(AssetSector).filter(AssetSector.sector == s).count()
+    in_use_legacy = db.query(Asset).filter(Asset.sector == s).count()
+
+    # Ohne purge verhindern wir versehentliches globales Löschen
+    if not purge and (in_use_nm or in_use_legacy):
+        raise HTTPException(
+            status_code=409,
+            detail={"in_use_nm": in_use_nm, "in_use_legacy": in_use_legacy},
+        )
+
+    # Welche Assets sind betroffen?
+    affected_ids_nm = [r[0] for r in db.query(AssetSector.asset_id).filter(AssetSector.sector == s).distinct().all()]
+    affected_ids_legacy = [r[0] for r in db.query(Asset.id).filter(Asset.sector == s).distinct().all()]
+    affected_ids = set(affected_ids_nm) | set(affected_ids_legacy)
+
+    # n:m entfernen
+    deleted_links = db.query(AssetSector).filter(AssetSector.sector == s).delete(synchronize_session=False)
+
+    # legacy-Feld nullen
+    legacy_cleared = db.query(Asset).filter(Asset.sector == s).update({Asset.sector: None}, synchronize_session=False)
+
+    # Version für alle betroffenen Assets erhöhen
+    bumped_assets = 0
+    if affected_ids:
+        # Achtung: _new_ver() pro Asset erzeugen (sonst überall die gleiche)
+        # -> hier mit Einzel-Update je Asset, ist sicherer und klarer.
+        for aid in affected_ids:
+            a = db.query(Asset).filter(Asset.id == aid).first()
+            if a:
+                a.version = _new_ver()
+                bumped_assets += 1
+
+    # Katalogeintrag löschen (wenn vorhanden)
+    deleted_catalog_entry = False
+    cat = db.query(Sector).filter(Sector.sector == s).first()
+    if cat:
+        db.delete(cat)
+        deleted_catalog_entry = True
+
+    log.info(
+        f"[SECTORS][DELETE] sector={s} purge={purge} "
+        f"in_use_nm={in_use_nm} in_use_legacy={in_use_legacy} "
+        f"deleted_links={deleted_links} legacy_cleared={legacy_cleared} bumped_assets={bumped_assets} "
+        f"catalog_deleted={deleted_catalog_entry}"
+    )
+
+    return SectorDeleteReport(
+        removed_from_assets=len(affected_ids_nm),
+        legacy_cleared=legacy_cleared,
+        deleted_links=deleted_links,
+        deleted_catalog_entry=deleted_catalog_entry,
+        bumped_assets=bumped_assets,
+    )
+
+
+@app.delete("/tags/{tag}", response_model=TagDeleteReport, dependencies=[Depends(require_auth)])
+def delete_tag(
+    tag: str,
+    purge: bool = Query(False, alias="purge", description="true = global: aus allen Assets entfernen + Katalogeintrag löschen"),
+    db: Session = Depends(get_db),
+):
+    t = (tag or "").strip()
+    if not t:
+        raise HTTPException(status_code=400, detail="Empty tag")
+
+    # Nutzung zählen
+    in_use_nm = db.query(AssetTag).filter(AssetTag.tag == t).count()
+    in_use_legacy = 0  # für UI-Kompatibilität: selbe Keys wie Sektor-409
+
+    # Ohne purge verhindern wir versehentliches globales Löschen
+    if not purge and in_use_nm:
+        raise HTTPException(
+            status_code=409,
+            detail={"in_use_nm": in_use_nm, "in_use_legacy": in_use_legacy},
+        )
+
+    # Betroffene Assets (distinct)
+    affected_ids = [r[0] for r in db.query(AssetTag.asset_id).filter(AssetTag.tag == t).distinct().all()]
+
+    # n:m entfernen
+    deleted_links = db.query(AssetTag).filter(AssetTag.tag == t).delete(synchronize_session=False)
+
+    # Version für alle betroffenen Assets erhöhen
+    bumped_assets = 0
+    if affected_ids:
+        for aid in affected_ids:
+            a = db.query(Asset).filter(Asset.id == aid).first()
+            if a:
+                a.version = _new_ver()
+                bumped_assets += 1
+
+    # Katalogeintrag löschen (wenn vorhanden)
+    deleted_catalog_entry = False
+    cat = db.query(Tag).filter(Tag.tag == t).first()
+    if cat:
+        db.delete(cat)
+        deleted_catalog_entry = True
+
+    log.info(
+        f"[TAGS][DELETE] tag={t} purge={purge} in_use_nm={in_use_nm} "
+        f"deleted_links={deleted_links} bumped_assets={bumped_assets} catalog_deleted={deleted_catalog_entry}"
+    )
+
+    return TagDeleteReport(
+        removed_from_assets=len(affected_ids),
+        deleted_links=deleted_links,
+        deleted_catalog_entry=deleted_catalog_entry,
+        bumped_assets=bumped_assets,
+    )
+
+@app.put("/assets/{asset_id}/tags", dependencies=[Depends(require_auth)])
+def put_asset_tags(asset_id: str, payload: AssetTagsPut, db: Session = Depends(get_db)):
+    a = db.query(Asset).filter(Asset.id == asset_id).first()
+    if not a:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    client_ver = payload.version
+    if client_ver and client_ver != a.version:
+        log.warning(f"[TAGS][PUT][409] asset={asset_id} client={client_ver} server={a.version}")
+        raise HTTPException(status_code=409, detail={"server_version": a.version})
+
+    # Normalisieren + deduplizieren
+    new_tags = [s.strip() for s in (payload.tags or []) if isinstance(s, str) and s.strip()]
+    new_set = set(new_tags)
+
+    old_tags = {t.tag for t in a.tags}
+    to_add = list(new_set - old_tags)
+    to_del = list(old_tags - new_set)
+
+    # Upsert Tag-Katalogeinträge
+    for t in to_add:
+        if not db.query(Tag).filter(Tag.tag == t).first():
+            db.add(Tag(tag=t))
+
+    # Apply changes
+    if to_del:
+        db.query(AssetTag).filter(AssetTag.asset_id == asset_id, AssetTag.tag.in_(to_del)).delete(synchronize_session=False)
+    for t in to_add:
+        db.add(AssetTag(asset_id=asset_id, tag=t))
+
+    a.version = _new_ver()
+    db.flush(); db.refresh(a)
+    log.info(f"[TAGS][PUT] asset={asset_id} add={to_add} del={to_del} -> ver={a.version}")
+    return {"version": a.version, "tags": sorted(new_set)}
+
+
+
+
 @app.post("/assets/{asset_id}/sectors/{sector}", status_code=204, dependencies=[Depends(require_auth)])
 def add_sector(asset_id: str, sector: str, db: Session = Depends(get_db)):
     if not db.query(Asset).filter(Asset.id == asset_id).first():
@@ -800,6 +1013,8 @@ def remove_sector(asset_id: str, sector: str, db: Session = Depends(get_db)):
 class AssetSectorsPut(BaseModel):
     sectors: List[str] = Field(default_factory=list)
     version: Optional[str] = None
+
+
 
 @app.put("/assets/{asset_id}/sectors", dependencies=[Depends(require_auth)])
 def put_asset_sectors(asset_id: str, payload: AssetSectorsPut, db: Session = Depends(get_db)):
@@ -835,6 +1050,9 @@ def put_asset_sectors(asset_id: str, payload: AssetSectorsPut, db: Session = Dep
     db.flush(); db.refresh(a)
     log.info(f"[SECTORS][PUT] asset={asset_id} add={to_add} del={to_del} -> ver={a.version}")
     return {"version": a.version, "sectors": sorted(new_set)}
+
+
+
 
 # ─ Identifiers CRUD ─
 @app.post("/assets/{asset_id}/identifiers", status_code=204, dependencies=[Depends(require_auth)])
