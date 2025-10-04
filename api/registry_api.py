@@ -5,14 +5,14 @@ Registry/GroupManager API (SQLite, SQLAlchemy, FastAPI)
 - Kanonische Assets (1 Eintrag je wirtschaftliches Objekt)
 - Listings (mehrere Börsen/Quellen/Ticker pro Asset)
 - Tags (n:m)
-- Sectors (n:m)  ⬅ NEU
-- Custom Gruppen (Members referenzieren asset_id, optional source/mic/exchange, group_tag ⬅ NEU)
-- Profiles (JSON) für Group-Manager/Notifier  ⬅ NEU
+- Sectors (n:m)
+- Custom Gruppen (Members referenzieren asset_id, optional source/mic/exchange, group_tag)
+- Profiles (JSON) für Group-Manager/Notifier
 - Resolver: asset_id + source/(exchange|mic) -> Symbol
 - Suche: einfache Filter + LIKE-Suche (Assets/Listings/Identifiers/Tags)
-- Meta: /meta/types|categories|tags|sectors (distinct, filterbar)
-- Versionierung: Assets/Groups/Profiles haben opaque Version-Strings (ETag-kompatibel) ⬅ NEU
-- Bulk-Write für Gruppen inkl. Versionscheck ⬅ NEU
+- Meta: /meta/types|categories|tags|sectors|sources (distinct, filterbar)
+- Versionierung: Assets/Groups/Profiles haben opaque Version-Strings (ETag-kompatibel)
+- Bulk-Write für Gruppen inkl. Versionscheck
 
 Start:
     uvicorn registry_api:app --reload --port 8098
@@ -141,14 +141,14 @@ class Asset(Base):
     sector = Column(String, nullable=True)  # legacy single sector (bleibt)
     primary_category = Column(String, nullable=False)
     status = Column(String, nullable=False, default="active")
-    version = Column(String, nullable=False, default=_new_ver)  # ⬅ NEU
+    version = Column(String, nullable=False, default=_new_ver)  # NEU
     created_ts = Column(DateTime, default=_now, nullable=False)
     updated_ts = Column(DateTime, default=_now, onupdate=_now, nullable=False)
 
     listings = relationship("Listing", back_populates="asset", cascade="all, delete-orphan")
     tags = relationship("AssetTag", back_populates="asset", cascade="all, delete-orphan")
     identifiers = relationship("Identifier", back_populates="asset", cascade="all, delete-orphan")
-    sectors = relationship("AssetSector", back_populates="asset", cascade="all, delete-orphan")  # NEU
+    sectors = relationship("AssetSector", back_populates="asset", cascade="all, delete-orphan")  # n:m
 
 class Listing(Base):
     __tablename__ = "listings"
@@ -211,7 +211,7 @@ class Group(Base):
     id = Column(String, primary_key=True)  # "group:my_watchlist" oder UUID/slug
     name = Column(String, nullable=False)
     default_source = Column(String, nullable=True)
-    version = Column(String, nullable=False, default=_new_ver)  # ⬅ NEU
+    version = Column(String, nullable=False, default=_new_ver)  # NEU
     created_ts = Column(DateTime, default=_now, nullable=False)
     updated_ts = Column(DateTime, default=_now, onupdate=_now, nullable=False)
     members = relationship("GroupMember", back_populates="group", cascade="all, delete-orphan")
@@ -224,7 +224,7 @@ class GroupMember(Base):
     exchange = Column(String, nullable=True)
     mic = Column(String, nullable=True)
     position = Column(Integer, nullable=True)
-    group_tag = Column(String, nullable=True)  # NULL = untagged ⬅ NEU
+    group_tag = Column(String, nullable=True)  # NULL = untagged
     group = relationship("Group", back_populates="members")
     asset = relationship("Asset")
 
@@ -234,7 +234,7 @@ class Profile(Base):
     id = Column(String, primary_key=True)               # "profile:<uuid>" oder slug
     name = Column(String, nullable=False)
     payload = Column(JSON, nullable=False, default={})  # freies JSON für UI/Notifier
-    version = Column(String, nullable=False, default=_new_ver)  # ⬅ NEU
+    version = Column(String, nullable=False, default=_new_ver)  # NEU
     created_ts = Column(DateTime, default=_now, nullable=False)
     updated_ts = Column(DateTime, default=_now, onupdate=_now, nullable=False)
 
@@ -294,7 +294,7 @@ class AssetIn(BaseModel):
     listings: List[ListingIn] = []
     tags: List[str] = []
     identifiers: List[IdentifierIn] = []
-    sectors: List[str] = []                         # NEU n:m Liste
+    sectors: List[str] = []                         # n:m Liste
 
 class AssetOut(BaseModel):
     id: str
@@ -302,10 +302,10 @@ class AssetOut(BaseModel):
     name: Optional[str]
     country: Optional[str]
     sector: Optional[str]              # legacy
-    sectors: List[str]                 # NEU
+    sectors: List[str]                 # n:m
     primary_category: str
     status: AssetStatus
-    version: str                       # ⬅ NEU
+    version: str
     created_ts: datetime
     updated_ts: datetime
     listings: List[ListingOut]
@@ -329,10 +329,18 @@ class GroupOut(BaseModel):
     id: str
     name: str
     default_source: Optional[str]
-    version: str                      # ⬅ NEU
+    version: str
     created_ts: datetime
     updated_ts: datetime
     members: List[Dict[str, Any]]
+    group_tags: List[GroupTagOut] = [] 
+
+
+class GroupTagOut(BaseModel):
+    id: str
+    name: Optional[str] = None
+    position: int
+
 
 class GroupMemberIn(BaseModel):
     asset_id: str
@@ -340,14 +348,14 @@ class GroupMemberIn(BaseModel):
     exchange: Optional[str] = None
     mic: Optional[str] = None
     position: Optional[int] = None
-    group_tag: Optional[str] = None  # ⬅ NEU
+    group_tag: Optional[str] = None
 
 class GroupMemberPatch(BaseModel):
     source: Optional[str] = None
     exchange: Optional[str] = None
     mic: Optional[str] = None
     position: Optional[int] = None
-    group_tag: Optional[str] = None  # ⬅ NEU
+    group_tag: Optional[str] = None
 
 class ReorderItem(BaseModel):
     asset_id: str
@@ -387,7 +395,7 @@ class ProfileOut(BaseModel):
     id: str
     name: str
     payload: Dict[str, Any]
-    version: str                 # ⬅ NEU
+    version: str
     created_ts: datetime
     updated_ts: datetime
 
@@ -490,8 +498,8 @@ def list_assets(
     status: Optional[AssetStatus] = Query(None),
     tag: Optional[str] = Query(None, description="Filter auf einen Tag"),
     sector: Optional[str] = Query(None, description="Filter auf Sektor (n:m oder legacy)"),
-    sectors: Optional[List[str]] = Query(None, alias="sectors[]", description="Mehrere Sektoren (OR innerhalb Liste)"),  # ⬅ NEU
-    sources: Optional[List[str]] = Query(None, alias="sources[]", description="Mehrere Sources (OR innerhalb Liste)"),    # ⬅ NEU
+    sectors: Optional[List[str]] = Query(None, alias="sectors[]", description="Mehrere Sektoren (OR innerhalb Liste)"),
+    sources: Optional[List[str]] = Query(None, alias="sources[]", description="Mehrere Sources (OR innerhalb Liste)"),
     order_by: str = Query("id", regex="^(id|name|updated_ts|created_ts)$"),
     order_dir: str = Query("asc", regex="^(asc|desc)$"),
     limit: int = Query(100, ge=1, le=1000),
@@ -520,12 +528,10 @@ def list_assets(
                  .filter(or_(AssetSector.sector == sector, Asset.sector == sector))
 
     if sectors:
-        # OR innerhalb Liste, über n:m oder legacy
         qry = qry.outerjoin(AssetSector, AssetSector.asset_id == Asset.id)\
                  .filter(or_(AssetSector.sector.in_(sectors), Asset.sector.in_(sectors)))
 
     if sources:
-        # Join auf Listings; OR innerhalb Liste
         qry = qry.join(Listing).filter(Listing.source.in_(sources))
 
     # Order
@@ -537,6 +543,34 @@ def list_assets(
     log.debug(f"[ASSETS][LIST] n={len(items)} q={q} type={type} cat={primary_category} tag={tag} sector={sector} sectors={sectors} sources={sources} order={order_by} {order_dir} off={offset} lim={limit}")
     return [_asset_to_out(a) for a in items]
 
+
+
+def _compute_group_tags(members: List[Dict[str, Any]]) -> List[GroupTagOut]:
+    """
+    Leitet group_tags (id, position) aus den Member-Zeilen ab.
+    - id = der string in member['group_tag'] (z. B. "sec:f4d58299")
+    - position = Reihenfolge nach erster Sichtung (stable)
+    - name = None (UI/Client kann Name mappen)
+    """
+    seen_index: Dict[str, int] = {}
+    order: List[str] = []
+
+    # stabile Reihenfolge anhand Position & asset_id
+    for m in sorted(members, key=lambda x: (x.get("position") or 0, x.get("asset_id") or "")):
+        tag = m.get("group_tag")
+        if not tag:
+            continue
+        if tag not in seen_index:
+            seen_index[tag] = len(order)
+            order.append(tag)
+
+    out: List[GroupTagOut] = []
+    for tag in order:
+        out.append(GroupTagOut(id=tag, name=None, position=seen_index[tag]))
+    log.debug("[GROUP_TAGS] derived=%s", [(gt.id, gt.position) for gt in out])
+    return out
+
+
 @app.post("/assets", response_model=AssetOut, status_code=201, dependencies=[Depends(require_auth)])
 def create_asset(payload: AssetIn, db: Session = Depends(get_db)):
     if db.query(Asset).filter(Asset.id == payload.id).first():
@@ -546,7 +580,7 @@ def create_asset(payload: AssetIn, db: Session = Depends(get_db)):
         type=payload.type.value,
         name=payload.name,
         country=payload.country,
-        sector=payload.sector,  # legacy string passt durch
+        sector=payload.sector,
         primary_category=payload.primary_category,
         status=payload.status.value if isinstance(payload.status, AssetStatus) else str(payload.status or "active"),
         version=_new_ver(),
@@ -570,7 +604,7 @@ def create_asset(payload: AssetIn, db: Session = Depends(get_db)):
     for ident in payload.identifiers:
         db.add(Identifier(asset_id=a.id, key=ident.key, value=ident.value))
 
-    # sectors n:m
+    # sectors n:m (+Backfill aus legacy single sector)
     seen = set()
     for sec in (payload.sectors or []):
         s = sec.strip()
@@ -580,8 +614,6 @@ def create_asset(payload: AssetIn, db: Session = Depends(get_db)):
         if not db.query(Sector).filter(Sector.sector == s).first():
             db.add(Sector(sector=s))
         db.add(AssetSector(asset_id=a.id, sector=s))
-
-    # optionaler Backfill aus legacy single sector
     if payload.sector and payload.sector.strip():
         s = payload.sector.strip()
         if s not in seen:
@@ -764,7 +796,7 @@ def remove_sector(asset_id: str, sector: str, db: Session = Depends(get_db)):
     log.info(f"[SECTORS][DEL] asset={asset_id} sector={sector} ver={a.version if a else 'n/a'}")
     return
 
-# ⬅ NEU: Full-Set PUT für Sektoren mit Versionsschutz
+# Full-Set PUT für Sektoren mit Versionsschutz
 class AssetSectorsPut(BaseModel):
     sectors: List[str] = Field(default_factory=list)
     version: Optional[str] = None
@@ -851,16 +883,20 @@ def list_groups(
     gs = db.query(Group).order_by(Group.id).offset(offset).limit(limit).all()
     out: List[GroupOut] = []
     for g in gs:
+        members_payload = [{
+            "asset_id": m.asset_id, "source": m.source, "exchange": m.exchange,
+            "mic": m.mic, "position": m.position, "group_tag": m.group_tag
+        } for m in sorted(g.members, key=lambda x: (x.position or 0, x.asset_id))]
+
         out.append(GroupOut(
             id=g.id, name=g.name, default_source=g.default_source, version=g.version,
             created_ts=g.created_ts, updated_ts=g.updated_ts,
-            members=[{
-                "asset_id": m.asset_id, "source": m.source, "exchange": m.exchange,
-                "mic": m.mic, "position": m.position, "group_tag": m.group_tag
-            } for m in sorted(g.members, key=lambda x: (x.position or 0, x.asset_id))]
+            members=members_payload,
+            group_tags=_compute_group_tags(members_payload),
         ))
     log.debug(f"[GROUPS][LIST] n={len(out)} off={offset} lim={limit}")
     return out
+
 
 @app.post("/groups", response_model=GroupOut, status_code=201, dependencies=[Depends(require_auth)])
 def create_group(payload: GroupIn, db: Session = Depends(get_db)):
@@ -874,19 +910,44 @@ def create_group(payload: GroupIn, db: Session = Depends(get_db)):
         created_ts=g.created_ts, updated_ts=g.updated_ts, members=[]
     )
 
+# NEU: Server-generierte Gruppen-ID (alternative zu POST /groups)
+class GroupNewIn(BaseModel):
+    name: str
+    default_source: Optional[str] = None
+
+@app.post("/groups/new", response_model=GroupOut, status_code=201, dependencies=[Depends(require_auth)])
+def create_group_new(payload: GroupNewIn, db: Session = Depends(get_db)):
+    base = (payload.name or "").strip().lower()
+    base = "".join(ch if ch.isalnum() else "-" for ch in base).strip("-") or "group"
+    gid = f"group:{base}-{uuid4().hex[:8]}"
+    while db.query(Group).filter(Group.id == gid).first() is not None:
+        gid = f"group:{base}-{uuid4().hex[:8]}"
+
+    g = Group(id=gid, name=payload.name, default_source=payload.default_source, version=_new_ver())
+    db.add(g); db.flush(); db.refresh(g)
+    log.info(f"[GROUP][CREATE_NEW] id={g.id} ver={g.version}")
+    return GroupOut(
+        id=g.id, name=g.name, default_source=g.default_source, version=g.version,
+        created_ts=g.created_ts, updated_ts=g.updated_ts, members=[]
+    )
+
 @app.get("/groups/{group_id}", response_model=GroupOut)
 def get_group(group_id: str, db: Session = Depends(get_db)):
     g = db.query(Group).filter(Group.id == group_id).first()
     if not g:
         raise HTTPException(status_code=404, detail="Not found")
+    members_payload = [{
+        "asset_id": m.asset_id, "source": m.source, "exchange": m.exchange,
+        "mic": m.mic, "position": m.position, "group_tag": m.group_tag
+    } for m in sorted(g.members, key=lambda x: (x.position or 0, x.asset_id))]
+
     return GroupOut(
         id=g.id, name=g.name, default_source=g.default_source, version=g.version,
         created_ts=g.created_ts, updated_ts=g.updated_ts,
-        members=[{
-            "asset_id": m.asset_id, "source": m.source, "exchange": m.exchange,
-            "mic": m.mic, "position": m.position, "group_tag": m.group_tag
-        } for m in sorted(g.members, key=lambda x: (x.position or 0, x.asset_id))]
+        members=members_payload,
+        group_tags=_compute_group_tags(members_payload),
     )
+
 
 @app.post("/groups/{group_id}/members", status_code=204, dependencies=[Depends(require_auth)])
 def add_group_member(group_id: str, member: GroupMemberIn, db: Session = Depends(get_db)):
@@ -963,14 +1024,18 @@ def patch_group(group_id: str, payload: GroupIn, db: Session = Depends(get_db)):
     g.version = _new_ver()
     db.flush(); db.refresh(g)
     log.info(f"[GROUP][PATCH] id={group_id} name={g.name} default_source={g.default_source} ver={g.version}")
+    members_payload = [{
+        "asset_id": m.asset_id, "source": m.source, "exchange": m.exchange,
+        "mic": m.mic, "position": m.position, "group_tag": m.group_tag
+    } for m in sorted(g.members, key=lambda x: (x.position or 0, x.asset_id))]
+
     return GroupOut(
         id=g.id, name=g.name, default_source=g.default_source, version=g.version,
         created_ts=g.created_ts, updated_ts=g.updated_ts,
-        members=[{
-            "asset_id": m.asset_id, "source": m.source, "exchange": m.exchange,
-            "mic": m.mic, "position": m.position, "group_tag": m.group_tag
-        } for m in sorted(g.members, key=lambda x: (x.position or 0, x.asset_id))]
+        members=members_payload,
+        group_tags=_compute_group_tags(members_payload),
     )
+
 
 @app.delete("/groups/{group_id}", status_code=204, dependencies=[Depends(require_auth)])
 def delete_group(group_id: str, db: Session = Depends(get_db)):
@@ -981,7 +1046,7 @@ def delete_group(group_id: str, db: Session = Depends(get_db)):
     log.info(f"[GROUP][DELETE] id={group_id}")
     return
 
-# ⬅ NEU: Atomarer Bulk-Write mit Versionsprüfung
+# Atomarer Bulk-Write mit Versionsprüfung
 @app.post("/groups/{group_id}/bulk", response_model=GroupBulkResponse, dependencies=[Depends(require_auth)])
 def bulk_group_update(group_id: str, payload: GroupBulkRequest, db: Session = Depends(get_db)):
     g = db.query(Group).filter(Group.id == group_id).first()
@@ -1042,24 +1107,56 @@ def bulk_group_update(group_id: str, payload: GroupBulkRequest, db: Session = De
 # ──────────────────────────────────────────────────────────────────────────────
 # Profiles (JSON) – Speichern/Laden/Löschen für Group-Manager/Notifier
 # ──────────────────────────────────────────────────────────────────────────────
+from sqlalchemy import text, literal, select
+from sqlalchemy.sql import exists
+
 @app.get("/profiles", response_model=List[ProfileOut])
 def list_profiles(
     limit: int = Query(200, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     q: Optional[str] = Query(None, description="LIKE auf name/id"),
+    group: Optional[str] = Query(None, description="Filter: payload.groups enthält diese gid"),
     db: Session = Depends(get_db),
 ):
     qry = db.query(Profile)
+
     if q:
         like = f"%{q}%"
         qry = qry.filter(or_(Profile.name.ilike(like), Profile.id.ilike(like)))
+
+    if group:
+        g = group.strip()
+        if IS_SQLITE:
+            # JSON1: EXISTS(SELECT 1 FROM json_each(profiles.payload,'$.groups') WHERE value = :gid)
+            sub = select(literal(1)).select_from(
+                text("json_each(profiles.payload, '$.groups')")
+            ).where(text("json_each.value = :gid")).params(gid=g)
+            qry = qry.filter(exists(sub))
+        else:
+            # MySQL/MariaDB: JSON_CONTAINS(payload, JSON_QUOTE(:gid), '$.groups')
+            # Fallback: LIKE
+            try:
+                qry = qry.filter(func.json_contains(Profile.payload, func.json_quote(g), '$.groups') == 1)  # MySQL
+            except Exception:
+                like_g = f'%"{g}"%'
+                qry = qry.filter(Profile.payload.cast(String).like(like_g))
+
     rows = qry.order_by(Profile.name).offset(offset).limit(limit).all()
     out: List[ProfileOut] = [
         ProfileOut(id=p.id, name=p.name, payload=p.payload or {}, version=p.version, created_ts=p.created_ts, updated_ts=p.updated_ts)
         for p in rows
     ]
-    log.debug(f"[PROFILES][LIST] n={len(out)} off={offset} lim={limit} q={q}")
+    log.debug(f"[PROFILES][LIST] n={len(out)} off={offset} lim={limit} q={q} group={group}")
     return out
+
+@app.get("/profiles/by-group/{group_id}", response_model=List[ProfileOut])
+def list_profiles_by_group(
+    group_id: str,
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    return list_profiles(limit=limit, offset=offset, q=None, group=group_id, db=db)
 
 @app.post("/profiles", response_model=ProfileOut, status_code=201, dependencies=[Depends(require_auth)])
 def create_profile(payload: ProfileIn, db: Session = Depends(get_db)):
@@ -1165,7 +1262,7 @@ def health():
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Meta: Distinct Types, Categories, Tags, Sectors (filterbar)
+# Meta: Distinct Types, Categories, Tags, Sectors, Sources (filterbar)
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/meta/types", response_model=List[str])
 def meta_types(db: Session = Depends(get_db)):
@@ -1224,7 +1321,6 @@ def meta_sectors(
     merged = sorted({*nm, *legacy}, key=lambda s: s.lower())
     log.debug(f"[META][SECTORS] type={type} cat={primary_category} n={len(merged)}")
     return merged
-
 
 @app.get("/meta/sources", response_model=List[str])
 def meta_sources(
