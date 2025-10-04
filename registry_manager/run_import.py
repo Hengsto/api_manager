@@ -42,13 +42,9 @@ print(f"[DBG] .env source: {dotenv_loaded_from or 'NOT FOUND'}")
 print(f"[DBG] REGISTRY_ENDPOINT={os.getenv('REGISTRY_ENDPOINT', 'N/A')}")
 _api_key = os.getenv("API_KEY_EODHD", "")
 print(f"[DBG] API_KEY_EODHD set={bool(_api_key)} len={(len(_api_key) if _api_key else 0)}")
-if not _api_key:
-    print("FATAL: API_KEY_EODHD nicht gesetzt. Lege ihn in .env (im Projekt-Root) "
-          "oder exportiere ihn in der Shell (z. B. $env:API_KEY_EODHD='...').")
-    sys.exit(2)
 
 # ── Imports NACH dem dotenv/Config-Load ─────────────────────────────────────
-from .pipeline import run_import  # noqa: E402
+from .pipeline import ADAPTERS, run_import  # noqa: E402
 import registry_manager.sources.base as _base  # noqa: E402
 
 # Debug: sicherstellen, dass das richtige base.py geladen wird
@@ -56,7 +52,13 @@ print(f"[DBG] base.py loaded from: {inspect.getfile(_base)}")
 
 def main():
     ap = argparse.ArgumentParser(description="Unified import runner (central pipeline + per-source adapters)")
-    ap.add_argument("--source", required=True, choices=["eodhd"], help="Quelle/Adapter (zunächst: eodhd)")
+    source_choices = sorted(ADAPTERS.keys())
+    ap.add_argument(
+        "--source",
+        required=True,
+        choices=source_choices,
+        help=f"Quelle/Adapter ({', '.join(source_choices)})",
+    )
     ap.add_argument("--exchanges", nargs="+", required=True, help="Exchange Codes (z. B. XNAS XNYS XETR)")
     ap.add_argument("--limit", type=int, default=None, help="Max Symbole pro Exchange")
     ap.add_argument("--sleep", type=float, default=0.0, help="Pause zwischen Items")
@@ -69,6 +71,10 @@ def main():
     # Debug-Zusammenfassung
     log.debug(f"args.source={args.source} exchanges={args.exchanges} limit={args.limit} sleep={args.sleep} dry_run={args.dry_run}")
     log.info (f"Using REGISTRY_ENDPOINT={args.registry_endpoint or os.getenv('REGISTRY_ENDPOINT','N/A')}")
+
+    if args.source.lower() == "eodhd" and not os.getenv("API_KEY_EODHD"):
+        log.error("API_KEY_EODHD nicht gesetzt. Bitte .env konfigurieren oder ENV setzen.")
+        sys.exit(2)
 
     totals = run_import(
         source=args.source,
