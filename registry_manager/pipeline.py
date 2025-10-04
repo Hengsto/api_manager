@@ -7,12 +7,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from .registry_client import RegistryClient
 from .sources.base import SourceAdapter, AssetDraft, Listing
 from .sources.eodhd import EODHDAdapter
+from .sources.binance import BinanceAdapter
 
 log = logging.getLogger("ingest.pipeline")
 
 ADAPTERS: Dict[str, SourceAdapter] = {
     "eodhd": EODHDAdapter(),
-    # "binance": BinanceAdapter(),  # später hinzufügen
+    "binance": BinanceAdapter(),
     # "bybit": BybitAdapter(),
 }
 
