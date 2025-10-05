@@ -4,13 +4,15 @@ from __future__ import annotations
 import os, sys, logging, argparse, inspect
 from pathlib import Path
 
+# Debug: Pfad prüfen (damit du sicher bist, dass diese Datei läuft)
+print(f"[DBG] run_import.py executing from: {Path(__file__).resolve()}")
+print(f"[DBG] sys.argv={sys.argv}")
+
 # ── .env robust laden ────────────────────────────────────────────────────────
 dotenv_loaded_from = None
 try:
     from dotenv import load_dotenv, find_dotenv
-    # 1) Suche .env vom aktuellen Arbeitsverzeichnis nach oben
     dotenv_path = find_dotenv(filename=".env", usecwd=True)
-    # 2) Fallback: eine Ebene über diesem File (…/api_manager/.env)
     if not dotenv_path:
         fallback = Path(__file__).resolve().parents[1] / ".env"
         if fallback.exists():
@@ -21,7 +23,7 @@ try:
 except Exception as e:
     print(f"[DBG] .env load skipped/failed: {e}")
 
-# 3) Letzter Fallback: dein zentrales config.py lädt selbst load_dotenv()
+# 3) Fallback: config.py lädt selbst load_dotenv()
 if not os.getenv("API_KEY_EODHD"):
     try:
         import config as _cfg  # noqa: F401
@@ -42,33 +44,65 @@ print(f"[DBG] .env source: {dotenv_loaded_from or 'NOT FOUND'}")
 print(f"[DBG] REGISTRY_ENDPOINT={os.getenv('REGISTRY_ENDPOINT', 'N/A')}")
 _api_key = os.getenv("API_KEY_EODHD", "")
 print(f"[DBG] API_KEY_EODHD set={bool(_api_key)} len={(len(_api_key) if _api_key else 0)}")
-if not _api_key:
-    print("FATAL: API_KEY_EODHD nicht gesetzt. Lege ihn in .env (im Projekt-Root) "
-          "oder exportiere ihn in der Shell (z. B. $env:API_KEY_EODHD='...').")
-    sys.exit(2)
 
 # ── Imports NACH dem dotenv/Config-Load ─────────────────────────────────────
 from .pipeline import run_import  # noqa: E402
 import registry_manager.sources.base as _base  # noqa: E402
 
-# Debug: sicherstellen, dass das richtige base.py geladen wird
 print(f"[DBG] base.py loaded from: {inspect.getfile(_base)}")
 
+# ── Main CLI ────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description="Unified import runner (central pipeline + per-source adapters)")
-    ap.add_argument("--source", required=True, choices=["eodhd"], help="Quelle/Adapter (zunächst: eodhd)")
-    ap.add_argument("--exchanges", nargs="+", required=True, help="Exchange Codes (z. B. XNAS XNYS XETR)")
+    ap.add_argument(
+        "--source",
+        required=True,
+        choices=["eodhd", "binance", "binance_futures"],
+        help="Quelle/Adapter (z. B. eodhd, binance (Spot) oder binance_futures (COIN-M))",
+    )
+    ap.add_argument(
+        "--exchanges",
+        nargs="+",
+        required=True,
+        help="Exchange Codes (z. B. XNAS XNYS XETR; für Binance Spot: BINANCE_SPOT, für COIN-M Futures: BINANCE_COINM)",
+    )
     ap.add_argument("--limit", type=int, default=None, help="Max Symbole pro Exchange")
     ap.add_argument("--sleep", type=float, default=0.0, help="Pause zwischen Items")
     ap.add_argument("--dry-run", action="store_true", help="Nur loggen, nicht schreiben")
     ap.add_argument("--tags", nargs="*", default=None, help="Zusätzliche Tags für alle neuen Assets")
     ap.add_argument("--unsorted", action="store_true", help="Neue Assets als 'unsorted' markieren")
-    ap.add_argument("--registry-endpoint", type=str, default=os.getenv("REGISTRY_ENDPOINT"), help="Registry API Base (optional override)")
+    ap.add_argument(
+        "--registry-endpoint",
+        type=str,
+        default=os.getenv("REGISTRY_ENDPOINT"),
+        help="Registry API Base (optional override)",
+    )
     args = ap.parse_args()
 
     # Debug-Zusammenfassung
-    log.debug(f"args.source={args.source} exchanges={args.exchanges} limit={args.limit} sleep={args.sleep} dry_run={args.dry_run}")
-    log.info (f"Using REGISTRY_ENDPOINT={args.registry_endpoint or os.getenv('REGISTRY_ENDPOINT','N/A')}")
+    log.debug(
+        "ARGS: source=%s exchanges=%s limit=%s sleep=%.3f dry_run=%s tags=%s unsorted=%s endpoint=%s",
+        args.source, args.exchanges, args.limit, args.sleep, args.dry_run,
+        args.tags, args.unsorted, args.registry_endpoint
+    )
+    log.info("Using REGISTRY_ENDPOINT=%s", args.registry_endpoint or os.getenv("REGISTRY_ENDPOINT", "N/A"))
+
+    # Sanity-Warnungen (nicht fatal, nur Hinweis)
+    try:
+        ex_set = {str(e).upper() for e in (args.exchanges or [])}
+        if args.source == "binance" and not any(ex.startswith("BINANCE_SPOT") for ex in ex_set):
+            log.warning("[SANITY] --source binance erwartet Exchanges wie BINANCE_SPOT; bekommen: %s", sorted(ex_set))
+        if args.source == "binance_futures" and not any(ex.startswith("BINANCE_COINM") for ex in ex_set):
+            log.warning("[SANITY] --source binance_futures erwartet Exchanges wie BINANCE_COINM; bekommen: %s", sorted(ex_set))
+    except Exception as e:
+        log.debug("[SANITY] exchange check skipped: %r", e)
+
+    if args.source == "eodhd" and not _api_key:
+        print(
+            "FATAL: API_KEY_EODHD nicht gesetzt. Lege ihn in .env (im Projekt-Root) "
+            "oder exportiere ihn in der Shell (z. B. $env:API_KEY_EODHD='...')."
+        )
+        sys.exit(2)
 
     totals = run_import(
         source=args.source,
@@ -80,7 +114,7 @@ def main():
         force_unsorted=args.unsorted,
         registry_endpoint=args.registry_endpoint,
     )
-    log.info(f"[EXIT] {totals}")
+    log.info("[EXIT] %s", totals)
 
 if __name__ == "__main__":
     main()

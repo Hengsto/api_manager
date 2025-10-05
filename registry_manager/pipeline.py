@@ -6,15 +6,23 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .registry_client import RegistryClient
 from .sources.base import SourceAdapter, AssetDraft, Listing
+from .sources.binance import BinanceAdapter
 from .sources.eodhd import EODHDAdapter
 
-log = logging.getLogger("ingest.pipeline")
+from registry_manager.sources.binance import BinanceAdapter
+from registry_manager.sources.binance_futures import BinanceFuturesAdapter  # NEU
 
-ADAPTERS: Dict[str, SourceAdapter] = {
+ADAPTERS = {
     "eodhd": EODHDAdapter(),
-    # "binance": BinanceAdapter(),  # später hinzufügen
-    # "bybit": BybitAdapter(),
+    "binance": BinanceAdapter(),                 # Spot
+    "binance_futures": BinanceFuturesAdapter(),  # COIN-M
 }
+
+# Debug: Adapterübersicht (hilft sofort beim nächsten Problem)
+import logging
+log = logging.getLogger("pipeline")
+log.info("[PIPE] adapters available=%s", list(ADAPTERS))
+
 
 def _asset_payload(a: AssetDraft) -> Dict[str, Any]:
     return {
