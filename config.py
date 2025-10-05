@@ -22,7 +22,6 @@ if _ENV_UNIFIED:
 else:
     NOTIFIER_UNIFIED = str(PROFILE_DIR / "notifier_profiles.json")
 
-
 # Für UI-Kompatibilität: historischer Alias (API nimmt das als Profile-Datei)
 PROFILES_NOTIFIER = NOTIFIER_UNIFIED
 
@@ -34,6 +33,7 @@ STATUS_NOTIFIER    = str(_base / "notifier_status.json")
 OVERRIDES_NOTIFIER = str(_base / "notifier_overrides.json")
 COMMANDS_NOTIFIER  = str(_base / "notifier_commands.json")
 ALARMS_NOTIFIER    = str(_base / "notifier_alarms.json")   # <-- ergänzt
+
 # ── Gate-State (neben NOTIFIER_UNIFIED) ───────────────────────────────────────
 _env_gate = os.getenv("NOTIFIER_GATE_STATE", "").strip()
 if _env_gate:
@@ -41,13 +41,13 @@ if _env_gate:
 else:
     GATE_STATE_NOTIFIER = str(_base / "evaluator_gate_state.json")
 
-
 # ── Endpoints (lokal als Default) ─────────────────────────────────────────────
 MAIN_IP = os.getenv("MAIN_IP", "127.0.0.1")
 
-# Eigener Notifier (UI spricht hierauf)
-NOTIFIER_PORT = int(os.getenv("NOTIFIER_PORT", "8099"))
-REGISTRY_PORT = int(os.getenv("REGISTRY_PORT", "8098"))
+# Ein-Port-Setup: beide (Notifier & Registry) laufen am selben Port
+NOTIFIER_PORT = int(os.getenv("NOTIFIER_PORT", "8098"))
+REGISTRY_PORT = int(os.getenv("REGISTRY_PORT", "8098"))  # nur relevant, wenn NICHT gemountet
+
 # WICHTIG: /notifier am Ende, damit Evaluator-PATCH /profiles/{pid}/groups/{gid}/active landet
 NOTIFIER_ENDPOINT = f"http://{MAIN_IP}:{NOTIFIER_PORT}/notifier"
 
@@ -61,29 +61,30 @@ CHART_API_HOST = os.getenv("CHART_API_HOST", MAIN_IP)
 CHART_API_PORT = int(os.getenv("CHART_API_PORT", "7004"))  # lokal: 7004
 CHART_API_ENDPOINT = f"http://{CHART_API_HOST}:{CHART_API_PORT}"
 
-# Registry-API (Asset/Listing/Tags/Groups) – Standard: gemountet unter /registry
+# Registry-API (Asset/Listing/Tags/Groups)
 REGISTRY_HOST = os.getenv("REGISTRY_HOST", MAIN_IP)
-REGISTRY_PORT = int(os.getenv("REGISTRY_PORT", "8098"))  # nur relevant, wenn NICHT gemountet
+
 # Wenn REGISTRY_ENDPOINT explizit gesetzt ist → nimm den.
 # Sonst: wenn als Sub-App gemountet (gleicher Prozess) → /registry auf Notifier-Port.
 # Andernfalls: eigener Dienst auf REGISTRY_HOST:REGISTRY_PORT.
 _env_registry = os.getenv("REGISTRY_ENDPOINT", "").strip()
 if _env_registry:
     REGISTRY_ENDPOINT = _env_registry.rstrip("/")
+    _mounted_flag = "explicit"
 else:
-    # gemountet (gleicher Prozess)
-    REGISTRY_ENDPOINT = f"http://{MAIN_IP}:{NOTIFIER_PORT}/registry" \
-        if os.getenv("REGISTRY_MOUNTED", "1").strip().lower() in {"1","true","yes","on","y"} \
+    mounted = os.getenv("REGISTRY_MOUNTED", "1").strip().lower() in {"1","true","yes","on","y"}
+    _mounted_flag = str(mounted)
+    REGISTRY_ENDPOINT = (
+        f"http://{MAIN_IP}:{NOTIFIER_PORT}/registry" if mounted
         else f"http://{REGISTRY_HOST}:{REGISTRY_PORT}"
-    
+    )
+print(f"[CFG] REGISTRY_ENDPOINT = {REGISTRY_ENDPOINT} (mounted={_mounted_flag})")
 
 # ── Registry / Symbol Manager ────────────────────────────────────────────────
 SYMBOL_MANAGER_DIR = DATA_DIR / "registry_manager"
 SYMBOL_MANAGER_DIR.mkdir(parents=True, exist_ok=True)
 
 REGISTRY_DB = str(SYMBOL_MANAGER_DIR / "registry.sqlite")
-
-
 
 # ── Steuerung ────────────────────────────────────────────────────────────────
 def _truthy(key: str, default: str = "1") -> bool:
@@ -114,34 +115,4 @@ AUTHORIZED_USERS = [
     int(x) for x in os.getenv("AUTHORIZED_USERS", "").split(",") if x.strip().isdigit()
 ]
 
-# ── CORS (für Web-UIs) ───────────────────────────────────────────────────────
-# Beispiel: NOTIFIER_CORS_ORIGINS=http://localhost:8050,http://127.0.0.1:8050
-NOTIFIER_CORS_ORIGINS = os.getenv("NOTIFIER_CORS_ORIGINS", "http://localhost:8050")
-
-# ── Locks ────────────────────────────────────────────────────────────────────
-# ENV > TMPDIR > TEMP > TMP > System-Temp
-_lock_base = (
-    os.getenv("NOTIFIER_LOCK_DIR")
-    or os.getenv("TMPDIR")
-    or os.getenv("TEMP")
-    or os.getenv("TMP")
-    or (str(Path(os.getenv("LOCALAPPDATA", Path.home())) / "Temp") if os.name == "nt" else "/tmp")
-)
-NOTIFIER_LOCK_DIR = Path(_lock_base) / "notifier_locks"
-NOTIFIER_LOCK_DIR.mkdir(parents=True, exist_ok=True)
-
-# ── Debug-Ausgabe (optional) ─────────────────────────────────────────────────
-if _truthy("CONFIG_DEBUG_PRINT", "0"):
-    print(f"[CFG] NOTIFIER_UNIFIED     = {NOTIFIER_UNIFIED}")
-    print(f"[CFG] PROFILES_NOTIFIER    = {PROFILES_NOTIFIER}")
-    print(f"[CFG] STATUS_NOTIFIER      = {STATUS_NOTIFIER}")
-    print(f"[CFG] OVERRIDES_NOTIFIER   = {OVERRIDES_NOTIFIER}")
-    print(f"[CFG] COMMANDS_NOTIFIER    = {COMMANDS_NOTIFIER}")
-    print(f"[CFG] ALARMS_NOTIFIER      = {ALARMS_NOTIFIER}")
-    print(f"[CFG] NOTIFIER_ENDPOINT    = {NOTIFIER_ENDPOINT}")
-    print(f"[CFG] PRICE_API_ENDPOINT   = {PRICE_API_ENDPOINT}")
-    print(f"[CFG] CHART_API_ENDPOINT   = {CHART_API_ENDPOINT}")
-    print(f"[CFG] ENABLE_EVALUATOR     = {ENABLE_EVALUATOR} (interval={EVALUATOR_INTERVAL}s)")
-    print(f"[CFG] EVAL_HTTP_TIMEOUT    = {EVAL_HTTP_TIMEOUT}s retries={EVAL_HTTP_RETRIES} cache_max={EVAL_CACHE_MAX}")
-    print(f"[CFG] NOTIFIER_LOCK_DIR    = {NOTIFIER_LOCK_DIR}")
-    print(f"[CFG] NOTIFIER_CORS_ORIGINS= {NOTIFIER_CORS_ORIGINS}")
+# ── CORS (für Web-UIs) ───────────────────────
