@@ -333,6 +333,68 @@ def _rand_id(n: int = 6) -> str:
 def _name_key(x: Any) -> str:
     return _trim_str(x).lower()
 
+def _contains_profile_token(x: Any) -> bool:
+    return isinstance(x, str) and x.strip().lower().startswith("profile:")
+
+import re
+
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_HEX_ID_RE = re.compile(r"^[0-9a-fA-F]{6,16}$")  # für kurze hex-IDs wie d4a5a0
+
+def _looks_like_profile_id(x: Any) -> bool:
+    if not isinstance(x, str):
+        return False
+    s = x.strip()
+    if not s:
+        return False
+    if s.lower().startswith("profile:"):
+        return True
+    # UUID oder kurze hex-ID
+    if _UUID_RE.match(s):
+        return True
+    if _HEX_ID_RE.match(s) and ":" not in s and "/" not in s:
+        return True
+    return False
+
+def _extract_profile_id(token: str) -> str:
+    s = str(token).strip()
+    if s.lower().startswith("profile:"):
+        return s.split(":", 1)[1].strip()
+    return s
+
+def _split_symbols_and_profiles(values: Any) -> tuple[list[str], list[str]]:
+    syms: list[str] = []
+    profs: list[str] = []
+    if isinstance(values, list):
+        for raw in values:
+            if not isinstance(raw, str):
+                continue
+            if _looks_like_profile_id(raw):
+                profs.append(_extract_profile_id(raw))
+            else:
+                syms.append(raw)
+    return syms, profs
+
+
+
+def _validate_group_strict(g: dict) -> None:
+    # Nach unserem Mapping sollten hier keine Profile mehr liegen.
+    bad = [s for s in (g.get("symbols") or []) if _contains_profile_token(s) or _looks_like_profile_id(s)]
+    if bad:
+        log.warning("Group symbols still contain profile-like tokens (will be ignored): %s", bad[:3])
+
+
+def _validate_condition_strict(c: dict) -> None:
+    # Nur noch warnen – _sanitize_condition mappt Profile → *_profiles
+    ls = _trim_str(c.get("left_symbol"))
+    rs = _trim_str(c.get("right_symbol"))
+    if _contains_profile_token(ls) or _looks_like_profile_id(ls):
+        log.warning("Condition.left_symbol contains profile-like token; will be moved by sanitizer: %s", ls)
+    if _contains_profile_token(rs) or _looks_like_profile_id(rs):
+        log.warning("Condition.right_symbol contains profile-like token; will be moved by sanitizer: %s", rs)
+
+
+
 _ALLOWED_DEACT = {"always","true","any_true"}
 def _normalize_deactivate_value(v: Any) -> Optional[str]:
     if v is None: return None
@@ -360,6 +422,49 @@ _ALLOWED_SINGLE_MODES = {"symbol","group","everything"}
 # ─────────────────────────────────────────────────────────────
 # Datenmodelle (READ/WRITE)
 # ─────────────────────────────────────────────────────────────
+# --- GroupOut / GroupIn: profile_labels entfernen
+class GroupOut(ApiModel):
+    gid: str
+    conditions: List[ConditionOut]
+    active: bool
+    symbols: List[str]  # nur echte Ticker
+    profiles: List[str] = Field(default_factory=list)  # nur Profil-IDs
+    interval: str = ""
+    exchange: str = ""
+    name: str = ""
+    description: str = ""
+    deactivate_on: Optional[Literal["always","true","any_true"]] = None
+    min_true_ticks: Optional[int] = None
+    single_mode: Optional[Literal["symbol","group","everything"]] = "symbol"
+
+class ProfileBaseOut(ApiModel):
+    name: str
+    enabled: bool = True
+    condition_groups: List[GroupOut]
+
+class ProfileRead(ProfileBaseOut):
+    id: str
+
+
+
+
+class GroupIn(ApiModel):
+    gid: Optional[str] = None
+    conditions: List[ConditionIn] = Field(default_factory=list)
+    active: bool = True
+    symbols: List[str] = Field(default_factory=list)    # nur Ticker
+    profiles: List[str] = Field(default_factory=list)   # nur Profil-IDs
+    interval: str = ""
+    exchange: str = ""
+    name: str = ""
+    description: str = ""
+    deactivate_on: Optional[Literal["always","true","any_true"]] = None
+    auto_deactivate: Optional[bool] = None
+    min_true_ticks: Optional[int] = None
+    single_mode: Optional[Literal["symbol","group","everything"]] = "symbol"
+
+
+# --- ConditionOut / ConditionIn: neue Felder left_profiles/right_profiles
 class ConditionOut(ApiModel):
     rid: str
     left: str
@@ -374,28 +479,10 @@ class ConditionOut(ApiModel):
     right_params: Dict[str, Any] = Field(default_factory=dict)
     left_symbol: str = ""
     left_interval: str = ""
+    # NEU: Profile-Listen (IDs)
+    left_profiles: List[str] = Field(default_factory=list)
+    right_profiles: List[str] = Field(default_factory=list)
 
-class GroupOut(ApiModel):
-    gid: str
-    conditions: List[ConditionOut]
-    active: bool
-    symbols: List[str]
-    interval: str = ""
-    exchange: str = ""
-    name: str = ""
-    description: str = ""
-    deactivate_on: Optional[Literal["always","true","any_true"]] = None
-    min_true_ticks: Optional[int] = None
-    single_mode: Optional[Literal["symbol","group","everything"]] = "symbol"
-
-
-class ProfileBaseOut(ApiModel):
-    name: str
-    enabled: bool = True
-    condition_groups: List[GroupOut]
-
-class ProfileRead(ProfileBaseOut):
-    id: str
 
 class ConditionIn(ApiModel):
     rid: Optional[str] = None
@@ -411,12 +498,26 @@ class ConditionIn(ApiModel):
     right_params: Dict[str, Any] = Field(default_factory=dict)
     left_symbol: Optional[str] = ""
     left_interval: Optional[str] = ""
+    # NEU: Profile-Listen (IDs)
+    left_profiles: List[str] = Field(default_factory=list)
+    right_profiles: List[str] = Field(default_factory=list)
+
+
 
 class GroupIn(ApiModel):
     gid: Optional[str] = None
     conditions: List[ConditionIn] = Field(default_factory=list)
     active: bool = True
+
+    # Echte Symbole (Tickers etc.)
     symbols: List[str] = Field(default_factory=list)
+
+    # NEU: Registry-Profile (IDs), die als Quelle dienen
+    profiles: List[str] = Field(default_factory=list)
+
+    # Optional nur für UI-Anzeige (nicht für Logik)
+    profile_labels: List[str] = Field(default_factory=list)
+
     interval: str = ""
     exchange: str = ""
     name: str = ""
@@ -443,13 +544,38 @@ class ProfileUpdate(ProfileBaseIn):
 class GroupActivePatch(ApiModel):
     active: bool
 
+
+
 # ─────────────────────────────────────────────────────────────
-# Sanitize & ID-Pflege
+# Sanitize: Condition (einzige gültige Definition, mit Debug-Logs)
 # ─────────────────────────────────────────────────────────────
 _ALLOWED_OPS = {"eq","ne","gt","gte","lt","lte"}
 _ALLOWED_LOGIC = {"and","or"}
 
 def _sanitize_condition(c: dict) -> dict:
+    import re
+
+    # lokale Regex (kein globaler Import nötig)
+    _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+    _HEX_ID_RE = re.compile(r"^[0-9a-fA-F]{6,16}$")
+
+    def _looks_like_profile_id(x: object) -> bool:
+        if not isinstance(x, str): return False
+        s = x.strip()
+        if not s: return False
+        if s.lower().startswith("profile:"): return True
+        if _UUID_RE.match(s): return True
+        if _HEX_ID_RE.match(s) and ":" not in s and "/" not in s: return True
+        return False
+
+    def _extract_profile_id(token: str) -> str:
+        s = str(token).strip()
+        if s.lower().startswith("profile:"):
+            return s.split(":", 1)[1].strip()
+        return s
+
+    # Defaults
+    c = dict(c or {})
     c.setdefault("rid", _rand_id())
     c.setdefault("left", "")
     c.setdefault("op", "gt")
@@ -463,17 +589,60 @@ def _sanitize_condition(c: dict) -> dict:
     c.setdefault("right_params", {})
     c.setdefault("left_symbol", "")
     c.setdefault("left_interval", "")
+    # Profile-Listen
+    c.setdefault("left_profiles", [])
+    c.setdefault("right_profiles", [])
 
-    for k in ("left","right_symbol","right_interval","left_output","right_output","logic","op","left_symbol","left_interval"):
+    # DEBUG: Eingang
+    try:
+        print(f"[DEBUG] _sanitize_condition:init rid={c.get('rid')} "
+              f"left='{c.get('left')}' right='{c.get('right')}' "
+              f"lsym='{c.get('left_symbol')}' rsym='{c.get('right_symbol')}' "
+              f"lop='{c.get('left_output')}' rop='{c.get('right_output')}'")
+    except Exception:
+        pass
+
+    # Strings trimmen
+    for k in ("left","right_symbol","right_interval","left_output",
+              "right_output","logic","op","left_symbol","left_interval"):
         c[k] = _trim_str(c.get(k))
 
+    # Op/Logic normalisieren
     if c["op"] not in _ALLOWED_OPS: c["op"] = "gt"
     if c["logic"] not in _ALLOWED_LOGIC: c["logic"] = "and"
 
-    # Drop legacy/typo variants
+    # Legacy/typo entfernen
     for k in ("right_absolute",):
         c.pop(k, None)
 
+    # Profile-IDs in *_symbol → *_profiles mappen
+    mapped = False
+    if _looks_like_profile_id(c.get("left_symbol", "")):
+        pid = _extract_profile_id(c.get("left_symbol", ""))
+        if pid:
+            c.setdefault("left_profiles", [])
+            if pid not in c["left_profiles"]:
+                c["left_profiles"].append(pid)
+            c["left_symbol"] = ""
+            mapped = True
+
+    if _looks_like_profile_id(c.get("right_symbol", "")):
+        pid = _extract_profile_id(c.get("right_symbol", ""))
+        if pid:
+            c.setdefault("right_profiles", [])
+            if pid not in c["right_profiles"]:
+                c["right_profiles"].append(pid)
+            c["right_symbol"] = ""
+            mapped = True
+
+    if mapped:
+        try:
+            print(f"[DEBUG] _sanitize_condition:mapped rid={c.get('rid')} "
+                  f"left_profiles={c.get('left_profiles')} right_profiles={c.get('right_profiles')}")
+        except Exception:
+            pass
+
+    # right zu String
     rv = c.get("right")
     if isinstance(rv, (int, float)):
         c["right"] = str(rv)
@@ -482,17 +651,36 @@ def _sanitize_condition(c: dict) -> dict:
     else:
         c["right"] = _trim_str(rv)
 
+    # Param-Dicts sichern
     if not isinstance(c["left_params"], dict):  c["left_params"]  = {}
     if not isinstance(c["right_params"], dict): c["right_params"] = {}
 
+    # slope-Params normalisieren
     if (_trim_str(c.get("left")).lower() == "slope"):
         c["left_params"] = _normalize_slope_params_dict(c["left_params"])
     if (_trim_str(c.get("right")).lower() == "slope"):
         c["right_params"] = _normalize_slope_params_dict(c["right_params"])
 
+    # Listen-Typ sichern
+    if not isinstance(c["left_profiles"], list):  c["left_profiles"]  = []
+    if not isinstance(c["right_profiles"], list): c["right_profiles"] = []
+
+    # RID stabilisieren
     rid = _trim_str(c.get("rid")) or _rand_id()
     c["rid"] = rid
+
+    # DEBUG: Ergebnis
+    try:
+        print(f"[DEBUG] _sanitize_condition:done rid={c.get('rid')} "
+              f"lsym='{c.get('left_symbol')}' rsym='{c.get('right_symbol')}' "
+              f"lprof={c.get('left_profiles')} rprof={c.get('right_profiles')}")
+    except Exception:
+        pass
+
     return c
+
+
+
 
 def _norm_symbol(s: str) -> str:
     if not isinstance(s, str):
@@ -500,86 +688,29 @@ def _norm_symbol(s: str) -> str:
     s = unicodedata.normalize("NFKC", s).strip()
     return s.upper()
 
-def _sanitize_group(g: dict) -> dict:
-    g.setdefault("gid", _rand_id())
-    g.setdefault("conditions", [])
-    g.setdefault("active", True)
-    g.setdefault("symbols", [])
-    g.setdefault("interval", "")
-    g.setdefault("exchange", "")
-    g.setdefault("name", "")
 
-    g.setdefault("description", "")
-    if "deactivate_on" not in g: g["deactivate_on"] = None
-    if "auto_deactivate" not in g: g["auto_deactivate"] = None
-    if "min_true_ticks" not in g:  g["min_true_ticks"] = None
-    if "single_mode" not in g:     g["single_mode"] = "symbol"
-
-    for k in ("interval","exchange","name","description","single_mode"):
-        g[k] = _trim_str(g.get(k))
-
-    if g["single_mode"] not in _ALLOWED_SINGLE_MODES:
-        g["single_mode"] = "symbol"
-
-    if not isinstance(g["symbols"], list):
-        g["symbols"] = []
-    else:
-        seen, out = set(), []
-        for raw in (g["symbols"] or []):
-            if not isinstance(raw, str): 
-                continue
-            s = _norm_symbol(raw)
-            if not s: 
-                continue
-            if s not in seen:
-                out.append(s); seen.add(s)
-        g["symbols"] = out
-
-    conds = []
-    for raw in g.get("conditions") or []:
-        if isinstance(raw, dict): conds.append(_sanitize_condition(raw))
-    g["conditions"] = conds
-
-    try:
-        _raw = g.get("min_true_ticks", None)
-        mtt: Optional[int] = None
-        if _raw not in (None, "", "null"):
-            mtt = int(_raw)
-            if mtt < 1: mtt = None
-    except Exception:
-        mtt = None
-    g["min_true_ticks"] = mtt
-
-    norm = _normalize_deactivate_value(g.get("deactivate_on"))
-    if norm is None:
-        norm = _normalize_deactivate_value(g.get("auto_deactivate"))
-    if norm in _ALLOWED_DEACT:
-        g["deactivate_on"] = norm
-    else:
-        g["deactivate_on"] = None
-    g.pop("auto_deactivate", None)
-
-    gid = _trim_str(g.get("gid")) or _rand_id()
-    g["gid"] = gid
-    seen = set()
-    for c in g["conditions"]:
-        if c["rid"] in seen:
-            c["rid"] = _rand_id()
-        seen.add(c["rid"])
-    return g
 
 def _sanitize_profiles(data: list) -> list:
     out = []
     for p in data or []:
-        if not isinstance(p, dict): continue
+        if not isinstance(p, dict):
+            continue
         p.setdefault("name", "Unnamed")
         p.setdefault("enabled", True)
         p.setdefault("condition_groups", [])
         p["id"] = str(p.get("id") or uuid.uuid4())
 
+        try:
+            print(f"[DEBUG] _sanitize_profiles:init id={p['id']} name='{p.get('name')}' "
+                  f"groups_in={len(p.get('condition_groups') or [])}")
+        except Exception:
+            pass
+
         groups = []
         for g in p.get("condition_groups") or []:
-            if isinstance(g, dict): groups.append(_sanitize_group(g))
+            if isinstance(g, dict):
+                sg = _sanitize_group(g)
+                groups.append(sg)
 
         seen = set()
         for g in groups:
@@ -588,8 +719,139 @@ def _sanitize_profiles(data: list) -> list:
             seen.add(g["gid"])
 
         p["condition_groups"] = groups
+
+        try:
+            syms_total = sum(len(gr.get("symbols") or []) for gr in groups)
+            profs_total = sum(len(gr.get("profiles") or []) for gr in groups)
+            print(f"[DEBUG] _sanitize_profiles:done id={p['id']} groups_out={len(groups)} "
+                  f"sum_symbols={syms_total} sum_profiles={profs_total}")
+        except Exception:
+            pass
+
         out.append(p)
     return out
+
+
+# ─────────────────────────────────────────────────────────────
+# Sanitize: Group (ruft _sanitize_condition auf, mit Debug-Logs)
+# ─────────────────────────────────────────────────────────────
+def _sanitize_group(g: dict) -> dict:
+    g = dict(g or {})
+
+    # Defaults
+    g.setdefault("gid", _rand_id())
+    g.setdefault("conditions", [])
+    g.setdefault("active", True)
+    g.setdefault("symbols", [])
+    g.setdefault("profiles", [])
+    g.setdefault("profile_labels", [])
+    g.setdefault("interval", "")
+    g.setdefault("exchange", "")
+    g.setdefault("name", "")
+    g.setdefault("description", "")
+    g.setdefault("deactivate_on", None)
+    g.setdefault("auto_deactivate", None)
+    g.setdefault("min_true_ticks", None)
+    g.setdefault("single_mode", "symbol")
+
+    # Trim einfache Strings
+    for k in ("gid","interval","exchange","name","description","single_mode"):
+        if k in g:
+            g[k] = _trim_str(g.get(k))
+
+    # Debug: Eingang
+    try:
+        print(f"[DEBUG] _sanitize_group:init gid={g.get('gid')} name='{g.get('name')}' "
+              f"interval='{g.get('interval')}' exchange='{g.get('exchange')}' "
+              f"symbols_in={len(g.get('symbols') or [])} profiles_in={len(g.get('profiles') or [])} "
+              f"conds_in={len(g.get('conditions') or [])}")
+    except Exception:
+        pass
+
+    # deactivate_on normalisieren (auto_deactivate als Legacy akzeptieren)
+    deact = _normalize_deactivate_value(g.get("deactivate_on"))
+    if deact is None and g.get("auto_deactivate") is not None:
+        deact = "true" if bool(g.get("auto_deactivate")) else "always"
+    g["deactivate_on"] = deact
+
+    # single_mode absichern
+    sm = _trim_str(g.get("single_mode")).lower()
+    g["single_mode"] = sm if sm in _ALLOWED_SINGLE_MODES else "symbol"
+
+    # Symbols/Profiles splitten (Profile-Tokens aus symbols rausziehen)
+    syms_in = list(g.get("symbols") or [])
+    profs_in = list(g.get("profiles") or [])
+
+    # Falls in symbols Profile stecken → nach profiles verschieben
+    split_syms, split_profs = _split_symbols_and_profiles(syms_in)
+    # Profile-Einträge: sowohl vorhandene als auch aus symbols
+    profs_all = list(profs_in) + split_profs
+
+    # Nur echte Ticker in symbols, deduplizieren + normalisieren
+    clean_syms = []
+    seen_s = set()
+    for s in split_syms:
+        ns = _norm_symbol(s)
+        if ns and ns not in seen_s:
+            clean_syms.append(ns)
+            seen_s.add(ns)
+
+    # Profiles deduplizieren (IDs/Token wurden in _split_symbols_and_profiles schon extrahiert)
+    clean_profs = []
+    seen_p = set()
+    for p in profs_all:
+        pid = _trim_str(p)
+        if pid and pid not in seen_p:
+            clean_profs.append(pid)
+            seen_p.add(pid)
+
+    g["symbols"] = clean_syms
+    g["profiles"] = clean_profs
+
+    # Debug: nach Split
+    try:
+        print(f"[DEBUG] _sanitize_group:after-split gid={g.get('gid')} "
+              f"symbols={g.get('symbols')} profiles={g.get('profiles')}")
+    except Exception:
+        pass
+
+    # Conditions sanitisieren
+    conds_out = []
+    for raw in (g.get("conditions") or []):
+        if isinstance(raw, dict):
+            sc = _sanitize_condition(raw)
+            conds_out.append(sc)
+        else:
+            # Ignoriere Nicht-Dicts still
+            continue
+
+    # Condition RIDs deduplizieren
+    seen_rids = set()
+    for c in conds_out:
+        rid = _trim_str(c.get("rid")) or _rand_id()
+        if rid in seen_rids:
+            rid = _rand_id()
+            c["rid"] = rid
+        seen_rids.add(rid)
+        # Optionale strikte Validierung nur für Logs/Warnungen
+        try:
+            _validate_condition_strict(c)
+        except Exception:
+            pass
+
+    g["conditions"] = conds_out
+
+    # Optionale Gruppen-Validierung (nur Warnungen)
+    try:
+        _validate_group_strict(g)
+    except Exception:
+        pass
+
+    # GID stabilisieren
+    g["gid"] = _trim_str(g.get("gid")) or _rand_id()
+
+    return g
+
 
 def _merge_ids(old_p: dict, new_p: dict) -> dict:
     """
@@ -759,25 +1021,21 @@ def _enqueue_command(pid: str, gid: str, rearm: bool = True, rebaseline: bool = 
 # Legacy → New Migration + Normalized Loader
 # ─────────────────────────────────────────────────────────────
 def _profile_to_legacy_alias(p: dict) -> dict:
-    """Spiegelt condition_groups zusätzlich als legacy 'groups: [{config: ...}]' aus.
-       Entfernt nichts – nur Aliasse, damit alte UIs wieder laden.
-    """
+    """Spiegelt condition_groups zusätzlich als legacy 'groups: [{config: ...}]' aus."""
     p = deepcopy(p)
     cgs = p.get("condition_groups") or []
     legacy_groups = []
     for g in cgs:
-        # auto_deactivate aus deactivate_on zurückgewinnen (true → any_true/true)
         deactivate_on = g.get("deactivate_on")
         auto_deactivate = None
         if deactivate_on in ("true", "any_true"):
             auto_deactivate = True
-        # Legacy-Objekt war { config: {...} }
         cfg = deepcopy(g)
-        # Für Legacy: Feldnamen, die früher da waren, wieder anbieten
         cfg["auto_deactivate"] = auto_deactivate
         legacy_groups.append({"config": cfg})
     p["groups"] = legacy_groups
     return p
+
 
 def _profiles_with_legacy_aliases(items: list[dict]) -> list[dict]:
     return [_profile_to_legacy_alias(x) for x in items]
@@ -800,6 +1058,7 @@ def _migrate_legacy_groups_one_profile(p: dict) -> tuple[dict, bool]:
                 "name":         _trim_str(cfg.get("name")),
                 "active":       bool(cfg.get("active", True)),
                 "symbols":      list(cfg.get("symbols") or []),
+                "profiles":     list(cfg.get("profiles") or []),  # NEU: übernehmen, falls vorhanden
                 "interval":     _trim_str(cfg.get("interval")),
                 "exchange":     _trim_str(cfg.get("exchange")),
                 "telegram_bot_id": cfg.get("telegram_bot_id"),
@@ -811,6 +1070,8 @@ def _migrate_legacy_groups_one_profile(p: dict) -> tuple[dict, bool]:
                 "single_mode":  _trim_str(cfg.get("single_mode") or "symbol"),
                 "conditions":   list(cfg.get("conditions") or []),
             }
+
+
             cond_groups.append(new_g)
         changed = True
 
@@ -866,7 +1127,6 @@ def _build_status_skeleton_from_profiles(profiles: list[dict]) -> dict:
                 "fresh": True,
                 "aggregate": {
                     "min_true_ticks": g.get("min_true_ticks"),
-                    # ⬇️ neu: deactivate_on (vormals notify_mode)
                     "deactivate_on": (
                         _normalize_deactivate_value(g.get("deactivate_on"))
                         or ("true" if g.get("auto_deactivate") else "always")
@@ -882,7 +1142,12 @@ def _build_status_skeleton_from_profiles(profiles: list[dict]) -> dict:
                 "last_bar_ts": None,
                 "conditions": _label_only_conditions(g),
                 "conditions_status": [],
+                # NEU: für UI sichtbar
+                "symbols": list(g.get("symbols") or []),
+                "profiles": list(g.get("profiles") or []),
             }
+
+
         profiles_map[pid] = {
             "id": pid,
             "name": p.get("name") or pid,
@@ -1009,14 +1274,13 @@ def _merge_status_keep_runtime(old: Dict[str, Any], skel: Dict[str, Any]) -> Dic
 
                 "aggregate": {
                     "min_true_ticks": agg_s.get("min_true_ticks", agg_old.get("min_true_ticks")),
-                    # ⬇️ nur noch deactivate_on persistieren
                     "deactivate_on": new_deactivate_on,
                 },
 
                 # Runtime unverändert beibehalten
                 "runtime": rt_old,
 
-                # ⬇️ WICHTIG: Bedingungen aus dem Skeleton (aktuelle Profil-Definition)
+                # Aktuelle Bedingungen aus dem Skeleton
                 "conditions": g_s.get("conditions", []),
 
                 "conditions_status": old_g.get("conditions_status", []) if isinstance(old_g.get("conditions_status"), list) else [],
@@ -1024,7 +1288,13 @@ def _merge_status_keep_runtime(old: Dict[str, Any], skel: Dict[str, Any]) -> Dic
                 "last_bar_ts": old_g.get("last_bar_ts", None),
             }
 
-            # (Optional/Empfohlen) zusätzliche Felder aus Skeleton übernehmen:
+            # ⬇️ NEU: Sichtbare Felder für die UI aus dem Skeleton übernehmen
+            for _k in ("symbols", "profiles"):
+
+                if _k in g_s:
+                    new_g[_k] = list(g_s.get(_k) or [])
+
+            # (Optional) weitere Felder
             if "min_tick" in g_s:
                 new_g["min_tick"] = g_s.get("min_tick")
             if "single_mode" in g_s:
@@ -1034,15 +1304,11 @@ def _merge_status_keep_runtime(old: Dict[str, Any], skel: Dict[str, Any]) -> Dic
 
         new_out["profiles"][pid] = new_p
 
-    return new_out
-
-
     # ---- Diagnostics: was wurde gepruned? ----
     old_pids = set(old_profiles.keys())
     new_pids = set(new_out["profiles"].keys())
     pruned_pids = sorted(list(old_pids - new_pids))
 
-    # pro PID entfernte GIDs
     pruned_groups_total = 0
     details_groups: List[str] = []
     for pid in sorted(list(old_pids & new_pids)):
@@ -1051,7 +1317,6 @@ def _merge_status_keep_runtime(old: Dict[str, Any], skel: Dict[str, Any]) -> Dic
         gone = sorted(list(old_gids - new_gids))
         if gone:
             pruned_groups_total += len(gone)
-            # nur die ersten paar drucken, damit Logs nicht explodieren
             preview = ", ".join(gone[:5]) + ("..." if len(gone) > 5 else "")
             details_groups.append(f"{pid}: {preview}")
 
@@ -1069,6 +1334,9 @@ def _merge_status_keep_runtime(old: Dict[str, Any], skel: Dict[str, Any]) -> Dic
             print(f"[STATUS] pruned groups (more): {len(details_groups) - 10} pid-lines omitted")
 
     return new_out
+
+
+
 
 
 def _status_autofix_merge() -> None:
