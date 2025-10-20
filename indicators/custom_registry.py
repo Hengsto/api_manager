@@ -56,12 +56,28 @@ CUSTOMS: Dict[str, Dict[str, Any]] = {
 }
 
 def _merge_unspecified(dest: Dict[str, Any], extras: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge remaining params into the ``unspecified`` bucket.
+
+    ``extras`` may already contain an ``"unspecified"`` key (for example wenn
+    Basis-Indikatoren zusätzliche Parameter liefern). In diesem Fall wollen wir
+    die inneren Keys nicht erneut unter ``"unspecified"`` verschachteln,
+    sondern direkt übernehmen. Anderenfalls würden wir Strukturen wie
+    ``{"unspecified": {"unspecified": {...}}}`` erzeugen, die der Upstream
+    nicht versteht.
+    """
+
     u = dest.get("unspecified")
     if not isinstance(u, dict):
         u = {}
+
     for k, v in extras.items():
-        if k not in u:
+        if k == "unspecified" and isinstance(v, dict):
+            for inner_key, inner_val in v.items():
+                if inner_key not in u:
+                    u[inner_key] = inner_val
+        elif k not in u:
             u[k] = v
+
     dest["unspecified"] = u
     return dest
 
