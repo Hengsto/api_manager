@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import config as cfg
 
-# ── Sicherstellen, dass Projektpfade importierbar sind ───────────────────────
+# ── sys.path primen ──────────────────────────────────────────────────────────
 try:
     _cwd = str(Path.cwd().resolve())
     _here = str(Path(__file__).resolve().parent)
@@ -66,18 +66,15 @@ def _import_registry_from_file(file_path: str):
         return None
 
 try:
-    # 1) Paket-Variante: api.registry_api
     from api.registry_api import app as registry_app  # type: ignore
     print("[DEBUG] registry_api gefunden (api.registry_api) → /registry wird gemountet.")
 except Exception as e1:
     _import_errs.append(f"api.registry_api -> {e1}")
     try:
-        # 2) Root-Modul-Variante: registry_api
         from registry_api import app as registry_app  # type: ignore
         print("[DEBUG] registry_api gefunden (registry_api) → /registry wird gemountet.")
     except Exception as e2:
         _import_errs.append(f"registry_api -> {e2}")
-        # 3) Datei-Variante per ENV: REGISTRY_API_FILE
         _reg_file = os.getenv("REGISTRY_API_FILE", "").strip()
         if _reg_file:
             registry_app = _import_registry_from_file(_reg_file)
@@ -86,11 +83,19 @@ except Exception as e1:
             for _line in _import_errs:
                 print("   ↳", _line)
 
-# ── Notifier-Worker (Dateiwächter & Evaluator) ──────────────────────────────
+# ── Indicators-Proxy als ROUTER (keine Pfadänderung) ────────────────────────
+ind_router = None
+try:
+    # WICHTIG: indicators_api MUSS einen APIRouter namens `router` exportieren
+    from api.indicators_api import router as ind_router  # type: ignore
+    print("[DEBUG] indicators_api Router gefunden → Routen werden 1:1 eingebunden (kein Prefix).")
+except Exception as e:
+    print(f"[DEBUG] kein indicators_api Router gefunden (optional). {e}")
+
+# ── Notifier-Worker ─────────────────────────────────────────────────────────
 from notifier.watch_profiles import run as watch_profiles_run
 from notifier.evaluator import run_check as evaluator_run_check
 from notifier.alarm_checker import run_alarm_checker
-
 
 def _start_profile_watcher_if_enabled() -> None:
     enabled = str(getattr(cfg, "ENABLE_PROFILE_WATCH", os.getenv("ENABLE_PROFILE_WATCH", "0"))).lower() in ("1", "true", "yes", "on")
@@ -102,14 +107,12 @@ def _start_profile_watcher_if_enabled() -> None:
     t = threading.Thread(target=watch_profiles_run, kwargs={"interval_sec": interval, "path_override": path}, daemon=True)
     t.start()
 
-
 def _start_evaluator_loop_if_enabled() -> None:
     enabled = str(getattr(cfg, "ENABLE_EVALUATOR", os.getenv("ENABLE_EVALUATOR", "0"))).lower() in ("1", "true", "yes", "on")
     interval = float(getattr(cfg, "EVALUATOR_INTERVAL_SEC", os.getenv("EVALUATOR_INTERVAL_SEC", "60")))
     print(f"[EVAL] enabled={enabled} interval={interval}s")
     if not enabled:
         return
-
     def _loop():
         print("[EVAL] Worker gestartet.")
         while True:
@@ -124,25 +127,19 @@ def _start_evaluator_loop_if_enabled() -> None:
             except Exception as e:
                 print(f"[EVAL] Loop-Fehler: {e}")
             time.sleep(max(1.0, float(interval)))
-
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
 
-
-# ── Utility: Debug-Pfade ausgeben (wie in deinem Log) ───────────────────────
+# ── Utility ─────────────────────────────────────────────────────────────────
 def _print_debug_paths() -> None:
     try:
         profiles_path = Path(getattr(cfg, "PROFILES_NOTIFIER"))
         alarms_path = Path(getattr(cfg, "ALARMS_NOTIFIER"))
         print(f"[DEBUG] Profiles path: {profiles_path}")
         print(f"[DEBUG] Alarms   path: {alarms_path}")
-
-        # Warnung, falls im Projektbaum (Hot-Reload-Risiko)
         cwd = Path.cwd().resolve()
         if str(profiles_path.resolve()).startswith(str(cwd)) or str(alarms_path.resolve()).startswith(str(cwd)):
             print("⚠️  WARN: JSONs liegen im Projektbaum → Hot-Reload-Risiko. Lege sie besser außerhalb ab.")
-
-        # Externes Lock-Verzeichnis anzeigen / setzen (optional)
         lock_dir = getattr(cfg, "LOCK_DIR", None) or Path(tempfile.gettempdir()) / "notifier_locks"
         Path(lock_dir).mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("NOTIFIER_LOCK_DIR", str(lock_dir))
@@ -150,16 +147,7 @@ def _print_debug_paths() -> None:
     except Exception as e:
         print(f"[DEBUG] Pfad-Debugging fehlgeschlagen: {e}")
 
-
-# ── Port-Resolver (vorhanden; aktuell nicht mehr für Start verwendet) ───────
 def _resolve_port(default: int = 8099) -> int:
-    """
-    Auswahl-Logik:
-      1) NOTIFIER_ENDPOINT (Port aus URL, sonst 80/443 je Scheme)
-      2) REGISTRY_ENDPOINT (Port aus URL, sonst 80/443 je Scheme)
-      3) PORT (ENV)
-      4) default
-    """
     try:
         u = urlparse(getattr(cfg, "NOTIFIER_ENDPOINT", os.getenv("NOTIFIER_ENDPOINT", "")))
         if u.scheme:
@@ -171,7 +159,6 @@ def _resolve_port(default: int = 8099) -> int:
                 return 443
     except Exception:
         pass
-
     try:
         u = urlparse(os.getenv("REGISTRY_ENDPOINT", ""))
         if u.scheme:
@@ -183,28 +170,24 @@ def _resolve_port(default: int = 8099) -> int:
                 return 443
     except Exception:
         pass
-
     try:
         return int(os.getenv("PORT", default))
     except Exception:
         return default
 
-
-# ── CORS-Setup (zusammengeführt, global für diese App) ──────────────────────
 def _compute_cors_origins() -> list[str]:
     raw = (
         os.getenv("NOTIFIER_CORS_ORIGINS")
         or os.getenv("REGISTRY_CORS_ORIGINS")
+        or os.getenv("IND_PROXY_CORS_ORIGINS")
         or "*"
     )
     if raw.strip() == "*":
         return ["*"]
     return [o.strip() for o in raw.split(",") if o.strip()]
 
-
 def _apply_cors(app: FastAPI) -> None:
     allow = _compute_cors_origins()
-    # Starlette-Constraint: allow_credentials=False wenn "*" benutzt wird
     allow_credentials = not (len(allow) == 1 and allow[0] == "*")
     app.add_middleware(
         CORSMiddleware,
@@ -215,38 +198,42 @@ def _apply_cors(app: FastAPI) -> None:
     )
     print(f"[DEBUG] CORS allow_origins={allow} allow_credentials={allow_credentials}")
 
-
 # ── FastAPI App ─────────────────────────────────────────────────────────────
+from notifier.watch_profiles import run as watch_profiles_run  # noqa: E402 (falls mypy)
+from notifier.evaluator import run_check as evaluator_run_check  # noqa: E402
+from notifier.alarm_checker import run_alarm_checker  # noqa: E402
+
+from pathlib import Path  # nach oben gezogen, aber safe erneut
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Debug-Ausgaben & Worker starten
     _print_debug_paths()
     _start_profile_watcher_if_enabled()
     _start_evaluator_loop_if_enabled()
     yield
-    print("[DEBUG] Notifier/Registry API wird heruntergefahren.")
+    print("[DEBUG] Unified API wird heruntergefahren.")
 
-
-app = FastAPI(title="Unified API (Notifier + Registry)", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Unified API (Notifier + Registry + Indicators Proxy)", version="1.1.1", lifespan=lifespan)
 _apply_cors(app)
 
 # Registry-Subapp mounten (wenn vorhanden)
 if registry_app:
     app.mount("/registry", registry_app)
     print("[DEBUG] Registry unter /registry gemountet.")
-    # Routen der Subapp kurz listen
     try:
         reg_paths = [getattr(r, "path", str(r)) for r in getattr(registry_app, "routes", [])]
-        _n = len(reg_paths)
-        _preview = reg_paths[:20]
-        print(f"[DEBUG] Registry routes (n={_n}):", _preview, "…" if _n > 20 else "")
+        print(f"[DEBUG] Registry routes (n={len(reg_paths)}):", reg_paths[:20], "…" if len(reg_paths) > 20 else "")
     except Exception as e:
         print("[DEBUG] Konnte Registry-Routen nicht auflisten:", e)
 else:
-    print("[DEBUG] Registry NICHT gemountet (kein registry_api importierbar). Hints:")
-    print("   - Liegt deine Datei als api/registry_api.py (mit __init__.py im api/)?")
-    print("   - Oder als registry_api.py neben main.py?")
-    print("   - Alternativ ENV REGISTRY_API_FILE auf den Pfad zur Datei setzen.")
+    print("[DEBUG] Registry NICHT gemountet.")
+
+# Indicators-Proxy-Router *ohne* Prefix einhängen → Pfade bleiben gleich
+if ind_router:
+    app.include_router(ind_router)
+    print("[DEBUG] Indicators-Proxy Router eingebunden (kein Prefix). Pfade bleiben identisch.")
+else:
+    print("[DEBUG] Indicators-Proxy NICHT eingebunden (Router fehlt).")
 
 # Notifier-/Alarms-Router einhängen (wenn vorhanden)
 if notifier_router:
@@ -257,13 +244,12 @@ if alarms_router:
 # ── Endpoints ───────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    has_reg = registry_app is not None
     return {
         "ok": True,
-        "see": ["/health"] + (["/registry/health"] if has_reg else []),
-        "registry_mounted": has_reg,
+        "see": ["/health", "/customs", "/custom", "/indicator", "/signal", "/registry/health"],
+        "registry_mounted": registry_app is not None,
+        "indicators_proxy_attached": ind_router is not None,
     }
-
 
 @app.get("/health")
 def health():
@@ -272,13 +258,12 @@ def health():
         "notifier_router": notifier_router is not None,
         "alarms_router": alarms_router is not None,
         "registry_mounted": registry_app is not None,
+        "indicators_proxy_attached": ind_router is not None,
         "time": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
     }
 
-
 if __name__ == "__main__":
     host = getattr(cfg, "MAIN_IP", os.getenv("MAIN_IP", "127.0.0.1"))
-    # Ein-Port-Setup: bevorzugt PORT, dann NOTIFIER_PORT, Default 8098
     port = int(os.getenv("PORT", os.getenv("NOTIFIER_PORT", "8098")))
     print(f"[DEBUG] uvicorn.run host={host} port={port} (ENV PORT/NOTIFIER_PORT kann überschreiben)")
     uvicorn.run("main:app", host=host, port=port, reload=False, log_level="info")
