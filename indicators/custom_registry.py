@@ -1,88 +1,101 @@
+# indicators/custom_registry.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 DEBUG = True
 
 """
-Lightweight Registry NUR fürs Param-Shaping & UI-Metadaten im Proxy.
-- Keine Validierung/Casting (macht die price_api).
-- 'display_name' für die UI.
-- 'summary' optional für Tooltips.
-- 'required'/'optional' steuern das Shaping (oben halten vs. in 'unspecified').
+Lightweight Registry für:
+- UI/Metadaten (display_name, summary, outputs, visibility)
+- Param-Shaping (required/optional -> 'unspecified')
+- Lokalen Fallback-Dispatcher: module + fn (dyn. import im Proxy)
+WICHTIG: Keine Imports der Indicator-Module hier (keine harte Kopplung / kein Startup-Overhead)!
 """
 
 CUSTOMS: Dict[str, Dict[str, Any]] = {
-    "slope": {
-        "name": "slope",
-        "display_name": "Slope (auf Basis)",
-        "summary": "Steigung einer Basisreihe (z. B. RSI/MACD) über N Schritte.",
-        "required": ["base", "window"],
-        "optional": ["input"],        # alias 'output' wird -> 'input' gemappt
-        "outputs": ["slope"],
-        "visibility": ["notifier", "screener"],
-        "sort_order": 30,
-    },
-    "change": {
-        "name": "change",
-        "display_name": "Change (vs. Timestamp)",
-        "summary": "Änderung einer Basisreihe seit fixem Zeitpunkt (absolut oder prozentual).",
-        "required": ["base", "type"],
-        "optional": ["input", "pct_scale", "timestamp"],
-        "outputs": ["change"],
-        "visibility": ["notifier", "screener"],
-        "sort_order": 40,
-    },
     "price": {
         "name": "price",
         "display_name": "Price (Quelle)",
         "summary": "Gibt die gewählte Preisquelle als Serie zurück (Close/High/Low/Open).",
         "required": ["source"],
-        "optional": [],
+        "optional": ["fillna", "dropna", "ensure_monotonic", "dedupe", "tz_naive"],
         "outputs": ["price"],
         "visibility": ["notifier", "screener", "source"],
         "sort_order": 10,
+        "module": "indicators.price",
+        "fn": "price",   # Signatur: price(df, **kwargs) -> (df, used, out_cols)
     },
     "value": {
         "name": "value",
         "display_name": "Konstanter Wert",
         "summary": "Konstante Zahl als Serie (für Vergleiche/Schwellen).",
         "required": ["value"],
-        "optional": [],
+        "optional": ["count_hint"],
         "outputs": ["value"],
         "visibility": ["notifier", "screener", "input"],
         "sort_order": 20,
+        "module": "indicators.value",
+        "fn": "compute", # Signatur: compute(df, params_dict) -> (df, used, out_cols)
+    },
+    "slope": {
+        "name": "slope",
+        "display_name": "Slope (auf Basis)",
+        "summary": "Steigung einer Basisreihe (z. B. RSI/MACD) über N Schritte.",
+        "required": ["base", "window"],
+        "optional": ["input", "base_params", "unspecified"],
+        "outputs": ["slope"],
+        "visibility": ["notifier", "screener"],
+        "sort_order": 30,
+        "module": "indicators.slope",
+        "fn": "slope",   # Signatur: slope(df, *, base, window, input=None, base_params=None, unspecified=None)
+    },
+    "change": {
+        "name": "change",
+        "display_name": "Change (vs. Timestamp)",
+        "summary": "Änderung einer Basisreihe seit fixem Zeitpunkt (absolut oder prozentual).",
+        "required": ["base", "type", "timestamp"],
+        "optional": ["input", "pct_scale", "base_params", "unspecified"],
+        "outputs": ["change"],
+        "visibility": ["notifier", "screener"],
+        "sort_order": 40,
+        "module": "indicators.change",
+        "fn": "change",  # Signatur: change(df, *, base, input=None, type='percentage', pct_scale=100.0, timestamp=..., base_params=None, unspecified=None)
     },
 }
 
 def _merge_unspecified(dest: Dict[str, Any], extras: Dict[str, Any]) -> Dict[str, Any]:
+    """Mergt übrige Params in 'unspecified' (flach halten, nicht verschachteln)."""
     u = dest.get("unspecified")
     if not isinstance(u, dict):
         u = {}
     for k, v in extras.items():
-        if k not in u:
+        if k == "unspecified" and isinstance(v, dict):
+            for inner_key, inner_val in v.items():
+                if inner_key not in u:
+                    u[inner_key] = inner_val
+        elif k not in u:
             u[k] = v
     dest["unspecified"] = u
     return dest
 
 def normalize_params_for_proxy(name: str, raw: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Reines Shaping für die price_api:
-      - 'output' -> 'input'
+    Reines Shaping:
+      - UI-Alias 'output' -> 'input'
       - bekannte required/optional Keys oben behalten
-      - alle übrigen Keys in 'unspecified' mergen (so kommen z. B. Base-Parameter an)
-    Keine Validierung, kein Casting.
+      - übrige Keys in 'unspecified'
+    Keine Typvalidierung/-konvertierung; das macht Upstream oder lokale Compute-Fns.
     """
     lname = (name or "").strip().lower()
     params = dict(raw or {})
 
-    # UI-Alias
+    # Alias
     if "input" not in params and "output" in params and params["output"] not in (None, ""):
         params["input"] = params.pop("output")
 
     spec = CUSTOMS.get(lname)
     if not spec:
-        # Unbekannt: 1:1 durchreichen (Alias bereits angewendet)
         return params
 
     required = set(spec.get("required", []))
@@ -113,9 +126,7 @@ def list_customs_for_ui(
     order_by: str = "sort_order",
     desc: bool = False,
 ) -> List[Dict[str, Any]]:
-    """
-    Liefert UI-Metadaten (inkl. display_name) zur Anzeige/Selektion.
-    """
+    """UI-Metadaten liefern (inkl. display_name, outputs)."""
     rows: List[Dict[str, Any]] = []
     vset = set([v.lower() for v in (visibility or [])])
 
@@ -137,3 +148,16 @@ def list_customs_for_ui(
     key = order_by if order_by in {"name", "display_name", "sort_order"} else "sort_order"
     rows.sort(key=lambda r: (r[key], r["name"]) if key == "sort_order" else r[key], reverse=desc)
     return rows
+
+def get_custom_exec(name: str) -> Tuple[str, str]:
+    """
+    Für lokalen Dispatcher: liefert (module, fn) zu einem Custom.
+    Raise KeyError wenn unbekannt / unvollständig.
+    """
+    lname = (name or "").strip().lower()
+    spec = CUSTOMS[lname]  # KeyError gewollt → sauberer 404 im Proxy
+    module = spec.get("module")
+    fn = spec.get("fn")
+    if not module or not fn:
+        raise KeyError(f"Custom '{lname}' hat keine ausführbare Definition (module/fn fehlen).")
+    return module, fn

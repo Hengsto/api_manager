@@ -1,133 +1,107 @@
+# indicators/price.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import Dict, List, Tuple, Optional, Union
-
+from typing import Dict, Any, Optional, List, Tuple
 import pandas as pd
 import numpy as np
+import json
 
-DEBUG = True  # per ENV/Config überschreibbar
+DEBUG = True
+
+SPEC: Dict[str, Any] = {
+    "name": "price",
+    "summary": "Gibt den Rohpreis (z. B. Close) des Basis-Datasets unverändert zurück.",
+    "required_params": {"source": "string"},
+    "default_params": {"source": "close"},
+    "outputs": ["price"],
+    "sort_order": 5,
+}
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def _ensure_dict(x: Any) -> Dict[str, Any]:
+    if isinstance(x, dict):
+        return dict(x)
+    if isinstance(x, str):
+        try:
+            j = json.loads(x)
+            return j if isinstance(j, dict) else {}
+        except Exception:
+            return {}
+    try:
+        return dict(x or {})
+    except Exception:
+        return {}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main Logic
+# ──────────────────────────────────────────────────────────────────────────────
 def price(
     df: pd.DataFrame,
     source: str = "close",
-    *,
-    fillna: Optional[Union[str, float, int]] = None,  # "ffill"|"bfill"|zahl|None
-    dropna: bool = True,
-    ensure_monotonic: bool = True,
-    dedupe: Optional[str] = "keep_last",     # None|"keep_first"|"keep_last"
-    tz_naive: bool = True,                   # TZ entfernen, falls vorhanden
-) -> Tuple[pd.DataFrame, Dict, List[str]]:
+    **kwargs: Any,
+) -> Tuple[pd.DataFrame, List[str], List[str]]:
     """
-    Liefert die angeforderte Preisquelle als Serie 'price'.
-
-    Erwartet df mit:
-      - 'Timestamp'
-      - und eine der Spalten: 'Open','High','Low','Close'
-
-    Parameter:
-      - source: case-insensitive; erlaubt NUR:
-          Basis:  close/open/high/low  (auch c/o/h/l)
-      - fillna:  "ffill" | "bfill" | numerischer Wert | None
-      - dropna:  NaN-Zeilen verwerfen (nach fillna)
-      - ensure_monotonic: Zeitachse sortieren
-      - dedupe:  Duplikate auf 'Timestamp' entfernen (None|keep_first|keep_last)
-      - tz_naive: TZ-Information aus Timestamp entfernen
-
-    Rückgabe:
-      out_df:    ['Timestamp','price'] (price=float32)
-      used_params: {'source': <norm>, 'derived': False, 'fillna':..., 'dropna':..., ...}
-      value_cols: ['price']
+    Gibt 1:1 die gewählte Preisspalte aus dem Eingabe-DataFrame zurück.
+    Erfüllt Proxy-Anforderung: 'Timestamp' MUSS als Spalte enthalten sein.
+    Unterstützt sowohl 'close' als auch 'Close' usw.
     """
-    # --- Vorbedingungen ---
-    if "Timestamp" not in df.columns:
-        raise ValueError("price: 'Timestamp' fehlt im DataFrame.")
+    if df is None or df.empty:
+        if DEBUG:
+            print("[PRICE] Eingabe-DataFrame ist leer oder None.")
+        # Proxy erwartet 'Timestamp' -> leeres, aber korrektes Schema liefern
+        return pd.DataFrame(columns=["Timestamp", "price"]), ["source"], ["price"]
 
-    # --- Timestamp aufbereiten ---
-    ts = pd.to_datetime(df["Timestamp"], errors="coerce")
-    if tz_naive:
-        # Falls mit TZ, in naive konvertieren (lokal/UTC-agnostisch, konsistent intern)
-        if getattr(ts.dt, "tz", None) is not None:
-            ts = ts.dt.tz_convert(None)
+    # Mappe 'close'/'Close' etc. robust auf vorhandene Spalten
+    cols = {c.lower(): c for c in df.columns}
+    # bevorzugte Schreibweisen
+    candidates = [source, source.lower(), source.capitalize(), source.title()]
+    resolved = None
+    for cand in candidates:
+        key = cand.lower()
+        if key in cols:
+            resolved = cols[key]
+            break
+        if cand in df.columns:
+            resolved = cand
+            break
+
+    if resolved is None:
+        raise ValueError(f"[PRICE] Spalte '{source}' nicht im DataFrame vorhanden. Spalten: {list(df.columns)}")
+
+    # 'Timestamp' als Spalte erzwingen
+    if "Timestamp" in df.columns:
+        ts = df["Timestamp"]
+    else:
+        # Falls Timestamp im Index steckt: übernehmen
+        ts = df.index
+    out = pd.DataFrame({"Timestamp": ts, "price": pd.to_numeric(df[resolved], errors="coerce")}, copy=False)
 
     if DEBUG:
-        print(f"[price] START source={source} rows={len(df)} tz_naive={tz_naive}")
+        try:
+            n = len(out)
+            n_nan = out["price"].isna().sum()
+            print(f"[PRICE] Quelle='{resolved}' (req='{source}'), len={n}, NaN={n_nan}")
+        except Exception as e:
+            print(f"[PRICE] debug-failed: {type(e).__name__}: {e}")
 
-    # --- Source/Alias normalisieren (NUR Basisquellen) ---
-    src_raw = str(source).strip().lower()
-    base_map = {
-        "c": "Close", "close": "Close",
-        "o": "Open",  "open":  "Open",
-        "h": "High",  "high":  "High",
-        "l": "Low",   "low":   "Low",
-    }
+    return out, ["source"], ["price"]
 
-    if src_raw not in base_map:
-        allowed = ["close", "open", "high", "low", "c", "o", "h", "l"]
-        raise ValueError(f"price: unbekannte source='{source}'. Erlaubt: {allowed}")
 
-    src_col = base_map[src_raw]
-    if src_col not in df.columns:
-        raise ValueError(f"price: Spalte '{src_col}' fehlt im DataFrame.")
-
-    series = pd.to_numeric(df[src_col], errors="coerce").astype("float64")
-    if DEBUG:
-        print(f"[price] using base column '{src_col}'")
-
-    # --- FillNA optional ---
-    if fillna is not None:
-        if isinstance(fillna, str):
-            f = fillna.lower().strip()
-            if f == "ffill":
-                series = series.ffill()
-            elif f == "bfill":
-                series = series.bfill()
-            else:
-                raise ValueError("price: fillna string muss 'ffill' oder 'bfill' sein")
-            if DEBUG:
-                print(f"[price] applied fillna='{f}'")
-        elif isinstance(fillna, (int, float)) and not isinstance(fillna, bool):
-            series = series.fillna(float(fillna))
-            if DEBUG:
-                print(f"[price] applied fillna numeric={fillna}")
-        else:
-            raise ValueError("price: fillna muss 'ffill'|'bfill'|zahl|None sein")
-
-    out = pd.DataFrame({"Timestamp": ts, "price": series.astype("float32")})
-
-    # --- Drop NaNs ---
-    if dropna:
-        before = len(out)
-        out = out.dropna(subset=["Timestamp", "price"])
-        if DEBUG:
-            print(f"[price] dropna removed {before - len(out)} rows")
-
-    # --- Sort/Monotonic ---
-    if ensure_monotonic and not out["Timestamp"].is_monotonic_increasing:
-        out = out.sort_values("Timestamp", kind="stable")
-        if DEBUG:
-            print("[price] sorted by Timestamp (monotonic increasing)")
-
-    # --- Dedupe ---
-    if dedupe:
-        before = len(out)
-        out = out.drop_duplicates(subset=["Timestamp"], keep=("first" if dedupe == "keep_first" else "last"))
-        if DEBUG:
-            print(f"[price] dedup '{dedupe}' removed {before - len(out)} rows")
-
-    used: Dict = {
-        "source": src_col,
-        "derived": False,  # absichtlich immer False – keine Derived-Quellen mehr
-        "fillna": fillna,
-        "dropna": bool(dropna),
-        "ensure_monotonic": bool(ensure_monotonic),
-        "dedupe": dedupe,
-        "tz_naive": bool(tz_naive),
-    }
-
-    if DEBUG:
-        head = out.head(3).to_dict("records")
-        tail = out.tail(3).to_dict("records")
-        print(f"[price] DONE rows={len(out)} head={head} tail={tail}")
-
-    return out, used, ["price"]
+# ──────────────────────────────────────────────────────────────────────────────
+# Debug Run
+# ──────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import pandas as pd
+    test = pd.DataFrame({
+        "open": [10, 11, 12],
+        "high": [11, 12, 13],
+        "low": [9, 10, 11],
+        "close": [10.5, 11.5, 12.5],
+    })
+    out, used, cols = price(test, source="close")
+    print(out)
+    print("used:", used, "cols:", cols)
