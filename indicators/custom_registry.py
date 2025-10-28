@@ -16,27 +16,27 @@ WICHTIG: Keine Imports der Indicator-Module hier (keine harte Kopplung / kein St
 CUSTOMS: Dict[str, Dict[str, Any]] = {
     "price": {
         "name": "price",
-        "display_name": "Price (Quelle)",
-        "summary": "Gibt die gewählte Preisquelle als Serie zurück (Close/High/Low/Open).",
+        "display_name": "Price (Rohwert)",
+        "summary": "Gibt den Rohpreis (z. B. Close) des Basis-Datasets unverändert zurück.",
         "required": ["source"],
-        "optional": ["fillna", "dropna", "ensure_monotonic", "dedupe", "tz_naive"],
+        "optional": ["unspecified"],
         "outputs": ["price"],
-        "visibility": ["notifier", "screener", "source"],
-        "sort_order": 10,
+        "visibility": ["notifier", "screener"],
+        "sort_order": 5,
         "module": "indicators.price",
-        "fn": "price",   # Signatur: price(df, **kwargs) -> (df, used, out_cols)
+        "fn": "price",  # Signatur: price(df, *, source='close', **kwargs)
     },
-    "value": {
-        "name": "value",
-        "display_name": "Konstanter Wert",
-        "summary": "Konstante Zahl als Serie (für Vergleiche/Schwellen).",
-        "required": ["value"],
-        "optional": ["count_hint"],
-        "outputs": ["value"],
-        "visibility": ["notifier", "screener", "input"],
-        "sort_order": 20,
-        "module": "indicators.value",
-        "fn": "compute", # Signatur: compute(df, params_dict) -> (df, used, out_cols)
+    "volume": {
+        "name": "volume",
+        "display_name": "Volume (Rohwert)",
+        "summary": "Gibt das Volumen (z. B. 'volume') des Basis-Datasets unverändert zurück.",
+        "required": ["source"],
+        "optional": ["unspecified"],
+        "outputs": ["volume"],
+        "visibility": ["notifier", "screener"],
+        "sort_order": 6,
+        "module": "indicators.volume",
+        "fn": "volume",  # Signatur: volume(df, *, source='volume', **kwargs)
     },
     "slope": {
         "name": "slope",
@@ -63,6 +63,7 @@ CUSTOMS: Dict[str, Dict[str, Any]] = {
         "fn": "change",  # Signatur: change(df, *, base, input=None, type='percentage', pct_scale=100.0, timestamp=..., base_params=None, unspecified=None)
     },
 }
+
 
 def _merge_unspecified(dest: Dict[str, Any], extras: Dict[str, Any]) -> Dict[str, Any]:
     """Mergt übrige Params in 'unspecified' (flach halten, nicht verschachteln)."""
