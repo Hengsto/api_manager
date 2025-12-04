@@ -28,8 +28,8 @@ COOLDOWN_SEC: int = int(os.getenv("ALARM_COOLDOWN_SEC", "300"))  # via ENV über
 DEBUG = os.getenv("ALARM_DEBUG", "1").strip() in ("1","true","yes","on")
 BYPASS_COOLDOWN: bool = os.getenv("ALARM_BYPASS_COOLDOWN", "0").strip() in ("1","true","yes","on")
 
-from config import PROFILES_NOTIFIER  # add near the imports
-STATE_FILE = (Path(PROFILES_NOTIFIER).resolve().parent / "alarm_checker_state.json")
+from config import NOTIFIER_PROFILE_DIR  # add near the imports
+STATE_FILE = (Path(NOTIFIER_PROFILE_DIR).resolve().parent / "alarm_checker_state.json")
 STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
