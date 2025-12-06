@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  registry:
+    container_name: registry_service
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # ENV-Variablen: .env optional + direkt in compose
+    env_file:
+      - .env
+    environment:
+      # Falls in .env nicht gesetzt, werden diese hier genutzt
+      MAIN_IP: "0.0.0.0"
+      REGISTRY_PORT: "8098"
+      # Erlaubte Origins für dein Dashboard / andere Clients
+      # Passe diese Liste an deine echten Hosts an
+      REGISTRY_CORS_ORIGINS: "http://localhost:8050,http://127.0.0.1:8050"
+      # Optional: falls du irgendwo mit REGISTRY_ENDPOINT arbeitest
+      # REGISTRY_ENDPOINT: "http://registry:8098"
+    volumes:
+      # Persistente Datenbank / Files des Registry-Managers
+      # Passt zum üblichen config-Setup mit BASE_DIR / "data" / "registry_manager"
+      - ./data/registry_manager:/app/data/registry_manager
+    ports:
+      # HostPort:ContainerPort
+      # außen 8098, innen 8098 (wie REGISTRY_PORT)
+      - "8098:8098"
+    restart: unless-stopped

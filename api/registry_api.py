@@ -1,4 +1,4 @@
-# registry_api.py
+# api/registry_api.py
 # -*- coding: utf-8 -*-
 """
 Registry/GroupManager API (SQLite, SQLAlchemy, FastAPI)
@@ -61,9 +61,9 @@ log = logging.getLogger("registry")
 from pathlib import Path
 import config as cfg
 
-Path(cfg.REGISTRY_DB).parent.mkdir(parents=True, exist_ok=True)
+Path(cfg.REGISTRY_MANAGER_DB).parent.mkdir(parents=True, exist_ok=True)
 
-DB_URL = os.getenv("REGISTRY_DB_URL", f"sqlite:///{cfg.REGISTRY_DB}")
+DB_URL = os.getenv("REGISTRY_DB_URL", f"sqlite:///{cfg.REGISTRY_MANAGER_DB}")
 IS_SQLITE = DB_URL.startswith("sqlite")
 
 engine = create_engine(
@@ -1472,7 +1472,7 @@ def health():
     return {
         "ok": True,
         "db_url": DB_URL,
-        "db_path": cfg.REGISTRY_DB if IS_SQLITE else None,
+        "db_path": cfg.REGISTRY_MANAGER_DB if IS_SQLITE else None,
         "engine": "sqlite-wal" if IS_SQLITE else "sqlalchemy",
         "time": datetime.utcnow().isoformat() + "Z",
         "version": "1.3.0",
