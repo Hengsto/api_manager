@@ -284,6 +284,28 @@ def save_json_atomic(path: Any, data: Any) -> None:
     log.info("save_json_atomic: %s bytes=%d", p, len(payload))
 
 
+# ─────────────────────────────────────────────────────────────
+# Backwards-Compatible Wrapper
+# ─────────────────────────────────────────────────────────────
+
+def save_json(path: Any, data: Any) -> None:
+    """Alias für save_json_atomic für bestehenden Code."""
+
+    save_json_atomic(path, data)
+
+
+def load_json_any(path: Any, fallback: Any = None) -> Any:
+    """Alias für load_json, akzeptiert beliebige Fallback-Typen."""
+
+    return load_json(path, fallback)
+
+
+def save_json_any(path: Any, data: Any) -> None:
+    """Alias für save_json_atomic für beliebige JSON-Daten."""
+
+    save_json_atomic(path, data)
+
+
 def load_json_list(path: Any, fallback: List[Any] | None = None) -> List[Any]:
     """
     Lädt ein JSON-Array. Gibt immer eine Liste zurück.
