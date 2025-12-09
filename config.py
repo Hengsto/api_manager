@@ -10,10 +10,23 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Notifier-Profile
-NOTIFIER_PROFILE_DIR = DATA_DIR / "notifier" / "profiles"
+
+# Notifier-Daten (alles unter data/notifier)
+NOTIFIER_DATA_DIR = DATA_DIR / "notifier"
+NOTIFIER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Profile-Verzeichnis (für spätere Files, Backups etc.)
+NOTIFIER_PROFILE_DIR = NOTIFIER_DATA_DIR / "profiles"
 NOTIFIER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Haupt-JSON-Dateien des Notifier-Stacks
+PROFILES_NOTIFIER  = str(NOTIFIER_DATA_DIR / "notifier_profiles.json")
+STATUS_NOTIFIER    = str(NOTIFIER_DATA_DIR / "notifier_status.json")
+OVERRIDES_NOTIFIER = str(NOTIFIER_DATA_DIR / "notifier_overrides.json")
+COMMANDS_NOTIFIER  = str(NOTIFIER_DATA_DIR / "notifier_commands.json")
+ALARMS_NOTIFIER    = str(NOTIFIER_DATA_DIR / "notifier_alarms.json")
 
 # Registry Manager (Asset- & Group-Registry)
 REGISTRY_MANAGER_DATA_DIR = DATA_DIR / "registry_manager"
