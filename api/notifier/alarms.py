@@ -84,6 +84,9 @@ def load_alarms() -> List[dict]:
     Stellt Default-Felder & Typen sicher.
     """
     data = load_json(ALARMS_NOTIFIER, [])
+    if not isinstance(data, list):
+        log.warning("load_alarms: expected list, got %s → fallback", type(data).__name__)
+        data = []
     out: List[dict] = []
 
     for a in data or []:
@@ -156,6 +159,9 @@ def add_alarm_entry(alarm_payload: Dict[str, Any]) -> str:
     """
     items = load_alarms()
     payload = dict(alarm_payload)
+
+    ts_raw = str(payload.get("ts") or "").strip()
+    payload["ts"] = ts_raw or _now_iso()
 
     # matched normalisieren
     m = payload.get("matched", [])
