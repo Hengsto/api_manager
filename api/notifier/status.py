@@ -2,11 +2,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import json
 import logging
 from copy import deepcopy
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from config import STATUS_NOTIFIER
@@ -29,6 +27,20 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
 
 
+def _safe_strip(v: Any) -> str:
+    """
+    Robust: macht aus None/int/float/etc. einen sauberen String.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v.strip()
+    try:
+        return str(v).strip()
+    except Exception:
+        return ""
+
+
 def _label_only_conditions(group: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Erzeugt eine einfache, UI-taugliche Cond-Liste (ohne Werte) für den Status-Snapshot.
@@ -37,13 +49,14 @@ def _label_only_conditions(group: Dict[str, Any]) -> List[Dict[str, Any]]:
     for c in (group.get("conditions") or []):
         if not isinstance(c, dict):
             continue
-        left = (c.get("left") or "").strip() or "—"
-        right = (c.get("right") or "").strip()
+
+        left = _safe_strip(c.get("left")) or "—"
+        right = _safe_strip(c.get("right"))
 
         if not right:
-            rsym = (c.get("right_symbol") or "").strip()
-            rinv = (c.get("right_interval") or "").strip()
-            rout = (c.get("right_output") or "").strip()
+            rsym = _safe_strip(c.get("right_symbol"))
+            rinv = _safe_strip(c.get("right_interval"))
+            rout = _safe_strip(c.get("right_output"))
             if rsym:
                 parts = [rsym]
                 if rinv:
@@ -51,8 +64,9 @@ def _label_only_conditions(group: Dict[str, Any]) -> List[Dict[str, Any]]:
                 if rout:
                     parts.append(f":{rout}")
                 right = "".join(parts)
+
         right = right or "—"
-        op = (c.get("op") or "gt").strip().lower()
+        op = (_safe_strip(c.get("op")) or "gt").lower()
 
         out.append(
             {
@@ -127,7 +141,7 @@ def save_status_any(data: Dict[str, Any]) -> None:
 # Skeleton aus Profilen
 # ─────────────────────────────────────────────────────────────
 
-def build_status_skeleton_from_profiles(profiles: list[dict]) -> Dict[str, Any]:
+def build_status_skeleton_from_profiles(profiles: list[dict], debug_print: bool = True) -> Dict[str, Any]:
     """
     Baut aus einer Profil-Liste ein "leeres" Status-Skeleton:
     - Struktur/IDs/Groups/Conditions sind drin
@@ -147,6 +161,13 @@ def build_status_skeleton_from_profiles(profiles: list[dict]) -> Dict[str, Any]:
             if not gid:
                 continue
 
+            # deactivate_on-Logik an Sanitizer anpassen:
+            # - erst normalize
+            # - nur wenn auto_deactivate explizit gesetzt ist, davon ableiten
+            raw_deact = _normalize_deactivate_value(g.get("deactivate_on"))
+            if raw_deact is None and g.get("auto_deactivate") is not None:
+                raw_deact = "true" if bool(g.get("auto_deactivate")) else "always"
+
             g_entry = {
                 "name": g.get("name") or gid,
                 "group_active": bool(g.get("active", True)),
@@ -157,10 +178,7 @@ def build_status_skeleton_from_profiles(profiles: list[dict]) -> Dict[str, Any]:
                 "fresh": True,
                 "aggregate": {
                     "min_true_ticks": g.get("min_true_ticks"),
-                    "deactivate_on": (
-                        _normalize_deactivate_value(g.get("deactivate_on"))
-                        or ("true" if g.get("auto_deactivate") else "always")
-                    ),
+                    "deactivate_on": raw_deact,
                 },
                 "runtime": {
                     "true_ticks": None,
@@ -175,6 +193,9 @@ def build_status_skeleton_from_profiles(profiles: list[dict]) -> Dict[str, Any]:
                 # Für UI sichtbar
                 "symbols": list(g.get("symbols") or []),
                 "profiles": list(g.get("profiles") or []),
+                # zusätzliche Felder, die auch im Profil existieren
+                "single_mode": g.get("single_mode", "symbol"),
+                "min_tick": g.get("min_tick"),
             }
 
             gmap[gid] = g_entry
@@ -193,13 +214,20 @@ def build_status_skeleton_from_profiles(profiles: list[dict]) -> Dict[str, Any]:
         "profiles": profiles_map,
     }
 
-    try:
-        print(
-            f"[STATUS] skeleton built profiles={len(profiles_map)} "
-            f"groups={sum(len(v.get('groups', {})) for v in profiles_map.values())}"
-        )
-    except Exception:
-        pass
+    if debug_print:
+        try:
+            print(
+                f"[STATUS] skeleton built profiles={len(profiles_map)} "
+                f"groups={sum(len(v.get('groups', {})) for v in profiles_map.values())}"
+            )
+        except Exception:
+            pass
+
+    log.debug(
+        "skeleton built profiles=%d groups=%d",
+        len(profiles_map),
+        sum(len(v.get("groups", {})) for v in profiles_map.values()),
+    )
 
     return skeleton
 
@@ -217,8 +245,14 @@ def merge_status_keep_runtime(old: Dict[str, Any], skel: Dict[str, Any]) -> Dict
     old_profiles = old.get("profiles") if isinstance(old.get("profiles"), dict) else {}
     skel_profiles = skel.get("profiles") if isinstance(skel.get("profiles"), dict) else {}
 
+    # version robust (kann int oder str sein)
+    try:
+        version_int = int(old.get("version", 1))
+    except Exception:
+        version_int = 1
+
     new_out: Dict[str, Any] = {
-        "version": int(old.get("version", 1)) if isinstance(old.get("version"), int) else 1,
+        "version": version_int,
         "flavor": "notifier-api",
         "profiles": {},
     }
@@ -267,9 +301,7 @@ def merge_status_keep_runtime(old: Dict[str, Any], skel: Dict[str, Any]) -> Dict
                     "min_true_ticks": agg_s.get("min_true_ticks", agg_old.get("min_true_ticks")),
                     "deactivate_on": new_deactivate_on,
                 },
-                # Runtime unverändert beibehalten
                 "runtime": rt_old,
-                # Aktuelle Bedingungen aus dem Skeleton
                 "conditions": g_s.get("conditions", []),
                 "conditions_status": old_g.get("conditions_status", [])
                 if isinstance(old_g.get("conditions_status"), list)
@@ -322,20 +354,32 @@ def merge_status_keep_runtime(old: Dict[str, Any], skel: Dict[str, Any]) -> Dict
         len(pruned_pids),
         pruned_groups_total,
     )
-    print(f"[STATUS] merged pruned profiles={len(new_out['profiles'])}")
+    try:
+        print(f"[STATUS] merged pruned profiles={len(new_out['profiles'])}")
+    except Exception:
+        pass
     if pruned_pids:
-        print(
-            f"[STATUS] pruned profile IDs: {pruned_pids[:5]}"
-            f"{'...' if len(pruned_pids) > 5 else ''}"
-        )
+        try:
+            print(
+                f"[STATUS] pruned profile IDs: {pruned_pids[:5]}"
+                f"{'...' if len(pruned_pids) > 5 else ''}"
+            )
+        except Exception:
+            pass
     if pruned_groups_total:
         for line in details_groups[:10]:
-            print(f"[STATUS] pruned groups -> {line}")
+            try:
+                print(f"[STATUS] pruned groups -> {line}")
+            except Exception:
+                pass
         if len(details_groups) > 10:
-            print(
-                f"[STATUS] pruned groups (more): "
-                f"{len(details_groups) - 10} pid-lines omitted"
-            )
+            try:
+                print(
+                    f"[STATUS] pruned groups (more): "
+                    f"{len(details_groups) - 10} pid-lines omitted"
+                )
+            except Exception:
+                pass
 
     return new_out
 
@@ -357,9 +401,12 @@ def status_autofix_merge() -> None:
     save_status_any(merged)
     log.info(
         "Status auto-fix merge done. profiles_fp=%s",
-        merged.get("profiles_fp", "")[:8],
+        (merged.get("profiles_fp", "") or "")[:8],
     )
-    print(f"[STATUS] autofix done fp={merged.get('profiles_fp', '')[:8]}")
+    try:
+        print(f"[STATUS] autofix done fp={(merged.get('profiles_fp', '') or '')[:8]}")
+    except Exception:
+        pass
 
 
 # Legacy-Name für alten Code
@@ -380,7 +427,10 @@ def sync_status(profiles: Optional[list] = None) -> Dict[str, Any]:
     merged["profiles_fp"] = profiles_fingerprint(profiles)
     save_status_any(merged)
     log.info("status sync profiles=%d", len(merged.get("profiles", {})))
-    print(f"[STATUS] sync profiles={len(merged.get('profiles', {}))}")
+    try:
+        print(f"[STATUS] sync profiles={len(merged.get('profiles', {}))}")
+    except Exception:
+        pass
     return merged
 
 
@@ -393,6 +443,8 @@ def get_status_snapshot(force_fix: bool = False) -> Dict[str, Any]:
     snap = load_status_any()
     try:
         need_fix = bool(force_fix)
+        reason = "force_fix" if force_fix else ""
+
         profiles = load_profiles_normalized()
         skeleton = build_status_skeleton_from_profiles(profiles)
         fp = profiles_fingerprint(profiles)
@@ -400,16 +452,20 @@ def get_status_snapshot(force_fix: bool = False) -> Dict[str, Any]:
         if not need_fix:
             if not snap.get("profiles"):
                 need_fix = True
+                reason = reason or "empty_status"
             else:
                 if snap.get("profiles_fp", "") != fp:
                     need_fix = True
+                    reason = reason or "fp_mismatch"
                 else:
+                    # prüfen, ob Gruppen fehlen
                     for pid, p_s in (skeleton.get("profiles") or {}).items():
                         sp = (snap.get("profiles") or {}).get(pid, {})
                         s_groups = sp.get("groups") or {}
                         for gid in (p_s.get("groups") or {}).keys():
                             if gid not in s_groups:
                                 need_fix = True
+                                reason = reason or "missing_group"
                                 break
                         if need_fix:
                             break
@@ -419,13 +475,24 @@ def get_status_snapshot(force_fix: bool = False) -> Dict[str, Any]:
             merged["profiles_fp"] = fp
             save_status_any(merged)
             log.info(
-                "get_status_snapshot fixed profiles=%d",
+                "get_status_snapshot fixed profiles=%d reason=%s",
                 len(merged.get("profiles", {})),
+                reason,
             )
-            print(f"[STATUS] get fixed profiles={len(merged.get('profiles', {}))}")
+            try:
+                print(
+                    f"[STATUS] get fixed profiles={len(merged.get('profiles', {}))} "
+                    f"reason={reason}"
+                )
+            except Exception:
+                pass
             return merged
 
         log.info("get_status_snapshot ok (no fix)")
+        try:
+            print("[STATUS] get ok (no fix needed)")
+        except Exception:
+            pass
         return snap
     except Exception as e:
         log.exception("get_status_snapshot failed: %s", e)

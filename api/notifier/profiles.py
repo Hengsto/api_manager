@@ -115,7 +115,7 @@ def _extract_profile_id(token: str) -> str:
 def _split_symbols_and_profiles(values: Any) -> tuple[list[str], list[str]]:
     syms: list[str] = []
     profs: list[str] = []
-    if isinstance(values, list):
+    if isinstance(values, (list, tuple)):
         for raw in values:
             if not isinstance(raw, str):
                 continue
@@ -154,7 +154,11 @@ def _normalize_slope_params_dict(p: Dict[str, Any] | None) -> Dict[str, Any]:
     if not isinstance(p, dict):
         return {}
     out = dict(p)
-    bp = {k[3:]: v for k, v in p.items() if isinstance(k, str) and k.startswith("bp.") and v not in (None, "")}
+    bp = {
+        k[3:]: v
+        for k, v in p.items()
+        if isinstance(k, str) and k.startswith("bp.") and v not in (None, "")
+    }
     if bp:
         nested = dict(p.get("base_params") or {})
         nested.update(bp)
@@ -285,7 +289,11 @@ class GroupActivePatch(ApiModel):
 
 def _validate_group_strict(g: dict) -> None:
     # Nach unserem Mapping sollten hier keine Profile mehr liegen.
-    bad = [s for s in (g.get("symbols") or []) if _contains_profile_token(s) or _looks_like_profile_id(s)]
+    bad = [
+        s
+        for s in (g.get("symbols") or [])
+        if _contains_profile_token(s) or _looks_like_profile_id(s)
+    ]
     if bad:
         log.warning(
             "Group symbols still contain profile-like tokens (will be ignored): %s",
@@ -318,7 +326,9 @@ def _sanitize_condition(c: dict) -> dict:
     - normalisiert slope-Parameter
     """
     # lokale Regex, um Import-Kreise zu vermeiden
-    _uuid_re = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+    _uuid_re = re.compile(
+        r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    )
     _hex_id_re = re.compile(r"^[0-9a-fA-F]{6,16}$")
 
     def _looks_like_pid(x: object) -> bool:
@@ -398,7 +408,8 @@ def _sanitize_condition(c: dict) -> dict:
             f"left='{c.get('left')}' right='{c.get('right')}' "
             f"lsym='{c.get('left_symbol')}' rsym='{c.get('right_symbol')}' "
             f"lop='{c.get('left_output')}' rop='{c.get('right_output')}' "
-            f"threshold_raw={c.get('threshold')} threshold_params_raw={c.get('threshold_params')}"
+            f"threshold_raw={c.get('threshold')} "
+            f"threshold_params_raw={c.get('threshold_params')}"
         )
     except Exception:
         pass
@@ -422,6 +433,7 @@ def _sanitize_condition(c: dict) -> dict:
     if c["logic"] not in _ALLOWED_LOGIC:
         c["logic"] = "and"
 
+    # Legacy-Feld rauswerfen
     for k in ("right_absolute",):
         c.pop(k, None)
 
@@ -437,12 +449,20 @@ def _sanitize_condition(c: dict) -> dict:
         else:
             tp = {"value": tp_raw}
     elif isinstance(tp_raw, dict):
-        tp_clean: Dict[str, Any] = {k: v for k, v in tp_raw.items() if v not in (None, "")}
+        tp_clean: Dict[str, Any] = {
+            k: v for k, v in tp_raw.items() if v not in (None, "")
+        }
         if "value" in tp_clean:
             tp = {"value": tp_clean["value"]}
         else:
             legacy_val = None
-            for legacy_key in ("value", "window", "min_ticks", "min_tick", "threshold_window"):
+            for legacy_key in (
+                "value",
+                "window",
+                "min_ticks",
+                "min_tick",
+                "threshold_window",
+            ):
                 if legacy_key in tp_clean and str(tp_clean[legacy_key]).strip() != "":
                     legacy_val = tp_clean[legacy_key]
                     break
@@ -461,7 +481,8 @@ def _sanitize_condition(c: dict) -> dict:
     try:
         print(
             f"[DEBUG] _sanitize_condition:threshold rid={c.get('rid')} "
-            f"thr='{c.get('threshold')}' thr_params={c.get('threshold_params')}"
+            f"thr='{c.get('threshold')}' "
+            f"thr_params={c.get('threshold_params')}"
         )
     except Exception:
         pass
@@ -489,7 +510,8 @@ def _sanitize_condition(c: dict) -> dict:
         try:
             print(
                 f"[DEBUG] _sanitize_condition:mapped rid={c.get('rid')} "
-                f"left_profiles={c.get('left_profiles')} right_profiles={c.get('right_profiles')}"
+                f"left_profiles={c.get('left_profiles')} "
+                f"right_profiles={c.get('right_profiles')}"
             )
         except Exception:
             pass
@@ -559,7 +581,8 @@ def _sanitize_group(g: dict) -> dict:
         print(
             f"[DEBUG] _sanitize_group:init gid={g.get('gid')} name='{g.get('name')}' "
             f"interval='{g.get('interval')}' exchange='{g.get('exchange')}' "
-            f"symbols_in={len(g.get('symbols') or [])} profiles_in={len(g.get('profiles') or [])} "
+            f"symbols_in={len(g.get('symbols') or [])} "
+            f"profiles_in={len(g.get('profiles') or [])} "
             f"conds_in={len(g.get('conditions') or [])}"
         )
     except Exception:
@@ -576,8 +599,13 @@ def _sanitize_group(g: dict) -> dict:
     syms_in = list(g.get("symbols") or [])
     profs_in = list(g.get("profiles") or [])
 
-    split_syms, split_profs = _split_symbols_and_profiles(syms_in)
-    profs_all = list(profs_in) + split_profs
+    # Split beide Listen, weil Clients/UI manchmal Müll in beide Felder legen
+    split_syms_1, split_profs_1 = _split_symbols_and_profiles(syms_in)
+    split_syms_2, split_profs_2 = _split_symbols_and_profiles(profs_in)
+
+    # Symbole dürfen NUR in symbols landen, Profile-IDs NUR in profiles
+    split_syms = split_syms_1 + split_syms_2
+    profs_all = split_profs_1 + split_profs_2
 
     clean_syms: List[str] = []
     seen_s = set()
@@ -611,8 +639,6 @@ def _sanitize_group(g: dict) -> dict:
         if isinstance(raw, dict):
             sc = _sanitize_condition(raw)
             conds_out.append(sc)
-        else:
-            continue
 
     seen_rids = set()
     for c in conds_out:
@@ -639,48 +665,128 @@ def _sanitize_group(g: dict) -> dict:
 
 def _sanitize_profiles(data: list) -> list:
     out = []
-    for p in data or []:
+    seen_profile_ids = set()
+
+    try:
+        print(f"[DEBUG] _sanitize_profiles:START items_in={len(data or [])}")
+    except Exception:
+        pass
+
+    for idx, p in enumerate(data or []):
         if not isinstance(p, dict):
+            try:
+                print(f"[WARN] _sanitize_profiles:skip idx={idx} type={type(p).__name__}")
+            except Exception:
+                pass
             continue
+
+        # wichtig: nicht das Input-Objekt mutieren (macht Debug/Save/Migration stabiler)
+        p = dict(p)
+
+        # Snapshot before mutate
+        try:
+            keys_preview = list(p.keys())[:25]
+            print(
+                f"[DEBUG] _sanitize_profiles:RAW idx={idx} keys={keys_preview} "
+                f"has_id={'id' in p} raw_id={repr(p.get('id'))} raw_name={repr(p.get('name'))}"
+            )
+        except Exception:
+            pass
+
         p.setdefault("name", "Unnamed")
         p.setdefault("enabled", True)
         p.setdefault("condition_groups", [])
-        p["id"] = str(p.get("id") or uuid.uuid4())
+
+        pid = str(p.get("id") or "").strip()
+        if not pid:
+            try:
+                print(
+                    f"[ERROR] _sanitize_profiles:NO_ID idx={idx} "
+                    f"name={repr(p.get('name'))} keys={list(p.keys())}"
+                )
+            except Exception:
+                pass
+            raise ValueError(
+                "[SANITIZE] Profile ohne ID entdeckt – das darf nicht passieren. "
+                "IDs müssen beim Erstellen vergeben und danach stabil bleiben."
+            )
+
+        # Detect duplicate IDs in same batch (should not happen)
+        if pid in seen_profile_ids:
+            try:
+                print(f"[ERROR] _sanitize_profiles:DUPLICATE_ID idx={idx} id={pid}")
+            except Exception:
+                pass
+        seen_profile_ids.add(pid)
+
+        p["id"] = pid
 
         try:
             print(
-                f"[DEBUG] _sanitize_profiles:init id={p['id']} name='{p.get('name')}' "
+                f"[DEBUG] _sanitize_profiles:init idx={idx} id={p['id']} "
+                f"name='{p.get('name')}' enabled={p.get('enabled')} "
                 f"groups_in={len(p.get('condition_groups') or [])}"
             )
         except Exception:
             pass
 
         groups = []
-        for g in p.get("condition_groups") or []:
-            if isinstance(g, dict):
-                sg = _sanitize_group(g)
-                groups.append(sg)
+        conds_total_in = 0
+        for gi, g in enumerate(p.get("condition_groups") or []):
+            if not isinstance(g, dict):
+                try:
+                    print(f"[WARN] _sanitize_profiles:skip_group idx={idx} gi={gi} type={type(g).__name__}")
+                except Exception:
+                    pass
+                continue
 
-        seen = set()
+            try:
+                conds_total_in += len(g.get("conditions") or [])
+            except Exception:
+                pass
+
+            sg = _sanitize_group(g)
+            groups.append(sg)
+
+        # Ensure unique gids within this profile
+        seen_gids = set()
         for g in groups:
-            if g["gid"] in seen:
-                g["gid"] = _rand_id()
-            seen.add(g["gid"])
+            gid = str(g.get("gid") or "").strip()
+            if gid in seen_gids:
+                new_gid = _rand_id()
+                try:
+                    print(f"[WARN] _sanitize_profiles:duplicate_gid id={pid} gid={gid} -> {new_gid}")
+                except Exception:
+                    pass
+                g["gid"] = new_gid
+            seen_gids.add(str(g.get("gid") or "").strip())
 
         p["condition_groups"] = groups
 
         try:
             syms_total = sum(len(gr.get("symbols") or []) for gr in groups)
             profs_total = sum(len(gr.get("profiles") or []) for gr in groups)
+            conds_total_out = sum(len(gr.get("conditions") or []) for gr in groups)
+            gids = [str(gr.get("gid") or "") for gr in groups][:6]
+
             print(
-                f"[DEBUG] _sanitize_profiles:done id={p['id']} groups_out={len(groups)} "
+                f"[DEBUG] _sanitize_profiles:done idx={idx} id={p['id']} "
+                f"groups_out={len(groups)} gids_preview={gids} "
+                f"conds_in≈{conds_total_in} conds_out={conds_total_out} "
                 f"sum_symbols={syms_total} sum_profiles={profs_total}"
             )
         except Exception:
             pass
 
         out.append(p)
+
+    try:
+        print(f"[DEBUG] _sanitize_profiles:END items_out={len(out)}")
+    except Exception:
+        pass
+
     return out
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -780,7 +886,18 @@ def load_profiles_raw() -> list[dict]:
     """
     Lädt die Roh-Profile (ohne Sanitize/Migration).
     """
-    return load_json(PROFILES_NOTIFIER, [])
+    items = load_json(PROFILES_NOTIFIER, [])
+    if not isinstance(items, list):
+        log.warning(
+            "load_profiles_raw: expected list, got %s → fallback []",
+            type(items).__name__,
+        )
+        items = []
+    try:
+        print(f"[PROFILES] load_raw count={len(items)} path={PROFILES_NOTIFIER}")
+    except Exception:
+        pass
+    return items
 
 
 def save_profiles_raw(items: list[dict]) -> None:
@@ -788,6 +905,11 @@ def save_profiles_raw(items: list[dict]) -> None:
     Speichert eine Liste von Profil-Dicts roh (ohne extra Sanitize).
     """
     save_json_atomic(PROFILES_NOTIFIER, items)
+    log.info("save_profiles_raw: saved count=%d", len(items))
+    try:
+        print(f"[PROFILES] save_raw count={len(items)} path={PROFILES_NOTIFIER}")
+    except Exception:
+        pass
 
 
 def load_profiles_normalized() -> list[dict]:
@@ -802,8 +924,15 @@ def load_profiles_normalized() -> list[dict]:
             "Profiles: legacy → condition_groups migriert & gespeichert (count=%d)",
             len(migrated),
         )
-        print(f"[PROFILES] migrated legacy→flat count={len(migrated)}")
+        try:
+            print(f"[PROFILES] migrated legacy→flat count={len(migrated)}")
+        except Exception:
+            pass
     sanitized = _sanitize_profiles(migrated)
+    try:
+        print(f"[PROFILES] load_normalized count={len(sanitized)}")
+    except Exception:
+        pass
     return sanitized
 
 
@@ -818,9 +947,18 @@ def profiles_fingerprint(profiles: list[dict]) -> str:
 
         h = hashlib.sha256()
         h.update(payload.encode("utf-8"))
-        return h.hexdigest()
+        fp = h.hexdigest()
+        try:
+            print(f"[PROFILES] fingerprint fp={fp[:16]}... len={len(normalized)}")
+        except Exception:
+            pass
+        return fp
     except Exception as e:
         log.error("profiles_fingerprint failed: %s", e)
+        try:
+            print(f"[PROFILES] fingerprint ERROR: {e}")
+        except Exception:
+            pass
         return ""
 
 
@@ -839,7 +977,7 @@ def merge_ids(old_p: dict, new_p: dict) -> dict:
     new_groups = new_p.get("condition_groups") or []
 
     old_by_gid = {str(g.get("gid")): g for g in old_groups if str(g.get("gid") or "")}
-    old_by_name = {}
+    old_by_name: Dict[str, dict] = {}
     for g in old_groups:
         nk = _name_key(g.get("name"))
         if nk and nk not in old_by_name:
@@ -877,10 +1015,13 @@ def merge_ids(old_p: dict, new_p: dict) -> dict:
             ng["gid"] = _trim_str(match.get("gid"))
         else:
             ng["gid"] = _trim_str(ng.get("gid")) or _rand_id()
-        used_old_groups.add(id(match)) if match else None
+        if match:
+            used_old_groups.add(id(match))
 
         old_conds = (match.get("conditions") if match else []) or []
-        old_by_rid = {_trim_str(c.get("rid")): c for c in old_conds if _trim_str(c.get("rid"))}
+        old_by_rid = {
+            _trim_str(c.get("rid")): c for c in old_conds if _trim_str(c.get("rid"))
+        }
         old_by_sig = {_sign(c): c for c in old_conds}
 
         new_conds = ng.get("conditions") or []
@@ -888,6 +1029,7 @@ def merge_ids(old_p: dict, new_p: dict) -> dict:
         for nc in new_conds:
             rid = _trim_str(nc.get("rid"))
             if rid and rid in old_by_rid and rid not in seen_rids:
+                # existierende RID behalten
                 pass
             else:
                 sig = _sign(nc)
@@ -907,6 +1049,13 @@ def merge_ids(old_p: dict, new_p: dict) -> dict:
         seen_gids.add(ng["gid"])
 
     new_p["condition_groups"] = new_groups
+    try:
+        print(
+            f"[PROFILES] merge_ids done id={old_p.get('id') or new_p.get('id')} "
+            f"groups={len(new_groups)}"
+        )
+    except Exception:
+        pass
     return new_p
 
 
@@ -920,11 +1069,13 @@ def resolve_gid_from_profile(profile_obj: dict, gid_or_index: Any) -> Optional[s
     """
     groups: List[dict] = list(profile_obj.get("condition_groups") or [])
 
+    # exakte GID
     for g in groups:
         gid = str(g.get("gid") or "").strip()
         if gid and str(gid_or_index).strip() == gid:
             return gid
 
+    # Index
     try:
         idx = int(str(gid_or_index).strip())
         if 0 <= idx < len(groups):
@@ -933,6 +1084,7 @@ def resolve_gid_from_profile(profile_obj: dict, gid_or_index: Any) -> Optional[s
     except Exception:
         pass
 
+    # Name
     key = _name_key(gid_or_index)
     if key:
         for g in groups:
@@ -940,6 +1092,135 @@ def resolve_gid_from_profile(profile_obj: dict, gid_or_index: Any) -> Optional[s
                 real = str(g.get("gid") or "").strip()
                 return real or None
     return None
+
+
+# ─────────────────────────────────────────────────────────────
+# High-Level Profile-API
+# ─────────────────────────────────────────────────────────────
+
+def list_profiles() -> list[dict]:
+    """
+    Bequemer Wrapper: alle Profile normalisiert laden.
+    """
+    profiles = load_profiles_normalized()
+    return profiles
+
+
+def get_profile_by_id(profile_id: str) -> Optional[dict]:
+    """
+    Liefert ein einzelnes Profil (normalisiert) nach ID.
+    """
+    pid = str(profile_id or "").strip()
+    if not pid:
+        return None
+    profiles = load_profiles_normalized()
+    for p in profiles:
+        if str(p.get("id") or "").strip() == pid:
+            try:
+                print(f"[PROFILES] get_profile_by_id hit id={pid}")
+            except Exception:
+                pass
+            return p
+    try:
+        print(f"[PROFILES] get_profile_by_id MISS id={pid}")
+    except Exception:
+        pass
+    return None
+
+def delete_profile_by_id(profile_id: str) -> dict:
+    """
+    Löscht ein Profil per ID.
+    Rückgabe:
+      {
+        "status": "deleted",
+        "id": "<profile-id>",
+        "deleted": bool,
+      }
+    """
+    pid = str(profile_id or "").strip()
+    if not pid:
+        raise ValueError("delete_profile_by_id: profile_id darf nicht leer sein")
+
+    print(f"[PROFILES] delete_profile_by_id pid='{pid}'")
+
+    def _transform(current: list):
+        items = [p for p in (current or []) if isinstance(p, dict)]
+        before = len(items)
+        kept = [p for p in items if str(p.get("id") or "").strip() != pid]
+        after = len(kept)
+
+        deleted = (after != before)
+        result = {
+            "status": "deleted" if deleted else "not_found",
+            "id": pid,
+            "deleted": deleted,
+            "before": before,
+            "after": after,
+        }
+        return kept, result
+
+    _, outcome = atomic_update_json_list(Path(PROFILES_NOTIFIER), _transform)
+    print(f"[PROFILES] delete_profile_by_id outcome={outcome}")
+    return outcome
+
+
+def update_profile_by_id(profile_id: str, profile: dict) -> dict:
+    """
+    Upsert über eine feste Profil-ID.
+
+    - Wenn ID existiert → Eintrag wird ersetzt.
+    - Wenn ID nicht existiert → neues Profil wird angelegt mit genau dieser ID.
+
+    Rückgabe:
+      {
+        "status": "created" | "updated",
+        "id": "<profile-id>",
+        "created": bool,
+        "updated": bool,
+      }
+    """
+    pid = str(profile_id or "").strip()
+    if not pid:
+        raise ValueError("update_profile_by_id: profile_id darf nicht leer sein")
+
+    incoming = deepcopy(profile or {})
+    if not str(incoming.get("id") or "").strip():
+        raise ValueError("[WRITE] update_profile_by_id mit leerer ID aufgerufen")
+
+    print(f"[PROFILES] update_profile_by_id incoming_id='{pid}'")
+
+    def _transform(current: list):
+        items = [p for p in (current or []) if isinstance(p, dict)]
+        target_idx = None
+
+        for idx, p in enumerate(items):
+            if str(p.get("id") or "").strip() == pid:
+                target_idx = idx
+                break
+
+        if target_idx is None:
+            # neu anlegen
+            items.append(incoming)
+            result = {
+                "status": "created",
+                "id": pid,
+                "created": True,
+                "updated": False,
+            }
+        else:
+            items[target_idx] = incoming
+            result = {
+                "status": "updated",
+                "id": pid,
+                "created": False,
+                "updated": True,
+            }
+
+        return items, result
+
+    _, outcome = atomic_update_json_list(Path(PROFILES_NOTIFIER), _transform)
+    print(f"[PROFILES] update_profile_by_id outcome={outcome}")
+    return outcome
 
 
 # --- Backwards-kompatible Helper-Funktion für main.py & Group-Manager ------
@@ -981,9 +1262,13 @@ def add_or_update_profile_by_name(profile: dict) -> dict:
 
         # ID setzen
         if existing_id:
-            incoming.setdefault("id", existing_id)
+            incoming["id"] = existing_id
         else:
-            incoming.setdefault("id", str(uuid.uuid4()))
+            incoming["id"] = str(uuid.uuid4())
+
+        if not str(incoming.get("id") or "").strip():
+            raise ValueError("[WRITE] add_or_update_profile_by_name erzeugt Profil ohne ID")
+
 
         # Upsert
         if target_idx is None:
@@ -1008,3 +1293,13 @@ def add_or_update_profile_by_name(profile: dict) -> dict:
     _, outcome = atomic_update_json_list(Path(PROFILES_NOTIFIER), _transform)
     print(f"[PROFILES] add_or_update_profile_by_name outcome={outcome}")
     return outcome
+
+
+# ─────────────────────────────────────────────────────────────
+# Backwards-Compatible Aliasse (falls alter Code Namen erwartet)
+# ─────────────────────────────────────────────────────────────
+
+# (Hier gerade keine zusätzlichen Aliasse nötig – falls du später alte Funktionsnamen
+# zurückbringen musst, kannst du sie hier sauber mappen, z.B.:
+# _update_profile_by_id = update_profile_by_id
+# etc.)

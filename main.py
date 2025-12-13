@@ -237,9 +237,17 @@ else:
 
 # Notifier-/Alarms-Router einhängen (wenn vorhanden)
 if notifier_router:
-    app.include_router(notifier_router)
+    # WICHTIG: Prefix setzen, damit /notifier/... entsteht
+    app.include_router(notifier_router, prefix="/notifier")
+    print("[DEBUG] Notifier-Router unter /notifier gemountet.")
+else:
+    print("[DEBUG] Notifier-Router NICHT eingebunden (notifier_router is None).")
+
 if alarms_router:
     app.include_router(alarms_router, prefix="/alarms")
+    print("[DEBUG] Alarms-Router unter /alarms gemountet.")
+else:
+    print("[DEBUG] Alarms-Router NICHT eingebunden (alarms_router is None).")
 
 # ── Endpoints ───────────────────────────────────────────────────────────────
 @app.get("/")

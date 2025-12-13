@@ -510,6 +510,21 @@ def _local_compute_custom(
         mod = import_module(module_name)
         fn = getattr(mod, fn_name)
 
+        # --- Hidden Base-Injection für HTTP-Fallbacks in lokalen Indikatoren ---
+        try:
+            if isinstance(shaped_params, dict) and "base" in shaped_params:
+                bp = dict(shaped_params.get("base_params") or {})
+                # Nicht überschreiben, nur setzen wenn nicht vorhanden:
+                bp.setdefault("_symbol", symbol)
+                bp.setdefault("_chart_interval", chart_interval)
+                bp.setdefault("_indicator_interval", indicator_interval)
+                shaped_params["base_params"] = bp
+                if DEBUG:
+                    print(f"[PROXY][IND][{req_id}] injected base_params keys={sorted(list(bp.keys()))}")
+        except Exception as e:
+            if DEBUG:
+                print(f"[PROXY][IND][{req_id}] base_params injection failed: {type(e).__name__}: {e}")
+
         # Zwei gängige Call-Konventionen unterstützen:
         # 1) fn(df, **kwargs)
         # 2) fn(df, params_dict)  (z. B. value.compute)
@@ -519,6 +534,7 @@ def _local_compute_custom(
             if DEBUG:
                 print(f"[PROXY][IND][{req_id}] kwargs-call failed ({te}); trying dict-call")
             out_df, used, out_cols = fn(df, shaped_params)
+
 
     except KeyError:
         # Unbekannt in Registry

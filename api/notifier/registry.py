@@ -12,12 +12,37 @@ from notifier.indicator_registry import REGISTERED, SIMPLE_SIGNALS
 log = logging.getLogger("notifier.registry")
 
 
+def _as_list(v: Any) -> List[Any]:
+    """Robust: None/str/tuple/etc. -> list"""
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    if isinstance(v, tuple):
+        return list(v)
+    # Strings nicht als Iterable splitten
+    if isinstance(v, str):
+        return [v]
+    try:
+        return list(v)  # type: ignore[arg-type]
+    except Exception:
+        return []
+
+
 def _log_summary(prefix: str, items: List[Dict[str, Any]]) -> None:
     """
     Kleine Debug-Hilfe: Anzahl + ein paar Namen loggen/printen.
     """
     try:
-        names = [str(it.get("display_name") or it.get("name") or it.get("base")) for it in items[:5]]
+        names: List[str] = []
+        for it in items[:5]:
+            if not isinstance(it, dict):
+                continue
+            name = it.get("display_name") or it.get("name") or it.get("base") or ""
+            try:
+                names.append(str(name))
+            except Exception:
+                names.append("?")
         log.info("%s count=%d sample=%s", prefix, len(items), names)
         print(f"[REGISTRY] {prefix} count={len(items)} sample={names}")
     except Exception:
@@ -51,18 +76,29 @@ def get_registry_indicators(
     """
     items: List[Dict[str, Any]] = []
 
+    # Debug: grobe Registry-Größe
+    try:
+        log.debug("get_registry_indicators expand_presets=%s scope=%s registered=%d",
+                  expand_presets, scope, len(getattr(REGISTERED, "keys", lambda: [])()))
+    except Exception:
+        pass
+
     if not expand_presets:
         # Roh-Registry
         for key, spec in REGISTERED.items():
+            if not isinstance(spec, dict):
+                log.warning("REGISTERED[%s] is not a dict -> skip (%r)", key, type(spec))
+                continue
+
             s = deepcopy(spec)
 
             if not s.get("enabled", True):
                 continue
-            if scope is not None and scope not in (s.get("scopes") or []):
+            if scope is not None and scope not in (_as_list(s.get("scopes"))):
                 continue
-            if not include_deprecated and s.get("deprecated", False):
+            if not include_deprecated and bool(s.get("deprecated", False)):
                 continue
-            if not include_hidden and s.get("ui_hidden", False):
+            if not include_hidden and bool(s.get("ui_hidden", False)):
                 continue
 
             items.append(s)
@@ -72,18 +108,32 @@ def get_registry_indicators(
 
     # expand_presets=True → pro Preset ein Objekt
     for key, spec in REGISTERED.items():
+        if not isinstance(spec, dict):
+            log.warning("REGISTERED[%s] is not a dict -> skip (%r)", key, type(spec))
+            continue
+
         s = spec
 
         if not s.get("enabled", True):
             continue
-        if scope is not None and scope not in (s.get("scopes") or []):
+        if scope is not None and scope not in (_as_list(s.get("scopes"))):
             continue
-        if not include_deprecated and s.get("deprecated", False):
+        if not include_deprecated and bool(s.get("deprecated", False)):
             continue
-        if not include_hidden and s.get("ui_hidden", False):
+        if not include_hidden and bool(s.get("ui_hidden", False)):
             continue
 
-        for p in (s.get("presets") or []):
+        base_name = s.get("name")
+        outputs = [str(x) for x in _as_list(s.get("outputs"))]
+
+        presets = s.get("presets") or []
+        if not isinstance(presets, (list, tuple)):
+            log.warning("Indicator '%s' presets is not list/tuple -> skip presets (%r)", base_name, type(presets))
+            continue
+
+        for p in presets:
+            if not isinstance(p, dict):
+                continue
             label = p.get("label")
             if not isinstance(label, str) or not label:
                 continue
@@ -91,10 +141,10 @@ def get_registry_indicators(
             items.append(
                 {
                     "display_name": label,
-                    "base": s.get("name"),
-                    "params": deepcopy(p.get("params", {})),
-                    "locked_params": list(p.get("locked_params", [])),
-                    "outputs": list(s.get("outputs", [])),
+                    "base": base_name,
+                    "params": deepcopy(p.get("params", {})) if isinstance(p.get("params", {}), dict) else {},
+                    "locked_params": [str(x) for x in _as_list(p.get("locked_params"))],
+                    "outputs": outputs,
                 }
             )
 
@@ -130,37 +180,50 @@ def get_notifier_indicators(
     items: List[Dict[str, Any]] = []
 
     for key, spec in REGISTERED.items():
+        if not isinstance(spec, dict):
+            log.warning("REGISTERED[%s] is not a dict -> skip (%r)", key, type(spec))
+            continue
+
         s = spec
 
         if not s.get("enabled", True):
             continue
-        if "notifier" not in (s.get("scopes") or []):
+        if "notifier" not in _as_list(s.get("scopes")):
             continue
-        if not include_deprecated and s.get("deprecated", False):
+        if not include_deprecated and bool(s.get("deprecated", False)):
             continue
-        if not include_hidden and s.get("ui_hidden", False):
+        if not include_hidden and bool(s.get("ui_hidden", False)):
             continue
 
-        base_locked = list(s.get("locked_params", []))
+        base_name = s.get("name")
+        base_locked = [str(x) for x in _as_list(s.get("locked_params"))]
+        outputs = [str(x) for x in _as_list(s.get("outputs"))]
 
-        for p in (s.get("presets") or []):
+        presets = s.get("presets") or []
+        if not isinstance(presets, (list, tuple)):
+            log.warning("Indicator '%s' presets is not list/tuple -> skip presets (%r)", base_name, type(presets))
+            continue
+
+        for p in presets:
+            if not isinstance(p, dict):
+                continue
             label = p.get("label")
             if not isinstance(label, str) or not label:
                 continue
 
-            preset_locked = (
-                list(p.get("locked_params", []))
-                if isinstance(p.get("locked_params"), (list, tuple))
-                else []
-            )
+            preset_locked = [str(x) for x in _as_list(p.get("locked_params"))]
+
+            params = p.get("params", {})
+            if not isinstance(params, dict):
+                params = {}
 
             items.append(
                 {
                     "display_name": label,
-                    "base": s.get("name"),
-                    "params": deepcopy(p.get("params", {})),
+                    "base": base_name,
+                    "params": deepcopy(params),
                     "locked_params": preset_locked or base_locked,
-                    "outputs": list(s.get("outputs", [])),
+                    "outputs": outputs,
                 }
             )
 
@@ -177,12 +240,15 @@ def get_simple_signals() -> List[str]:
     Entspricht dem alten /registry/simple-signals.
     Gibt nur die Namen als Liste zurück.
     """
-    signals = list(SIMPLE_SIGNALS or [])
+    signals_raw = SIMPLE_SIGNALS or []
+    signals = [str(x) for x in _as_list(signals_raw)]
+
     try:
         log.info("simple_signals count=%d", len(signals))
         print(f"[REGISTRY] simple_signals count={len(signals)}")
     except Exception:
         pass
+
     return signals
 
 

@@ -6,9 +6,11 @@ import logging
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Dict
+import uuid  # für eindeutige Command-IDs
+from pathlib import Path
 
 from config import OVERRIDES_NOTIFIER, COMMANDS_NOTIFIER
-from storage import load_json_any, save_json_any
+from storage import load_json_any, save_json_any, atomic_update_json_list
 
 log = logging.getLogger("notifier.control")
 
@@ -36,7 +38,24 @@ def load_overrides() -> Dict[str, Any]:
     """
     d = load_json_any(OVERRIDES_NOTIFIER, deepcopy(_OVR_TEMPLATE))
     if not isinstance(d, dict) or "overrides" not in d:
+        log.warning(
+            "load_overrides: invalid structure (%s) → using template",
+            type(d).__name__,
+        )
         d = deepcopy(_OVR_TEMPLATE)
+
+    # härtung: overrides muss dict sein
+    if not isinstance(d.get("overrides"), dict):
+        d["overrides"] = {}
+
+    try:
+        print(
+            f"[OVR] load profiles={len(d.get('overrides', {}))} "
+            f"ts={d.get('updated_ts')}"
+        )
+    except Exception:
+        pass
+
     return d
 
 
@@ -46,6 +65,13 @@ def save_overrides(d: Dict[str, Any]) -> None:
     updated_ts wird immer neu gesetzt.
     """
     payload = deepcopy(d)
+    if not isinstance(payload, dict):
+        payload = deepcopy(_OVR_TEMPLATE)
+
+    payload.setdefault("overrides", {})
+    if not isinstance(payload.get("overrides"), dict):
+        payload["overrides"] = {}
+
     payload["updated_ts"] = _now_iso()
     save_json_any(OVERRIDES_NOTIFIER, payload)
     log.info("Overrides saved. profiles=%d", len(payload.get("overrides", {})))
@@ -73,11 +99,27 @@ def ensure_override_slot(
       }
     """
     ovr.setdefault("overrides", {})
+    if not isinstance(ovr.get("overrides"), dict):
+        ovr["overrides"] = {}
+
     ovr["overrides"].setdefault(profile_id, {})
+    if not isinstance(ovr["overrides"].get(profile_id), dict):
+        ovr["overrides"][profile_id] = {}
+
     ovr["overrides"][profile_id].setdefault(
         group_id,
         {"forced_off": False, "snooze_until": None, "note": None},
     )
+
+    try:
+        print(
+            f"[OVR] ensure-slot pid={profile_id} gid={group_id} "
+            f"forced_off={ovr['overrides'][profile_id][group_id]['forced_off']} "
+            f"snooze_until={ovr['overrides'][profile_id][group_id]['snooze_until']}"
+        )
+    except Exception:
+        pass
+
     return ovr["overrides"][profile_id][group_id]
 
 
@@ -92,7 +134,21 @@ def load_commands() -> Dict[str, Any]:
     """
     d = load_json_any(COMMANDS_NOTIFIER, deepcopy(_CMD_TEMPLATE))
     if not isinstance(d, dict) or "queue" not in d:
+        log.warning(
+            "load_commands: invalid structure (%s) → using template",
+            type(d).__name__,
+        )
         d = deepcopy(_CMD_TEMPLATE)
+
+    # härtung: queue muss list sein
+    if not isinstance(d.get("queue"), list):
+        d["queue"] = []
+
+    try:
+        print(f"[CMD] load queue_len={len(d.get('queue', []))}")
+    except Exception:
+        pass
+
     return d
 
 
@@ -101,6 +157,13 @@ def save_commands(d: Dict[str, Any]) -> None:
     Speichert die Command-Queue nach COMMANDS_NOTIFIER.
     """
     payload = deepcopy(d)
+    if not isinstance(payload, dict):
+        payload = deepcopy(_CMD_TEMPLATE)
+
+    payload.setdefault("queue", [])
+    if not isinstance(payload.get("queue"), list):
+        payload["queue"] = []
+
     save_json_any(COMMANDS_NOTIFIER, payload)
     log.info("Commands saved. queue_len=%d", len(payload.get("queue", [])))
     try:
@@ -119,25 +182,74 @@ def enqueue_command(
     Fügt einen Befehl für den Evaluator / Alarm-Worker in die Queue ein.
 
     Felder:
+      - id         → eindeutige UUID
       - profile_id
       - group_id
       - rearm      → Gruppe neu scharf stellen
       - rebaseline → History/true_ticks neu setzen
     """
-    cmds = load_commands()
     item = {
+        "id": str(uuid.uuid4()),
         "profile_id": str(profile_id),
         "group_id": str(group_id),
         "rearm": bool(rearm),
         "rebaseline": bool(rebaseline),
         "ts": _now_iso(),
     }
-    cmds.setdefault("queue", [])
-    cmds["queue"].append(item)
-    save_commands(cmds)
+
+    # ATOMIC: verhindert Lost-Updates bei parallelen enqueue-Requests
+    def _transform(current: list):
+        # current ist bei atomic_update_json_list immer "list-like" gedacht.
+        # Wir modellieren commands.json als "list" mit genau einem dict-Element oder leer:
+        #   [] oder [{"queue": [...]}]
+        items = [x for x in (current or []) if isinstance(x, dict)]
+        if not items:
+            doc = deepcopy(_CMD_TEMPLATE)
+            items = [doc]
+        else:
+            doc = items[0]
+            doc.setdefault("queue", [])
+            if not isinstance(doc.get("queue"), list):
+                doc["queue"] = []
+
+        doc["queue"].append(item)
+
+        result = {
+            "status": "enqueued",
+            "id": item["id"],
+            "queue_len": len(doc["queue"]),
+        }
+        return items, result
+
+    # NOTE: COMMANDS_NOTIFIER ist vermutlich eine JSON-Datei die bisher ein dict war.
+    # atomic_update_json_list erwartet eine LIST im File. Damit das drop-in bleibt,
+    # unterstützen wir BEIDES:
+    # - wenn Datei dict enthält → fallback auf load+save (wie vorher) + warning
+    # - wenn Datei list enthält → atomic path
+
+    try:
+        _, outcome = atomic_update_json_list(Path(COMMANDS_NOTIFIER), _transform)
+        try:
+            print(f"[CMD] enqueue atomic outcome={outcome}")
+        except Exception:
+            pass
+    except Exception as e:
+        # Fallback: altes Verhalten (nicht atomic), aber wenigstens nicht kaputt.
+        log.warning("enqueue_command atomic_update failed (%s) -> fallback load/save", e)
+        cmds = load_commands()
+        cmds.setdefault("queue", [])
+        if not isinstance(cmds.get("queue"), list):
+            cmds["queue"] = []
+        cmds["queue"].append(item)
+        save_commands(cmds)
+        try:
+            print(f"[CMD] enqueue FALLBACK load/save because atomic failed: {e}")
+        except Exception:
+            pass
 
     log.info(
-        "Command enqueued pid=%s gid=%s rearm=%s rebaseline=%s",
+        "Command enqueued id=%s pid=%s gid=%s rearm=%s rebaseline=%s",
+        item["id"],
         profile_id,
         group_id,
         rearm,
@@ -145,7 +257,7 @@ def enqueue_command(
     )
     try:
         print(
-            f"[CMD] enqueue pid={profile_id} gid={group_id} "
+            f"[CMD] enqueue id={item['id']} pid={profile_id} gid={group_id} "
             f"rearm={rearm} rebaseline={rebaseline}"
         )
     except Exception:
@@ -166,21 +278,39 @@ def run_activation_routine(
     """
     Entspricht grob dem alten _run_activation_routine:
 
+    - Wenn activate_flag False → NO-OP (nur Logging/Debug)
     - Nimmt ein *bereits saniertes* Profilobjekt (mit condition_groups)
     - Für jede aktive Gruppe:
         - forced_off=False, snooze_until=None im Overrides-JSON
         - Command-Queue-Eintrag (rearm + optional rebaseline)
     """
+    if not activate_flag:
+        log.info("run_activation_routine called with activate_flag=False → no-op")
+        try:
+            print("[ACTIVATE] skip: activate_flag=False")
+        except Exception:
+            pass
+        return
+
     pid = str(profile_obj.get("id") or "").strip()
     if not pid:
         log.warning("run_activation_routine called without profile_id")
-        print("[ACTIVATE] skip: missing profile_id")
+        try:
+            print("[ACTIVATE] skip: missing profile_id")
+        except Exception:
+            pass
         return
 
     groups = profile_obj.get("condition_groups") or []
     if not isinstance(groups, list):
-        log.warning("run_activation_routine: condition_groups is not a list for pid=%s", pid)
-        print(f"[ACTIVATE] skip: bad groups type pid={pid}")
+        log.warning(
+            "run_activation_routine: condition_groups is not a list for pid=%s",
+            pid,
+        )
+        try:
+            print(f"[ACTIVATE] skip: bad groups type pid={pid}")
+        except Exception:
+            pass
         return
 
     ovr = load_overrides()
@@ -190,11 +320,17 @@ def run_activation_routine(
     for g in groups:
         if not isinstance(g, dict):
             continue
+
         gid = str(g.get("gid") or "").strip()
         if not gid:
             continue
+
         if not bool(g.get("active", True)):
             # Inaktive Gruppen werden nicht scharf geschaltet
+            try:
+                print(f"[ACTIVATE] skip group pid={pid} gid={gid} active=False")
+            except Exception:
+                pass
             continue
 
         slot = ensure_override_slot(ovr, pid, gid)

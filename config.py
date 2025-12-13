@@ -17,9 +17,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 NOTIFIER_DATA_DIR = DATA_DIR / "notifier"
 NOTIFIER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Profile-Verzeichnis (für spätere Files, Backups etc.)
-NOTIFIER_PROFILE_DIR = NOTIFIER_DATA_DIR / "profiles"
-NOTIFIER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # Haupt-JSON-Dateien des Notifier-Stacks
 PROFILES_NOTIFIER  = str(NOTIFIER_DATA_DIR / "notifier_profiles.json")
