@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import uuid
 import json
 import logging
 import random
 import re
 import unicodedata
-import uuid
+
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from pathlib import Path
@@ -126,28 +127,37 @@ def _split_symbols_and_profiles(values: Any) -> tuple[list[str], list[str]]:
     return syms, profs
 
 
-_ALLOWED_DEACT = {"always", "true", "any_true"}
-_ALLOWED_THRESHOLDS = {"check", "min_tick"}
+_ALLOWED_DEACT = {"always_on", "auto_off", "pre_notification"}
+
+_ALLOWED_THRESHOLDS = {"check", "min_tick", "count", "streak"}
 _ALLOWED_SINGLE_MODES = {"symbol", "group", "everything"}
 _ALLOWED_OPS = {"eq", "ne", "gt", "gte", "lt", "lte"}
 _ALLOWED_LOGIC = {"and", "or"}
 
 
 def _normalize_deactivate_value(v: Any) -> Optional[str]:
+    """
+    Accept ONLY the new UI terms:
+      - always_on
+      - auto_off
+      - pre_notification
+
+    Everything else is treated as invalid/None.
+    """
     if v is None:
         return None
-    if isinstance(v, bool):
-        return "true" if v else None
+
     s = _trim_str(v).lower()
     if not s:
         return None
-    if s == "always":
-        return "always"
-    if s in {"true", "full", "match"}:
-        return "true"
-    if s in {"any_true", "any", "partial"}:
-        return "any_true"
+
+    if s in {"always_on", "auto_off", "pre_notification"}:
+        return s
+
+    # old junk -> drop hard
     return None
+
+
 
 
 def _normalize_slope_params_dict(p: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -224,7 +234,7 @@ class GroupOut(ApiModel):
     exchange: str = ""
     name: str = ""
     description: str = ""
-    deactivate_on: Optional[Literal["always", "true", "any_true"]] = None
+    deactivate_on: Optional[Literal["always_on", "auto_off", "pre_notification"]] = None
     min_true_ticks: Optional[int] = None
     single_mode: Optional[Literal["symbol", "group", "everything"]] = "symbol"
 
@@ -247,7 +257,8 @@ class GroupIn(ApiModel):
     exchange: str = ""
     name: str = ""
     description: str = ""
-    deactivate_on: Optional[Literal["always", "true", "any_true"]] = None
+    deactivate_on: Optional[Literal["always_on", "auto_off", "pre_notification"]] = None
+
     auto_deactivate: Optional[bool] = None
     min_true_ticks: Optional[int] = None
     single_mode: Optional[Literal["symbol", "group", "everything"]] = "symbol"
@@ -364,24 +375,61 @@ def _sanitize_condition(c: dict) -> dict:
             s_norm = ""
 
         if not s_norm:
+            tp = container.get("threshold_params") or {}
+            if isinstance(tp, (int, float, str)):
+                tp = {"value": tp}
+            elif not isinstance(tp, dict):
+                tp = {}
+
+
             has_min = any(
-                (k in container) and str(container.get(k)).strip() != ""
+                (k in container and str(container.get(k)).strip() != "") or (k in tp and str(tp.get(k)).strip() != "")
                 for k in ("threshold_min_tick", "min_tick")
             )
             has_window = any(
-                (k in container) and str(container.get(k)).strip() != ""
+                (k in container and str(container.get(k)).strip() != "") or (k in tp and str(tp.get(k)).strip() != "")
                 for k in ("threshold_window", "window", "min_ticks")
             )
-            if has_min:
+            has_count = any(
+                (k in container and str(container.get(k)).strip() != "") or (k in tp and str(tp.get(k)).strip() != "")
+                for k in ("count_min", "min_count")
+            )
+            has_streak = any(
+                (k in container and str(container.get(k)).strip() != "")
+                or (k in tp and str(tp.get(k)).strip() != "")
+                for k in ("streak_min", "min_streak")
+            )
+
+
+
+            # Priorität: streak > count > min_tick > check (weil check sonst "window" frisst)
+            if has_streak:
+                s_norm = "streak"
+            elif has_count:
+                s_norm = "count"
+            elif has_min:
                 s_norm = "min_tick"
             elif has_window:
                 s_norm = "check"
+
+        # akzeptiere Alias-Schreibweisen
+        aliases = {
+            "mintick": "min_tick",
+            "min": "min_tick",
+            "min_ticks": "check",
+            "window": "check",
+            "countmin": "count",
+            "window_count": "count",
+            "streakmin": "streak",
+        }
+        s_norm = aliases.get(s_norm, s_norm)
 
         if not s_norm:
             return ""
         if s_norm not in _ALLOWED_THRESHOLDS:
             return ""
         return s_norm
+
 
     c = dict(c or {})
     c.setdefault("rid", _rand_id())
@@ -440,52 +488,99 @@ def _sanitize_condition(c: dict) -> dict:
     thr = _canonical_threshold(c.get("threshold", ""), c)
     c["threshold"] = thr
 
+    def _to_int(x: Any) -> Optional[int]:
+        if x in (None, "", "null"):
+            return None
+        try:
+            return int(float(str(x).strip()))
+        except Exception:
+            return None
+
     tp_raw = c.get("threshold_params", {})
+    tp_clean: Dict[str, Any] = {}
 
-    if isinstance(tp_raw, (int, float, str)):
-        v_str = str(tp_raw).strip()
-        if v_str == "":
-            tp = {}
-        else:
-            tp = {"value": tp_raw}
-    elif isinstance(tp_raw, dict):
-        tp_clean: Dict[str, Any] = {
-            k: v for k, v in tp_raw.items() if v not in (None, "")
-        }
-        if "value" in tp_clean:
-            tp = {"value": tp_clean["value"]}
-        else:
-            legacy_val = None
-            for legacy_key in (
-                "value",
-                "window",
-                "min_ticks",
-                "min_tick",
-                "threshold_window",
-            ):
-                if legacy_key in tp_clean and str(tp_clean[legacy_key]).strip() != "":
-                    legacy_val = tp_clean[legacy_key]
-                    break
-            tp = {"value": legacy_val} if legacy_val is not None else {}
+    # 1) normalize tp_raw -> dict
+    if isinstance(tp_raw, dict):
+        tp_clean = {k: v for k, v in tp_raw.items() if v not in (None, "", [], {})}
+    elif isinstance(tp_raw, (int, float, str)):
+        s = str(tp_raw).strip()
+        if s != "":
+            tp_clean = {"value": tp_raw}
     else:
-        tp = {}
+        tp_clean = {}
 
-    if not tp:
-        for k in ("threshold_window", "window", "min_ticks", "min_tick"):
-            if k in c and str(c.get(k)).strip() != "":
-                tp = {"value": c.get(k)}
-                break
+    # 2) legacy fallbacks from top-level fields (older clients)
+    #    (only if not already in tp_clean)
+    for legacy_k in (
+        "threshold_window", "window", "min_ticks",
+        "min_tick", "threshold_min_tick",
+        "count_min", "min_count",
+        "streak_min", "min_streak",
+    ):
+
+        if legacy_k not in tp_clean and legacy_k in c and str(c.get(legacy_k)).strip() != "":
+            tp_clean[legacy_k] = c.get(legacy_k)
+
+    # 3) build canonical threshold_params based on thr
+    tp: Dict[str, Any] = {}
+
+    if thr == "check":
+        # accept: window / min_ticks / threshold_window / value
+        w = (
+            _to_int(tp_clean.get("window"))
+            or _to_int(tp_clean.get("min_ticks"))
+            or _to_int(tp_clean.get("threshold_window"))
+        )
+        if w is None and "value" in tp_clean:
+            w = _to_int(tp_clean.get("value"))
+        if w is not None:
+            tp = {"window": w}
+
+    elif thr == "min_tick":
+        # accept: min_tick / threshold_min_tick / value
+        mt = _to_int(tp_clean.get("min_tick")) or _to_int(tp_clean.get("threshold_min_tick"))
+        if mt is None and "value" in tp_clean:
+            mt = _to_int(tp_clean.get("value"))
+        if mt is not None:
+            tp = {"min_tick": mt}
+
+    elif thr == "count":
+        # accept: window + count_min (or value->count_min fallback)
+        w = _to_int(tp_clean.get("window")) or _to_int(tp_clean.get("threshold_window"))
+        cm = _to_int(tp_clean.get("count_min")) or _to_int(tp_clean.get("min_count"))
+        if cm is None and "value" in tp_clean:
+            # if some old client sends just a single value, treat as count_min
+            cm = _to_int(tp_clean.get("value"))
+        if w is not None and cm is not None:
+            tp = {"window": w, "count_min": cm}
+        else:
+            tp = {}
+
+
+    elif thr == "streak":
+        sm = _to_int(tp_clean.get("streak_min")) or _to_int(tp_clean.get("min_streak"))
+
+        if sm is None and "value" in tp_clean:
+            sm = _to_int(tp_clean.get("value"))
+        if sm is not None:
+            tp = {"streak_min": sm}
+
+    else:
+        # no threshold or unknown -> empty
+        tp = {}
 
     c["threshold_params"] = tp
 
     try:
         print(
             f"[DEBUG] _sanitize_condition:threshold rid={c.get('rid')} "
-            f"thr='{c.get('threshold')}' "
-            f"thr_params={c.get('threshold_params')}"
+            f"thr='{c.get('threshold')}' tp_raw={tp_raw!r} tp_clean={tp_clean!r} tp_final={tp!r}"
         )
     except Exception:
         pass
+
+
+
 
     mapped = False
     if _looks_like_pid(c.get("left_symbol", "")):
@@ -577,21 +672,22 @@ def _sanitize_group(g: dict) -> dict:
         if k in g:
             g[k] = _trim_str(g.get(k))
 
+    raw_deact = g.get("deactivate_on")
+
+    deact = _normalize_deactivate_value(raw_deact)
+    if deact is None and g.get("auto_deactivate") is not None:
+        # legacy bool support -> map to NEW terms only
+        deact = "auto_off" if bool(g.get("auto_deactivate")) else "always_on"
+
+    g["deactivate_on"] = deact
+
     try:
         print(
-            f"[DEBUG] _sanitize_group:init gid={g.get('gid')} name='{g.get('name')}' "
-            f"interval='{g.get('interval')}' exchange='{g.get('exchange')}' "
-            f"symbols_in={len(g.get('symbols') or [])} "
-            f"profiles_in={len(g.get('profiles') or [])} "
-            f"conds_in={len(g.get('conditions') or [])}"
+            f"[DEBUG] _sanitize_group:deactivate_on raw={repr(raw_deact)} "
+            f"normalized={repr(deact)}"
         )
     except Exception:
         pass
-
-    deact = _normalize_deactivate_value(g.get("deactivate_on"))
-    if deact is None and g.get("auto_deactivate") is not None:
-        deact = "true" if bool(g.get("auto_deactivate")) else "always"
-    g["deactivate_on"] = deact
 
     sm = _trim_str(g.get("single_mode")).lower()
     g["single_mode"] = sm if sm in _ALLOWED_SINGLE_MODES else "symbol"
@@ -862,8 +958,13 @@ def _profile_to_legacy_alias(p: dict) -> dict:
     for g in cgs:
         deactivate_on = g.get("deactivate_on")
         auto_deactivate = None
-        if deactivate_on in ("true", "any_true"):
+        if deactivate_on == "auto_off":
             auto_deactivate = True
+        elif deactivate_on == "always_on":
+            auto_deactivate = False
+        else:
+            auto_deactivate = None  # pre_notification hat im legacy kein Äquivalent
+
         cfg = dict(g)
         cfg["auto_deactivate"] = auto_deactivate
         legacy_groups.append({"config": cfg})
@@ -1189,6 +1290,36 @@ def update_profile_by_id(profile_id: str, profile: dict) -> dict:
 
     print(f"[PROFILES] update_profile_by_id incoming_id='{pid}'")
 
+    # --- SANITIZE BEFORE WRITE (damit JSON sauber bleibt) ---
+    try:
+        incoming_s = _sanitize_profiles([incoming])[0]
+        incoming = incoming_s
+
+        cgs = incoming.get("condition_groups") or []
+        if not cgs:
+            print("[DBG] WRITE(update_by_id) no condition_groups after sanitize")
+        else:
+            cg0 = cgs[0] or {}
+            conds = cg0.get("conditions") or []
+            if not conds:
+                print(f"[DBG] WRITE(update_by_id) gid={cg0.get('gid')!r} has no conditions after sanitize")
+            else:
+                c0 = conds[0] or {}
+                tp = c0.get("threshold_params") or {}
+                print(
+                    "[DBG] WRITE(update_by_id) first condition AFTER sanitize: "
+                    f"rid={c0.get('rid')!r} left={c0.get('left')!r} op={c0.get('op')!r} right={c0.get('right')!r} "
+                    f"thr={c0.get('threshold')!r} tp={tp!r} keys={list(tp.keys())}"
+                )
+
+
+
+        print(f"[PROFILES] sanitize-before-write OK id={incoming.get('id')} groups={len(incoming.get('condition_groups') or [])}")
+    except Exception as e:
+        print(f"[PROFILES] sanitize-before-write FAILED id={pid} err={type(e).__name__}: {e}")
+        raise
+
+
     def _transform(current: list):
         items = [p for p in (current or []) if isinstance(p, dict)]
         target_idx = None
@@ -1260,33 +1391,63 @@ def add_or_update_profile_by_name(profile: dict) -> dict:
                 existing_id = str(p.get("id") or "").strip() or None
                 break
 
+        # Wir arbeiten in der Transform-Funktion mit einer lokalen Kopie,
+        # damit es keine Scope/UnboundLocal-Probleme gibt.
+        inc = deepcopy(incoming)
+
         # ID setzen
         if existing_id:
-            incoming["id"] = existing_id
+            inc["id"] = existing_id
         else:
-            incoming["id"] = str(uuid.uuid4())
+            inc["id"] = str(uuid.uuid4())
 
-        if not str(incoming.get("id") or "").strip():
+        if not str(inc.get("id") or "").strip():
             raise ValueError("[WRITE] add_or_update_profile_by_name erzeugt Profil ohne ID")
+
+        # --- SANITIZE BEFORE WRITE (damit JSON sauber bleibt) ---
+        try:
+            inc = _sanitize_profiles([inc])[0]
+            print(f"[PROFILES] sanitize-before-write OK id={inc.get('id')} groups={len(inc.get('condition_groups') or [])}")
+
+            try:
+                cg0 = (inc.get("condition_groups") or [])[0]
+                c0  = (cg0.get("conditions") or [])[0]
+                print(
+                    "[DBG] WRITE(upsert_by_name) first condition: "
+                    f"thr={c0.get('threshold')!r} tp={c0.get('threshold_params')!r} "
+                    f"keys={list((c0.get('threshold_params') or {}).keys())}"
+                )
+            except Exception as e:
+                print(f"[DBG] WRITE(upsert_by_name) dump failed: {e}")
+
+
+
+
+        except Exception as e:
+            print(f"[PROFILES] sanitize-before-write FAILED name='{name}' id={inc.get('id')} err={type(e).__name__}: {e}")
+            raise
+
+
 
 
         # Upsert
         if target_idx is None:
-            items.append(incoming)
+            items.append(inc)
             result = {
                 "status": "created",
-                "id": incoming["id"],
+                "id": inc["id"],
                 "created": True,
                 "updated": False,
             }
         else:
-            items[target_idx] = incoming
+            items[target_idx] = inc
             result = {
                 "status": "updated",
-                "id": incoming["id"],
+                "id": inc["id"],
                 "created": False,
                 "updated": True,
             }
+
 
         return items, result
 
