@@ -150,7 +150,7 @@ class TTLGroupExpander:
 
         return ExpandResult(
             symbols=merged,
-            version_key=_mk_version_key(base_symbols, tags),
+            version_key=_mk_version_key(merged, tags),
             debug=debug,
         )
 

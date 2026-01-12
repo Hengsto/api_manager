@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from notifier_evaluator.alarms.policy import apply_alarm_policy
 from notifier_evaluator.context.group_expander import TTLGroupExpander
@@ -72,6 +72,150 @@ class RunSummary:
     status_updates: int = 0
 
 
+@dataclass
+class UnitPlan:
+    profile_id: str
+    gid: str
+    base_symbol: str
+    group: Group
+    profile: Profile
+    resolved_pairs: Dict[str, ResolvedPair]
+    unique_keys: List[RequestKey]
+    row_map: Dict[Tuple[str, str, str, str, str], RequestKey]
+
+
+def _safe_strip(x: Optional[str]) -> str:
+    return (str(x).strip() if x is not None else "").strip()
+
+
+def _normalize_logic(x: Optional[str]) -> str:
+    s = _safe_strip(x).lower()
+    if s in ("and", "or"):
+        return s
+    if s:
+        print(f"[engine] WARN invalid logic_to_prev='{s}' -> default AND")
+    return "and"
+
+
+def _build_logic_to_prev_from_conditions(conds_in_eval_order: List, n_results: int) -> List[str]:
+    """
+    Build logic_to_prev list aligned with results.
+    - length == n_results
+    - index 0 is ignored by chain_eval, but we keep it as "<start>"
+    - for i>=1, logic_to_prev[i] is conds_in_eval_order[i].logic_to_prev normalized
+    """
+    logic: List[str] = []
+    if n_results <= 0:
+        return logic
+
+    # index 0 ignored by chain_eval (documented), but keep a marker
+    logic.append("<start>")
+
+    # for each subsequent row, use that row's logic_to_prev
+    for i in range(1, n_results):
+        try:
+            cond = conds_in_eval_order[i]
+            logic.append(_normalize_logic(getattr(cond, "logic_to_prev", None)))
+        except Exception as e:
+            print(f"[engine] WARN build_logic_to_prev failed at i={i} err={e} -> default AND")
+            logic.append("and")
+
+    return logic
+
+
+def _pick_tick_ts_for_unit(
+    *,
+    profile_id: str,
+    gid: str,
+    base_symbol: str,
+    group_rows: List,
+    row_map: Dict[Tuple[str, str, str, str, str], RequestKey],
+    fetch_results: Dict[RequestKey, FetchResult],
+    clock_interval: str,
+) -> Tuple[Optional[str], Dict[str, object]]:
+    """
+    Best-effort tick timestamp selection.
+
+    Strategy:
+    1) Prefer latest_ts from any request whose *data interval* == clock_interval (LEFT or RIGHT).
+       (This is the closest approximation we have without dedicated candle clock fetching.)
+    2) Fallback: last seen LEFT latest_ts in row order (legacy behavior).
+    """
+    dbg: Dict[str, object] = {
+        "clock_interval": clock_interval,
+        "picked": None,
+        "reason": None,
+        "candidates": 0,
+    }
+
+    clock_interval = _safe_strip(clock_interval)
+
+    # collect candidates where request interval matches clock_interval
+    candidates: List[Tuple[str, str]] = []  # (latest_ts, key_short)
+    for cond in group_rows or []:
+        if not getattr(cond, "enabled", True):
+            continue
+        rid = getattr(cond, "rid", None)
+        if not rid:
+            continue
+
+        for side in ("left", "right"):
+            mk = (profile_id, gid, rid, base_symbol, side)
+            k = row_map.get(mk)
+            if not k:
+                continue
+
+            fr = fetch_results.get(k)
+            if not fr or not fr.latest_ts:
+                continue
+
+            # We try to match the clock interval on the RequestKey context interval
+            try:
+                k_interval = _safe_strip(getattr(getattr(k, "ctx", None), "interval", None))
+            except Exception:
+                k_interval = ""
+
+            if clock_interval and k_interval and (k_interval == clock_interval):
+                candidates.append((str(fr.latest_ts), k.short()))
+
+    dbg["candidates"] = len(candidates)
+
+    if candidates:
+        # pick max by string (works if ISO timestamps are consistent). If not consistent, we still at least pick one.
+        # We also print the top few for debugging.
+        candidates_sorted = sorted(candidates, key=lambda x: x[0])
+        picked_ts, picked_key = candidates_sorted[-1]
+        dbg["picked"] = picked_ts
+        dbg["reason"] = "interval_match"
+        dbg["picked_key"] = picked_key
+        if len(candidates_sorted) > 1:
+            dbg["top2"] = candidates_sorted[-2:]
+        return picked_ts, dbg
+
+    # fallback: legacy "last left wins"
+    tick_ts = None
+    last_key_short = None
+    for cond in group_rows or []:
+        if not getattr(cond, "enabled", True):
+            continue
+        rid = getattr(cond, "rid", None)
+        if not rid:
+            continue
+        mk_left = (profile_id, gid, rid, base_symbol, "left")
+        k_left = row_map.get(mk_left)
+        if not k_left:
+            continue
+        fr = fetch_results.get(k_left)
+        if fr and fr.latest_ts:
+            tick_ts = fr.latest_ts
+            last_key_short = k_left.short()
+
+    dbg["picked"] = tick_ts
+    dbg["reason"] = "fallback_last_left"
+    dbg["picked_key"] = last_key_short
+    return (str(tick_ts).strip() if tick_ts is not None else None), dbg
+
+
 class EvaluatorEngine:
     def __init__(
         self,
@@ -89,7 +233,7 @@ class EvaluatorEngine:
         self.cache = fetch_cache or FetchCache(ttl_sec=cfg.fetch_ttl_sec)
 
     def run(self, profiles: List[Profile]) -> RunSummary:
-        run_id = f"run_{int(time.time()*1000)}"
+        run_id = f"run_{int(time.time() * 1000)}"
         print("[engine] START %s profiles=%d" % (run_id, len(profiles or [])))
 
         self.cache.reset_run_cache()
@@ -97,8 +241,9 @@ class EvaluatorEngine:
 
         # Collect all planned unique RequestKeys across the whole run (global dedupe)
         global_unique: Dict[RequestKey, None] = {}
-        # Map for each evaluation unit: (profile_id,gid,base_symbol) -> plan result
-        unit_plans: Dict[Tuple[str, str, str], Tuple[List[RequestKey], Dict[Tuple[str, str, str, str, str], RequestKey], Group, Profile, Dict[str, ResolvedPair]]] = {}
+
+        # Per evaluation unit plan
+        unit_plans: Dict[Tuple[str, str, str], UnitPlan] = {}
 
         # --- PLAN PHASE ---
         for profile in profiles or []:
@@ -117,14 +262,19 @@ class EvaluatorEngine:
                 symbols = exp.symbols
                 summary.symbols += len(symbols)
 
-                print("[engine] profile=%s gid=%s expanded_symbols=%d" % (profile.profile_id, group.gid, len(symbols)))
+                print(
+                    "[engine] profile=%s gid=%s expanded_symbols=%d version=%s"
+                    % (profile.profile_id, group.gid, len(symbols), getattr(exp, "version_key", "<no-version>"))
+                )
 
                 for base_symbol in symbols:
+                    base_symbol = _safe_strip(base_symbol)
                     if not base_symbol:
                         continue
 
                     # Resolve per row contexts
                     resolved_pairs: Dict[str, ResolvedPair] = {}
+                    resolved_n = 0
                     for cond in group.rows or []:
                         if not cond.enabled:
                             continue
@@ -136,6 +286,12 @@ class EvaluatorEngine:
                             base_symbol=base_symbol,
                         )
                         resolved_pairs[cond.rid] = pair
+                        resolved_n += 1
+
+                    print(
+                        "[engine] PLAN resolve profile=%s gid=%s sym=%s resolved_pairs=%d"
+                        % (profile.profile_id, group.gid, base_symbol, resolved_n)
+                    )
 
                     # Plan requests for this evaluation unit
                     plan = plan_requests_for_symbol(
@@ -147,19 +303,41 @@ class EvaluatorEngine:
                         mode=self.cfg.request_mode,
                         as_of=self.cfg.request_as_of,
                     )
-                    summary.rows += plan.debug.get("rows", 0)
-                    summary.unique_requests += plan.debug.get("unique", 0)
 
+                    summary.rows += plan.debug.get("rows", 0)
+
+                    # global unique
+                    before = len(global_unique)
                     for k in plan.unique_keys:
                         global_unique[k] = None
+                    after = len(global_unique)
 
-                    unit_plans[(profile.profile_id, group.gid, base_symbol)] = (
-                        plan.unique_keys,
-                        plan.row_map,
-                        group,
-                        profile,
-                        resolved_pairs,
+                    print(
+                        "[engine] PLAN unit profile=%s gid=%s sym=%s rows=%d unit_unique=%d global_unique %d->%d"
+                        % (
+                            profile.profile_id,
+                            group.gid,
+                            base_symbol,
+                            plan.debug.get("rows", 0),
+                            plan.debug.get("unique", 0),
+                            before,
+                            after,
+                        )
                     )
+
+                    unit_plans[(profile.profile_id, group.gid, base_symbol)] = UnitPlan(
+                        profile_id=profile.profile_id,
+                        gid=group.gid,
+                        base_symbol=base_symbol,
+                        group=group,
+                        profile=profile,
+                        resolved_pairs=resolved_pairs,
+                        unique_keys=plan.unique_keys,
+                        row_map=plan.row_map,
+                    )
+
+        # Correct global unique_requests count (fix: previously was summed per-unit)
+        summary.unique_requests = len(global_unique)
 
         # --- FETCH PHASE (global unique) ---
         fetch_results: Dict[RequestKey, FetchResult] = {}
@@ -167,7 +345,7 @@ class EvaluatorEngine:
         def _fetch_fn(k: RequestKey) -> FetchResult:
             return self.client.fetch_indicator(k)
 
-        print("[engine] FETCH global_unique=%d" % len(global_unique))
+        print("[engine] FETCH global_unique=%d ttl=%ds" % (len(global_unique), int(self.cfg.fetch_ttl_sec)))
         for k in global_unique.keys():
             fr = self.cache.get_or_fetch(k, _fetch_fn)
             fetch_results[k] = fr
@@ -185,9 +363,14 @@ class EvaluatorEngine:
         now_unix = time.time()
         now_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now_unix))  # UTC-ish; replace if you want tz aware
 
-        for (profile_id, gid, base_symbol), (unit_keys, row_map, group, profile, resolved_pairs) in unit_plans.items():
+        for (profile_id, gid, base_symbol), up in unit_plans.items():
+            group = up.group
+            profile = up.profile
+            resolved_pairs = up.resolved_pairs
+            row_map = up.row_map
+
             # status key uses clock_interval (take from any pair; fallback to group.interval/defaults)
-            clock_interval = None
+            clock_interval = ""
             if resolved_pairs:
                 any_pair = next(iter(resolved_pairs.values()))
                 clock_interval = any_pair.left.clock_interval
@@ -204,6 +387,11 @@ class EvaluatorEngine:
                 clock_interval=clock_interval,
             )
 
+            print(
+                "[engine] EVAL unit profile=%s gid=%s sym=%s ex=%s clock=%s rows_total=%d"
+                % (profile_id, gid, base_symbol, exchange, clock_interval, len(group.rows or []))
+            )
+
             # load status
             st = self.store.load_status(skey)
 
@@ -213,8 +401,8 @@ class EvaluatorEngine:
                 continue
 
             # evaluate all rows in order
-            cond_results = []
-            logic_to_prev = ["and"]  # dummy for index 0
+            cond_results: List = []
+            conds_in_eval_order: List = []
             last_row_left = None
             last_row_right = None
             last_row_op = None
@@ -224,7 +412,12 @@ class EvaluatorEngine:
                     continue
                 pair = resolved_pairs.get(cond.rid)
                 if pair is None:
+                    print(
+                        "[engine] WARN missing resolved_pair profile=%s gid=%s sym=%s rid=%s"
+                        % (profile_id, gid, base_symbol, cond.rid)
+                    )
                     continue
+
                 cr = eval_condition_row(
                     profile_id=profile_id,
                     gid=gid,
@@ -235,29 +428,48 @@ class EvaluatorEngine:
                     fetch_results=fetch_results,
                 )
                 cond_results.append(cr)
-                logic_to_prev.append((cond.logic_to_prev or "and").strip().lower())
+                conds_in_eval_order.append(cond)
 
                 # keep last row values for push formatting/debug
                 last_row_left = cr.left_value
                 last_row_right = cr.right_value
                 last_row_op = cr.op
 
+            # FIX: logic_to_prev aligned with results (no off-by-one)
+            logic_to_prev = _build_logic_to_prev_from_conditions(conds_in_eval_order, len(cond_results))
+
+            if logic_to_prev and (len(logic_to_prev) != len(cond_results)):
+                print(
+                    "[engine] WARN logic_to_prev length mismatch profile=%s gid=%s sym=%s logic=%d results=%d"
+                    % (profile_id, gid, base_symbol, len(logic_to_prev), len(cond_results))
+                )
+
             chain = eval_chain(cond_results, logic_to_prev=logic_to_prev)
 
-            # choose tick ts: simplest: use the max/latest of LEFT timestamp from any row
-            # Better later: fetch a dedicated "clock" candle series. For now: best-effort.
-            tick_ts = None
-            for cond in group.rows or []:
-                if not cond.enabled:
-                    continue
-                rid = cond.rid
-                mk_left = (profile_id, gid, rid, base_symbol, "left")
-                k_left = row_map.get(mk_left)
-                if not k_left:
-                    continue
-                fr = fetch_results.get(k_left)
-                if fr and fr.latest_ts:
-                    tick_ts = fr.latest_ts  # last wins; ok for now
+            # choose tick ts: best-effort selection guided by clock_interval
+            tick_ts, tick_dbg = _pick_tick_ts_for_unit(
+                profile_id=profile_id,
+                gid=gid,
+                base_symbol=base_symbol,
+                group_rows=group.rows or [],
+                row_map=row_map,
+                fetch_results=fetch_results,
+                clock_interval=clock_interval,
+            )
+
+            print(
+                "[engine] TICK_PICK profile=%s gid=%s sym=%s picked=%s reason=%s candidates=%s key=%s"
+                % (
+                    profile_id,
+                    gid,
+                    base_symbol,
+                    tick_dbg.get("picked"),
+                    tick_dbg.get("reason"),
+                    tick_dbg.get("candidates"),
+                    tick_dbg.get("picked_key"),
+                )
+            )
+
             tick_res = detect_new_tick(skey=skey, state=st, current_tick_ts=tick_ts)
 
             thr = apply_threshold(
@@ -283,6 +495,21 @@ class EvaluatorEngine:
                 last_row_op=last_row_op,
             )
 
+            print(
+                "[engine] DECISION profile=%s gid=%s sym=%s partial=%s final=%s tick_new=%s thr_passed=%s push=%s reason=%s"
+                % (
+                    profile_id,
+                    gid,
+                    base_symbol,
+                    chain.partial_true,
+                    chain.final_state.value,
+                    tick_res.new_tick,
+                    thr.passed,
+                    pol.push,
+                    pol.push_reason,
+                )
+            )
+
             # History: always store a compact eval snapshot (optional but super helpful)
             history_events.append(
                 HistoryEvent(
@@ -304,6 +531,7 @@ class EvaluatorEngine:
                         "count_window": list(st.count_window),
                         "new_tick": tick_res.new_tick,
                         "tick_ts": tick_res.tick_ts,
+                        "tick_pick": tick_dbg,
                     },
                     debug={
                         "tick_reason": tick_res.reason,
@@ -311,6 +539,7 @@ class EvaluatorEngine:
                         "policy_reason": pol.push_reason,
                         "policy": pol.debug,
                         "chain": chain.debug,
+                        "logic_to_prev": logic_to_prev,
                     },
                 )
             )
@@ -332,7 +561,15 @@ class EvaluatorEngine:
         self.store.commit(StoreCommit(status_updates=status_updates, history_events=history_events))
 
         print(
-            "[engine] END %s profiles=%d groups=%d symbols=%d rows=%d unique_requests=%d pushes=%d"
-            % (run_id, summary.profiles, summary.groups, summary.symbols, summary.rows, summary.unique_requests, summary.pushes)
+            "[engine] END %s profiles=%d groups=%d symbols=%d rows=%d global_unique_requests=%d pushes=%d"
+            % (
+                run_id,
+                summary.profiles,
+                summary.groups,
+                summary.symbols,
+                summary.rows,
+                summary.unique_requests,
+                summary.pushes,
+            )
         )
         return summary

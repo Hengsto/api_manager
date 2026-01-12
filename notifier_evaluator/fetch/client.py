@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -12,6 +13,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from notifier_evaluator.fetch.types import RequestKey, normalize_indicator_response
+from notifier_evaluator.models.runtime import FetchResult
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -60,14 +62,14 @@ class IndicatorClient:
             raise ValueError("[fetch.client] base_url is empty")
 
         print(
-            "[fetch.client] init base_url=%s timeout=%ss retries=%d verify_ssl=%s"
-            % (self.base_url, cfg.timeout_sec, cfg.retries, cfg.verify_ssl)
+            "[fetch.client] init base_url=%s timeout=%ss retries=%d backoff=%.3f verify_ssl=%s endpoint=%s"
+            % (self.base_url, cfg.timeout_sec, cfg.retries, cfg.backoff, cfg.verify_ssl, cfg.endpoint_indicator)
         )
 
     def _make_session(self, cfg: ClientConfig) -> requests.Session:
         s = requests.Session()
 
-        # urllib3 Retry config (robust genug für Start)
+        # urllib3 Retry config
         retry = Retry(
             total=max(0, int(cfg.retries)),
             connect=max(0, int(cfg.retries)),
@@ -83,15 +85,16 @@ class IndicatorClient:
         s.mount("https://", adapter)
         return s
 
-    def fetch_indicator(self, key: RequestKey) -> Any:
+    def fetch_indicator(self, key: RequestKey) -> FetchResult:
         """
         Führt HTTP Request aus und gibt *normalisierte* FetchResult zurück.
         """
-        url = self.base_url + self.cfg.endpoint_indicator
+        req_id = uuid.uuid4().hex[:8]
+        url = self._build_url()
         params = self._build_params(key)
 
         t0 = time.time()
-        print("[fetch.client] GET %s params=%s" % (url, _short_params(params)))
+        print("[fetch.client] REQ id=%s GET %s key=%s params=%s" % (req_id, url, key.short(), _short_params(params)))
 
         try:
             r = self.session.get(
@@ -102,55 +105,96 @@ class IndicatorClient:
             )
         except Exception as e:
             dt = time.time() - t0
-            print("[fetch.client] EXC key=%s dt=%.3fs err=%s" % (key.short(), dt, e))
+            print("[fetch.client] EXC id=%s key=%s dt=%.3fs err=%s" % (req_id, key.short(), dt, e))
             return normalize_indicator_response(
-                {"error": f"request_exc:{e}", "rows": []},
+                {
+                    "ok": False,
+                    "error": f"request_exc:{e}",
+                    "rows": [],
+                    "_http": {"req_id": req_id, "elapsed_sec": dt, "url": url},
+                },
                 key=key,
             )
 
         dt = time.time() - t0
-        print("[fetch.client] RESP key=%s status=%s dt=%.3fs len=%s" % (key.short(), r.status_code, dt, r.headers.get("Content-Length")))
+        clen = r.headers.get("Content-Length")
+        print(
+            "[fetch.client] RESP id=%s key=%s status=%s dt=%.3fs len=%s"
+            % (req_id, key.short(), r.status_code, dt, clen)
+        )
 
         # best-effort parse
         payload: Any = None
         try:
             payload = r.json()
         except Exception as e:
-            # fallback: text
             txt = ""
             try:
-                txt = r.text[:5000]
+                txt = (r.text or "")[:5000]
             except Exception:
                 txt = "<no-text>"
-            print("[fetch.client] JSON_PARSE_FAIL key=%s err=%s text_snip=%s" % (key.short(), e, txt[:200]))
-            payload = {"error": f"json_parse_fail:{e}", "text": txt, "rows": []}
+            print("[fetch.client] JSON_PARSE_FAIL id=%s key=%s err=%s text_snip=%s" % (req_id, key.short(), e, txt[:200]))
+            payload = {"ok": False, "error": f"json_parse_fail:{e}", "text": txt, "rows": []}
 
         # attach some meta from HTTP
         if isinstance(payload, dict):
             payload.setdefault("_http", {})
             payload["_http"].update(
                 {
+                    "req_id": req_id,
                     "status_code": r.status_code,
                     "elapsed_sec": dt,
                     "url": url,
                 }
             )
 
+            # If HTTP status is not OK, force an error marker (even if body looks "ok")
+            if r.status_code != 200:
+                payload.setdefault("ok", False)
+                payload.setdefault("error", f"http_{r.status_code}")
+                payload["_http"]["http_error"] = True
+
+                # Also include a small response snippet for quick debugging (without flooding logs)
+                try:
+                    payload["_http"]["text_snip"] = (r.text or "")[:300]
+                except Exception:
+                    payload["_http"]["text_snip"] = "<no-text>"
+
+        else:
+            # Non-dict payload but status != 200 -> wrap it so normalize sees the error
+            if r.status_code != 200:
+                payload = {
+                    "ok": False,
+                    "error": f"http_{r.status_code}",
+                    "data": payload if payload is not None else [],
+                    "_http": {"req_id": req_id, "status_code": r.status_code, "elapsed_sec": dt, "url": url, "http_error": True},
+                }
+
         return normalize_indicator_response(payload, key=key)
+
+    def _build_url(self) -> str:
+        ep = (self.cfg.endpoint_indicator or "").strip()
+        if not ep:
+            ep = "/indicator"
+        if not ep.startswith("/"):
+            ep = "/" + ep
+        return self.base_url + ep
 
     def _build_params(self, key: RequestKey) -> Dict[str, Any]:
         """
         Map RequestKey -> query params.
         """
-        # NOTE:
-        # Wenn dein API chart_interval vs indicator_interval trennt,
-        # kannst du das später hier erweitern.
+        cnt = int(key.count) if key.count is not None else 1
+        if cnt <= 0:
+            print(f"[fetch.client] WARN count<=0 for key={key.short()} -> forcing count=1")
+            cnt = 1
+
         out: Dict[str, Any] = {
             "name": key.indicator,
             "symbol": key.symbol,
             "chart_interval": key.interval,
             "indicator_interval": key.interval,
-            "count": int(key.count),
+            "count": cnt,
         }
 
         # exchange (falls API es nutzt)
@@ -158,7 +202,6 @@ class IndicatorClient:
             out["exchange"] = key.exchange
 
         # params ist JSON string
-        # key.params_json ist bereits stable_json(...) aus fetch/types.py
         if key.params_json:
             out["params"] = key.params_json
         else:
@@ -168,11 +211,28 @@ class IndicatorClient:
         if key.output:
             out["output"] = key.output
 
-        # mode / as_of optional (future)
+        # mode / as_of optional
+        # only send as_of if mode is as_of or as_of is explicitly set
         if key.mode:
             out["mode"] = key.mode
         if key.as_of:
             out["as_of"] = key.as_of
+
+        # Extra noisy sanity check
+        print(
+            "[fetch.client] PARAMS key=%s name=%s sym=%s itv=%s ex=%s out=%s cnt=%s mode=%s asof=%s"
+            % (
+                key.short(),
+                out.get("name"),
+                out.get("symbol"),
+                out.get("chart_interval"),
+                out.get("exchange"),
+                out.get("output"),
+                out.get("count"),
+                out.get("mode"),
+                out.get("as_of"),
+            )
+        )
 
         return out
 

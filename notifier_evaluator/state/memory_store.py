@@ -33,10 +33,15 @@ class MemoryStore(StateStore):
         return st
 
     def load_status_batch(self, keys: Iterable[StatusKey]) -> Dict[StatusKey, StatusState]:
+        # IMPORTANT:
+        # keys can be a generator -> don't consume it twice for len().
+        key_list = list(keys)
+
         out: Dict[StatusKey, StatusState] = {}
         n_init = 0
         n_hit = 0
-        for k in keys:
+
+        for k in key_list:
             if k in self._status:
                 out[k] = self._status[k]
                 n_hit += 1
@@ -44,7 +49,8 @@ class MemoryStore(StateStore):
                 out[k] = StatusState()
                 self._status[k] = out[k]
                 n_init += 1
-        print("[memory_store] load_status_batch keys=%d hit=%d init=%d" % (len(list(keys)) if hasattr(keys, "__len__") else -1, n_hit, n_init))
+
+        print("[memory_store] load_status_batch keys=%d hit=%d init=%d" % (len(key_list), n_hit, n_init))
         return out
 
     # ---- COMMIT ----
@@ -67,7 +73,11 @@ class MemoryStore(StateStore):
         if he:
             self._history.extend(he)
             for e in he:
-                print("[memory_store] history=%s" % asdict(e))
+                try:
+                    print("[memory_store] history=%s" % asdict(e))
+                except Exception as ex:
+                    # Keep tests running even if event contains weird types
+                    print("[memory_store] history_asdict_fail err=%s event=%r" % (ex, e))
 
     # ---- HISTORY READ ----
 

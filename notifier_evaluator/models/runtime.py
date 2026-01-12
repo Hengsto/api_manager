@@ -34,6 +34,10 @@ class ResolvedContext:
     exchange: str
     clock_interval: str
 
+    # Optional: where the value comes from (e.g. "price_api", "local", "cache")
+    # Used only for debug/dumps.
+    source: Optional[str] = None
+
 
 @dataclass(frozen=True)
 class ResolvedPair:
@@ -80,7 +84,7 @@ class ConditionResult:
     right_value: Optional[float]
 
     reason: str = ""
-    meta: Dict[str, Any] = field(default_factory=dict)
+    debug: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -103,9 +107,9 @@ class StatusState:
     streak_current: int = 0
     count_window: List[bool] = field(default_factory=list)  # rolling window
 
-    # timestamps
-    last_true_ts: Optional[float] = None
-    last_push_ts: Optional[float] = None
+    # timestamps (string, because engine/policy/formatter use string timestamps everywhere)
+    last_true_ts: Optional[str] = None
+    last_push_ts: Optional[str] = None
     last_tick_ts: Optional[str] = None
 
     # for edge gating / pre-notification change detection
@@ -119,7 +123,7 @@ class StatusState:
 
 @dataclass(frozen=True)
 class HistoryEvent:
-    ts: float
+    ts: str
     profile_id: str
     gid: str
     symbol: str

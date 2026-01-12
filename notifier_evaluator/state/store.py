@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional
 
 from notifier_evaluator.models.runtime import HistoryEvent, StatusKey, StatusState
@@ -16,8 +16,8 @@ class StoreCommit:
       - status_updates: kompletter neuer Status pro Key
       - history_events: append-only Events
     """
-    status_updates: Dict[StatusKey, StatusState]
-    history_events: List[HistoryEvent]
+    status_updates: Dict[StatusKey, StatusState] = field(default_factory=dict)
+    history_events: List[HistoryEvent] = field(default_factory=list)
 
 
 class StateStore(ABC):

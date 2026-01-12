@@ -30,6 +30,7 @@ class CacheStats:
     miss: int = 0
     set: int = 0
     ttl_expired: int = 0
+    purged: int = 0
 
 
 class TTLCache:
@@ -41,38 +42,58 @@ class TTLCache:
     - ok für Start; wenn du später memory growth willst -> LRU/size cap.
     """
 
-    def __init__(self, ttl_sec: int = 5):
-        self.ttl_sec = max(0, int(ttl_sec))
+    def __init__(self, ttl_sec_ok: int = 5, ttl_sec_fail: int = 1):
+        self.ttl_sec_ok = max(0, int(ttl_sec_ok))
+        self.ttl_sec_fail = max(0, int(ttl_sec_fail))
         self._data: Dict[RequestKey, Tuple[float, FetchResult]] = {}
 
-    def get(self, key: RequestKey) -> Optional[FetchResult]:
-        if self.ttl_sec <= 0:
-            return None
+    def _ttl_for(self, val: FetchResult) -> int:
+        # Failure TTL shorter to avoid "sticky" outages while still preventing storms.
+        if val is None:
+            return self.ttl_sec_fail
+        return self.ttl_sec_ok if bool(val.ok) else self.ttl_sec_fail
+
+    def enabled(self) -> bool:
+        return (self.ttl_sec_ok > 0) or (self.ttl_sec_fail > 0)
+
+    def get(self, key: RequestKey) -> Tuple[Optional[FetchResult], bool]:
+        """
+        Returns (val, expired_flag).
+        expired_flag True means: key existed but was expired and got evicted.
+        """
+        if not self.enabled():
+            return None, False
+
         item = self._data.get(key)
         if not item:
-            return None
+            return None, False
+
         exp_ts, val = item
         now = time.time()
         if now <= exp_ts:
-            return val
+            return val, False
+
         # expired
         try:
             del self._data[key]
         except Exception:
             pass
-        return None
+        return None, True
 
     def set(self, key: RequestKey, val: FetchResult) -> None:
-        if self.ttl_sec <= 0:
+        if not self.enabled():
             return
-        exp_ts = time.time() + self.ttl_sec
+        ttl = self._ttl_for(val)
+        if ttl <= 0:
+            return
+        exp_ts = time.time() + ttl
         self._data[key] = (exp_ts, val)
 
     def purge(self) -> int:
         """
         Removes expired items. Returns number removed.
         """
-        if self.ttl_sec <= 0:
+        if not self.enabled():
             return 0
         now = time.time()
         dead = [k for k, (exp, _) in self._data.items() if now > exp]
@@ -92,17 +113,18 @@ class FetchCache:
     Combines run_cache and ttl_cache.
     """
 
-    def __init__(self, ttl_sec: int = 5):
+    def __init__(self, ttl_sec: int = 5, ttl_sec_fail: int = 1, purge_every_sets: int = 200):
         self.run_cache: Dict[RequestKey, FetchResult] = {}
-        self.ttl_cache = TTLCache(ttl_sec=ttl_sec)
+        self.ttl_cache = TTLCache(ttl_sec_ok=ttl_sec, ttl_sec_fail=ttl_sec_fail)
         self.stats = CacheStats()
+        self._purge_every_sets = max(0, int(purge_every_sets))
 
     def reset_run_cache(self) -> None:
         """
         Call at start of each engine run.
         """
         print("[fetch.cache] reset_run_cache() prev_size=%d" % len(self.run_cache))
-        self.run_cache = {}
+        self.run_cache.clear()
 
     def get_or_fetch(self, key: RequestKey, fetch_fn: Callable[[RequestKey], FetchResult]) -> FetchResult:
         """
@@ -112,14 +134,18 @@ class FetchCache:
           3) fetch
         """
         # 1) run_cache
-        if key in self.run_cache:
+        fr = self.run_cache.get(key)
+        if fr is not None:
             self.stats.run_hit += 1
-            fr = self.run_cache[key]
             print("[fetch.cache] RUN_HIT key=%s ok=%s" % (key.short(), fr.ok))
             return fr
 
         # 2) ttl_cache
-        fr2 = self.ttl_cache.get(key)
+        fr2, expired = self.ttl_cache.get(key)
+        if expired:
+            self.stats.ttl_expired += 1
+            print("[fetch.cache] TTL_EXPIRED key=%s ttl_size=%d" % (key.short(), self.ttl_cache.size()))
+
         if fr2 is not None:
             self.stats.ttl_hit += 1
             self.run_cache[key] = fr2
@@ -130,22 +156,28 @@ class FetchCache:
         self.stats.miss += 1
         print("[fetch.cache] MISS key=%s (fetching...)" % key.short())
 
-        fr = fetch_fn(key)
+        fr3 = fetch_fn(key)
 
-        # set caches regardless of ok? -> yes, short TTL prevents storm on failing endpoints
-        self.run_cache[key] = fr
-        self.ttl_cache.set(key, fr)
+        # set caches regardless of ok? -> yes, short fail TTL prevents storms on failing endpoints
+        self.run_cache[key] = fr3
+        self.ttl_cache.set(key, fr3)
         self.stats.set += 1
+
+        # opportunistic purge (keeps cache from growing forever)
+        if self._purge_every_sets > 0 and (self.stats.set % self._purge_every_sets == 0):
+            removed = self.ttl_cache.purge()
+            self.stats.purged += removed
+            print("[fetch.cache] PURGE removed=%d ttl_size=%d" % (removed, self.ttl_cache.size()))
 
         print(
             "[fetch.cache] SET key=%s ok=%s err=%s ttl_size=%d run_size=%d"
-            % (key.short(), fr.ok, fr.error, self.ttl_cache.size(), len(self.run_cache))
+            % (key.short(), fr3.ok, fr3.error, self.ttl_cache.size(), len(self.run_cache))
         )
-        return fr
+        return fr3
 
     def summary(self) -> str:
         return (
             f"run_hit={self.stats.run_hit} ttl_hit={self.stats.ttl_hit} "
-            f"miss={self.stats.miss} set={self.stats.set} ttl_size={self.ttl_cache.size()} "
-            f"run_size={len(self.run_cache)}"
+            f"miss={self.stats.miss} set={self.stats.set} ttl_expired={self.stats.ttl_expired} "
+            f"purged={self.stats.purged} ttl_size={self.ttl_cache.size()} run_size={len(self.run_cache)}"
         )

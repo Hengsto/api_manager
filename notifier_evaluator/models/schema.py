@@ -197,6 +197,15 @@ class ConditionSide:
             cnt = 1
         if cnt < 1:
             cnt = 1
+
+        # best-effort numeric value
+        val = d.get("value", None)
+        try:
+            if val is not None:
+                val = float(val)
+        except Exception:
+            val = None
+
         return ConditionSide(
             kind=kind,
             name=d.get("name"),
@@ -204,7 +213,7 @@ class ConditionSide:
             output=d.get("output"),
             count=cnt,
             source=d.get("source"),
-            value=d.get("value"),
+            value=val,
             symbol=d.get("symbol"),
             interval=d.get("interval"),
             exchange=d.get("exchange"),
@@ -268,8 +277,12 @@ class Group:
     gid: str
     enabled: bool = True
 
-    # Symbole können direkt sein ODER group tags (z.B. "@top10") – Expander löst das auf
+    # Konkrete Symbole (direkt)
     symbols: List[str] = field(default_factory=list)
+
+    # Gruppentags (werden vom Expander in echte Symbole aufgelöst)
+    # WICHTIG: TTLGroupExpander erwartet group.group_tags
+    group_tags: List[str] = field(default_factory=list)
 
     # Gruppen-Defaults (Kontext)
     interval: Optional[str] = None
@@ -294,8 +307,12 @@ class Group:
 
         gid = str(d.get("gid") or d.get("id") or "").strip() or "<missing>"
         enabled = bool(d.get("enabled", True))
+
         symbols = d.get("symbols") if isinstance(d.get("symbols"), list) else []
-        symbols = [str(x) for x in symbols if str(x).strip()]
+        symbols = [str(x).strip() for x in symbols if str(x).strip()]
+
+        group_tags = d.get("group_tags") if isinstance(d.get("group_tags"), list) else []
+        group_tags = [str(x).strip() for x in group_tags if str(x).strip()]
 
         interval = d.get("interval", None)
         exchange = d.get("exchange", None)
@@ -322,6 +339,7 @@ class Group:
             gid=gid,
             enabled=enabled,
             symbols=symbols,
+            group_tags=group_tags,
             interval=interval,
             exchange=exchange,
             threshold=threshold,

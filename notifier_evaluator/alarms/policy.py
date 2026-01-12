@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from notifier_evaluator.models.schema import AlarmConfig
@@ -59,6 +60,53 @@ def _cooldown_allows(*, cooldown_sec: int, now_unix: float, last_push_unix: Opti
     return (now_unix - last_push_unix) >= cooldown_sec
 
 
+def _parse_ts_to_unix(ts: object) -> Optional[float]:
+    """
+    Best-effort parsing for state.last_push_ts.
+    Supported:
+      - float/int unix seconds
+      - numeric strings ("1736690000", "1736690000.123")
+      - ISO8601 strings (with or without timezone); supports trailing 'Z'
+    Returns unix seconds (float) or None if not parseable.
+    """
+    if ts is None:
+        return None
+
+    # direct unix
+    if isinstance(ts, (int, float)):
+        # basic sanity check: ignore negatives
+        return float(ts) if float(ts) >= 0 else None
+
+    # string forms
+    if isinstance(ts, str):
+        s = ts.strip()
+        if not s:
+            return None
+
+        # numeric string -> unix
+        try:
+            return float(s)
+        except Exception:
+            pass
+
+        # ISO string
+        try:
+            # handle trailing Z
+            s2 = s.replace("Z", "+00:00") if s.endswith("Z") else s
+            dt = datetime.fromisoformat(s2)
+
+            # if naive -> assume UTC (better than local guessing)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+
+            return dt.timestamp()
+        except Exception:
+            return None
+
+    # unknown type
+    return None
+
+
 def apply_alarm_policy(
     *,
     skey: StatusKey,
@@ -99,7 +147,7 @@ def apply_alarm_policy(
                 left_value=last_row_left,
                 right_value=last_row_right,
                 op=last_row_op,
-                debug={"prev_partial": prev_partial, "mode": mode},
+                debug={"prev_partial": prev_partial, "mode": mode, "policy_reason": "partial_change"},
             )
         )
         print(
@@ -114,18 +162,19 @@ def apply_alarm_policy(
     # - we push only when threshold_passed=True (this is your "final true after threshold")
     base_trigger = bool(threshold_passed)
 
+    # sanity: threshold passed but not final true => suspicious
+    sanity_mismatch = bool(base_trigger and (final_state != TriState.TRUE))
+    if sanity_mismatch:
+        print(
+            "[policy] WARN threshold_passed=True but final_state!=TRUE profile=%s gid=%s sym=%s final=%s partial=%s"
+            % (skey.profile_id, skey.gid, skey.symbol, final_state.value, partial_true)
+        )
+
     # edge gating
     edge_ok = _edge_allows(edge_only=edge_only, prev_final=prev_final, final_state=final_state)
 
-    # cooldown gating
-    last_push_unix = None
-    if state.last_push_ts:
-        try:
-            # you might store unix directly later; for now: can't parse robustly => skip parsing
-            # keep it simple: engine can pass last_push_unix if you want
-            last_push_unix = None
-        except Exception:
-            last_push_unix = None
+    # cooldown gating (FIXED)
+    last_push_unix = _parse_ts_to_unix(getattr(state, "last_push_ts", None))
     cooldown_ok = _cooldown_allows(cooldown_sec=cooldown, now_unix=now_unix, last_push_unix=last_push_unix)
 
     push = base_trigger and edge_ok and cooldown_ok
@@ -166,13 +215,27 @@ def apply_alarm_policy(
                     "cooldown_sec": cooldown,
                     "edge_only": edge_only,
                     "prev_final": (prev_final.value if prev_final else None),
+                    "policy_reason": push_reason,
+                    "last_push_unix": last_push_unix,
+                    "now_unix": now_unix,
+                    "sanity_mismatch": sanity_mismatch,
                 },
             )
         )
 
         print(
-            "[policy] PUSH profile=%s gid=%s sym=%s mode=%s reason=%s final=%s partial=%s"
-            % (skey.profile_id, skey.gid, skey.symbol, mode, push_reason, final_state.value, partial_true)
+            "[policy] PUSH profile=%s gid=%s sym=%s mode=%s reason=%s final=%s partial=%s cooldown_ok=%s edge_ok=%s"
+            % (
+                skey.profile_id,
+                skey.gid,
+                skey.symbol,
+                mode,
+                push_reason,
+                final_state.value,
+                partial_true,
+                cooldown_ok,
+                edge_ok,
+            )
         )
 
         # deactivation logic
@@ -188,7 +251,7 @@ def apply_alarm_policy(
                     event="deactivated",
                     partial_true=partial_true,
                     final_state=final_state.value,
-                    debug={"mode": mode, "reason": "deactivate_on_push"},
+                    debug={"mode": mode, "reason": "deactivate_on_push", "policy_reason": "deactivated"},
                 )
             )
             print("[policy] DEACTIVATE profile=%s gid=%s sym=%s mode=%s" % (skey.profile_id, skey.gid, skey.symbol, mode))
@@ -212,5 +275,9 @@ def apply_alarm_policy(
             "final_true": final_true,
             "prev_partial": prev_partial,
             "prev_final": (prev_final.value if prev_final else None),
+            "last_push_ts": getattr(state, "last_push_ts", None),
+            "last_push_unix": last_push_unix,
+            "now_unix": now_unix,
+            "sanity_mismatch": sanity_mismatch,
         },
     )

@@ -57,12 +57,17 @@ except Exception as e:
 def _lock_path(path: Path) -> Path:
     """
     Erzeugt Pfad zur Lock-Datei für eine gegebene Ressource.
+
+    WICHTIG:
+    - Muss eindeutig sein, auch wenn verschiedene Files denselben Namen haben.
+    - Deshalb: basename + hash(full_resolved_path)
     """
-    try:
-        name = Path(path).name
-    except Exception:
-        name = str(path)
-    return LOCK_DIR / (name + ".lock")
+    p = to_path(path)
+    base = p.name or "unknown"
+    h = sha256_bytes(str(p).encode("utf-8"))[:16]
+    lp = LOCK_DIR / f"{base}.{h}.lock"
+    log.debug("lock_path: target=%s lockfile=%s", p, lp)
+    return lp
 
 
 def sha256_bytes(b: bytes) -> str:
@@ -72,6 +77,18 @@ def sha256_bytes(b: bytes) -> str:
     h = hashlib.sha256()
     h.update(b)
     return h.hexdigest()
+
+
+def _canon_json_bytes(obj: Any) -> bytes:
+    """
+    Canonical JSON bytes for comparisons (stable across indent/whitespace).
+    """
+    try:
+        s = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return s.encode("utf-8")
+    except Exception as e:
+        log.warning("canon_json failed err=%s -> fallback str()", e)
+        return str(obj).encode("utf-8")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -96,7 +113,8 @@ class FileLock:
         poll: float = 0.1,
         stale_after: float = 300.0,
     ) -> None:
-        self.lockfile = _lock_path(path)
+        self._target = to_path(path)
+        self.lockfile = _lock_path(self._target)
         self.timeout = timeout
         self.poll = poll
         self.stale_after = stale_after
@@ -105,30 +123,79 @@ class FileLock:
     def _is_stale(self) -> bool:
         try:
             st = self.lockfile.stat()
-            return (time.time() - st.st_mtime) > self.stale_after
+            age = time.time() - st.st_mtime
+            stale = age > self.stale_after
+            log.debug("FileLock stale_check lock=%s age=%.2fs stale=%s", self.lockfile, age, stale)
+            return stale
         except FileNotFoundError:
             return False
+        except Exception as e:
+            log.warning("FileLock stale_check failed lock=%s err=%s (treat as NOT stale)", self.lockfile, e)
+            return False
+
+    def _write_lock_meta(self) -> None:
+        """
+        Best-effort metadata in lockfile for debugging/stale analysis.
+        """
+        try:
+            meta = {
+                "pid": os.getpid(),
+                "time_unix": time.time(),
+                "target": str(self._target),
+            }
+            # write small JSON; update mtime too
+            with open(self.lockfile, "w", encoding="utf-8") as f:
+                f.write(json.dumps(meta, ensure_ascii=False))
+                f.flush()
+                os.fsync(f.fileno())
+            log.debug("FileLock meta written: %s -> %s", self.lockfile, meta)
+        except Exception as e:
+            log.debug("FileLock meta write failed: %s err=%s", self.lockfile, e)
 
     def acquire(self) -> None:
         start = time.time()
+        log.debug("FileLock acquire start target=%s lock=%s timeout=%.2fs", self._target, self.lockfile, self.timeout)
+
         while True:
             try:
                 fd = os.open(str(self.lockfile), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 os.close(fd)
                 self._acquired = True
+                self._write_lock_meta()
                 log.debug("FileLock acquired: %s", self.lockfile)
                 return
+
             except FileExistsError:
                 if self._is_stale():
+                    # try to log stale content
+                    try:
+                        txt = self.lockfile.read_text(encoding="utf-8")[:300]
+                        log.warning("FileLock stale detected: %s meta_snip=%s", self.lockfile, txt)
+                    except Exception:
+                        pass
+
                     try:
                         os.unlink(self.lockfile)
                         log.warning("FileLock stale removed: %s", self.lockfile)
                     except FileNotFoundError:
                         pass
+                    except Exception as e:
+                        log.error("FileLock stale remove failed: %s err=%s", self.lockfile, e)
                     continue
+
                 if time.time() - start > self.timeout:
+                    log.error("FileLock timeout acquiring: %s (target=%s)", self.lockfile, self._target)
                     raise TimeoutError(f"Timeout acquiring lock: {self.lockfile}")
+
                 time.sleep(self.poll)
+
+            except PermissionError as e:
+                log.error("FileLock permission error lock=%s err=%s", self.lockfile, e)
+                raise
+
+            except Exception as e:
+                log.error("FileLock acquire unexpected err lock=%s err=%s", self.lockfile, e)
+                raise
 
     def release(self) -> None:
         if self._acquired:
@@ -136,7 +203,7 @@ class FileLock:
                 os.unlink(self.lockfile)
                 log.debug("FileLock released: %s", self.lockfile)
             except FileNotFoundError:
-                pass
+                log.debug("FileLock release: lock already gone %s", self.lockfile)
             finally:
                 self._acquired = False
 
@@ -177,16 +244,19 @@ def write_text_atomic(path: Any, text: str) -> None:
     _ensure_parent_dir(p)
     tmp = p.with_suffix(p.suffix + ".tmp")
     payload = text.encode("utf-8")
+    payload_hash = sha256_bytes(payload)
 
     with FileLock(p):
         try:
             if p.exists():
                 cur = p.read_bytes()
-                if len(cur) == len(payload) and sha256_bytes(cur) == sha256_bytes(payload):
-                    log.debug("write_text_atomic skipped (no change): %s", p)
-                    return
-        except Exception:
-            pass
+                if len(cur) == len(payload):
+                    cur_hash = sha256_bytes(cur)
+                    if cur_hash == payload_hash:
+                        log.debug("write_text_atomic skipped (no change): %s", p)
+                        return
+        except Exception as e:
+            log.debug("write_text_atomic compare failed (%s): %s (will write anyway)", p, e)
 
         with open(tmp, "wb") as f:
             f.write(payload)
@@ -204,7 +274,7 @@ def write_text_atomic(path: Any, text: str) -> None:
         except Exception:
             pass
 
-    log.info("write_text_atomic: %s bytes=%d", p, len(payload))
+    log.info("write_text_atomic: %s bytes=%d sha256=%s", p, len(payload), payload_hash)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -252,18 +322,20 @@ def save_json_atomic(path: Any, data: Any) -> None:
     _ensure_parent_dir(p)
     tmp = p.with_suffix(p.suffix + ".tmp")
 
-    payload_str = json.dumps(data, indent=2, ensure_ascii=False)
-    payload = payload_str.encode("utf-8")
+    payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    payload_hash = sha256_bytes(payload)
 
     with FileLock(p):
         try:
             if p.exists():
                 cur = p.read_bytes()
-                if len(cur) == len(payload) and sha256_bytes(cur) == sha256_bytes(payload):
-                    log.debug("save_json_atomic skipped (no change): %s", p)
-                    return
-        except Exception:
-            pass
+                if len(cur) == len(payload):
+                    cur_hash = sha256_bytes(cur)
+                    if cur_hash == payload_hash:
+                        log.debug("save_json_atomic skipped (no change): %s", p)
+                        return
+        except Exception as e:
+            log.debug("save_json_atomic compare failed (%s): %s (will write anyway)", p, e)
 
         with open(tmp, "wb") as f:
             f.write(payload)
@@ -281,7 +353,7 @@ def save_json_atomic(path: Any, data: Any) -> None:
         except Exception:
             pass
 
-    log.info("save_json_atomic: %s bytes=%d", p, len(payload))
+    log.info("save_json_atomic: %s bytes=%d sha256=%s", p, len(payload), payload_hash)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -330,19 +402,19 @@ def atomic_update_json_list(
     Gibt (new_list, result) zurück und speichert nur bei Änderung.
     """
     p = to_path(path)
-    current = load_json_list(p, fallback=[])
+    _ensure_parent_dir(p)
 
     with FileLock(p):
-        # Aktuellen Stand nochmal lesen, um Race-Conditions zu minimieren
         current = load_json_list(p, fallback=[])
+        log.debug("atomic_update_json_list: loaded %s len=%d", p, len(current))
+
         new_list, result = transform_fn(list(current))
 
-        cur_bytes = json.dumps(current, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        new_bytes = json.dumps(new_list, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        cur_bytes = _canon_json_bytes(current)
+        new_bytes = _canon_json_bytes(new_list)
 
         if sha256_bytes(cur_bytes) != sha256_bytes(new_bytes):
             tmp = p.with_suffix(p.suffix + ".tmp")
-            _ensure_parent_dir(p)
             with open(tmp, "wb") as f:
                 f.write(json.dumps(new_list, indent=2, ensure_ascii=False).encode("utf-8"))
                 f.flush()

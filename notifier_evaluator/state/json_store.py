@@ -6,9 +6,9 @@ import json
 import os
 import threading
 from dataclasses import asdict
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from notifier_evaluator.models.runtime import HistoryEvent, StatusKey, StatusState
+from notifier_evaluator.models.runtime import HistoryEvent, StatusKey, StatusState, TriState
 from notifier_evaluator.state.store import StateStore, StoreCommit
 
 
@@ -170,25 +170,105 @@ class JsonStore(StateStore):
                 pass
             raise
 
+    def _parse_tristate(self, v: Any) -> TriState:
+        """
+        Accepts TriState, strings ("true"/"false"/"unknown"), or None.
+        Anything else => UNKNOWN.
+        """
+        if isinstance(v, TriState):
+            return v
+        if v is None:
+            return TriState.UNKNOWN
+        try:
+            s = str(v).strip().lower()
+        except Exception:
+            return TriState.UNKNOWN
+        if s == TriState.TRUE.value:
+            return TriState.TRUE
+        if s == TriState.FALSE.value:
+            return TriState.FALSE
+        if s == TriState.UNKNOWN.value:
+            return TriState.UNKNOWN
+        # tolerate legacy booleans
+        if s in ("1", "true", "yes"):
+            return TriState.TRUE
+        if s in ("0", "false", "no"):
+            return TriState.FALSE
+        print("[json_store] WARN parse_tristate unknown value=%r -> UNKNOWN" % (v,))
+        return TriState.UNKNOWN
+
+    def _parse_bool(self, v: Any, default: bool = False) -> bool:
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return default
+        try:
+            s = str(v).strip().lower()
+        except Exception:
+            return default
+        if s in ("1", "true", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "no", "n", "off"):
+            return False
+        # fallback: python truthiness is dangerous here -> keep default
+        print("[json_store] WARN parse_bool weird value=%r -> default=%s" % (v, default))
+        return default
+
+    def _normalize_bool_list(self, v: Any) -> List[bool]:
+        """
+        Ensure count_window is List[bool] even if JSON contains ints/strings/None.
+        """
+        if not isinstance(v, list):
+            return []
+        out: List[bool] = []
+        for x in v:
+            out.append(self._parse_bool(x, default=False))
+        return out
+
     def _dict_to_status(self, d: dict) -> StatusState:
         # tolerant migration: ignore unknown fields, fill missing
         st = StatusState()
-        st.active = bool(d.get("active", True))
+
+        st.active = self._parse_bool(d.get("active", True), default=True)
         st.streak_current = int(d.get("streak_current", 0) or 0)
-        st.count_window = list(d.get("count_window", []) or [])
-        st.last_partial_true = d.get("last_partial_true", None)
-        st.last_final_state = d.get("last_final_state", None)  # might be string; engine treats as optional
+        st.count_window = self._normalize_bool_list(d.get("count_window", []) or [])
+
+        # MUST be bool / TriState for policy/edge logic
+        st.last_partial_true = self._parse_bool(d.get("last_partial_true", False), default=False)
+        st.last_final_state = self._parse_tristate(d.get("last_final_state", TriState.UNKNOWN))
+
+        # timestamps: keep tolerant (string/float/None). Don't force parse here.
         st.last_true_ts = d.get("last_true_ts", None)
         st.last_push_ts = d.get("last_push_ts", None)
         st.last_tick_ts = d.get("last_tick_ts", None)
+
         st.last_reason = d.get("last_reason", "") or ""
         st.last_debug = d.get("last_debug", {}) or {}
+
+        # extra noisy debug if stuff looks off
+        if not isinstance(st.count_window, list):
+            print("[json_store] WARN count_window not list after normalize? %r" % (st.count_window,))
         return st
+
+    def _try_float(self, v: Any) -> Optional[float]:
+        try:
+            if v is None:
+                return None
+            return float(v)
+        except Exception:
+            return None
 
     def _dict_to_event(self, d: dict) -> HistoryEvent:
         # tolerant event restore
+
+        ts_raw = d.get("ts", "")
+        ts_num = self._try_float(ts_raw)
+
+        # keep as float if possible, else keep raw string (engine currently writes string timestamps)
+        ts_val: Any = ts_num if ts_num is not None else str(ts_raw)
+
         return HistoryEvent(
-            ts=str(d.get("ts", "")),
+            ts=ts_val,  # type: ignore
             profile_id=str(d.get("profile_id", "")),
             gid=str(d.get("gid", "")),
             symbol=str(d.get("symbol", "")),
@@ -196,6 +276,7 @@ class JsonStore(StateStore):
             event=str(d.get("event", "")),
             partial_true=d.get("partial_true", None),
             final_state=d.get("final_state", None),
+            threshold_passed=d.get("threshold_passed", None),
             rid=d.get("rid", None),
             left_value=d.get("left_value", None),
             right_value=d.get("right_value", None),

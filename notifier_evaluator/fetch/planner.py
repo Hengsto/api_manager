@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from notifier_evaluator.fetch.types import RequestKey
 from notifier_evaluator.models.schema import Condition
@@ -35,6 +35,14 @@ class PlanResult:
     debug: Dict[str, int] = field(default_factory=dict)
 
 
+def _safe_count(x: Optional[int]) -> int:
+    try:
+        n = int(x or 1)
+        return n if n >= 1 else 1
+    except Exception:
+        return 1
+
+
 def plan_requests_for_symbol(
     *,
     profile_id: str,
@@ -50,32 +58,51 @@ def plan_requests_for_symbol(
 
     resolved_pairs: dict[rid] -> ResolvedPair
     """
-    unique_set = set()
+    mode2 = (mode or "latest").strip() or "latest"
+    as_of2 = (as_of.strip() if isinstance(as_of, str) else as_of)
+
+    unique_set: Set[RequestKey] = set()
     unique_keys: List[RequestKey] = []
     row_map: Dict[Tuple[str, str, str, str, str], RequestKey] = {}
 
     dbg_rows = 0
     dbg_keys = 0
     dbg_dedup = 0
+    dbg_skipped = 0
 
     for cond in rows or []:
         if not cond.enabled:
             continue
+
         rid = cond.rid
         pair = resolved_pairs.get(rid)
         if pair is None:
+            dbg_skipped += 1
             print("[planner] WARN missing resolved pair rid=%s profile=%s gid=%s base_symbol=%s" % (rid, profile_id, gid, base_symbol))
             continue
 
+        left_name = (cond.left.name or "").strip()
+        right_name = (cond.right.name or "").strip()
+        if not left_name or not right_name:
+            dbg_skipped += 1
+            print(
+                "[planner] WARN missing indicator name rid=%s profile=%s gid=%s base_symbol=%s left=%s right=%s (skip row)"
+                % (rid, profile_id, gid, base_symbol, bool(left_name), bool(right_name))
+            )
+            continue
+
+        left_count = _safe_count(cond.left.count)
+        right_count = _safe_count(cond.right.count)
+
         # LEFT
         k_left = RequestKey.from_parts(
-            indicator=cond.left.name,
+            indicator=left_name,
             ctx=pair.left,
             params=cond.left.params or {},
             output=cond.left.output,
-            count=cond.left.count,
-            mode=mode,
-            as_of=as_of,
+            count=left_count,
+            mode=mode2,
+            as_of=as_of2,
         )
 
         map_key_left = (profile_id, gid, rid, base_symbol, RowSide.LEFT.value)
@@ -90,13 +117,13 @@ def plan_requests_for_symbol(
 
         # RIGHT
         k_right = RequestKey.from_parts(
-            indicator=cond.right.name,
+            indicator=right_name,
             ctx=pair.right,
             params=cond.right.params or {},
             output=cond.right.output,
-            count=cond.right.count,
-            mode=mode,
-            as_of=as_of,
+            count=right_count,
+            mode=mode2,
+            as_of=as_of2,
         )
 
         map_key_right = (profile_id, gid, rid, base_symbol, RowSide.RIGHT.value)
@@ -112,14 +139,13 @@ def plan_requests_for_symbol(
         dbg_rows += 1
 
         print(
-            "[planner] profile=%s gid=%s base_symbol=%s rid=%s -> "
-            "L=%s | R=%s"
+            "[planner] profile=%s gid=%s base_symbol=%s rid=%s -> L=%s | R=%s"
             % (profile_id, gid, base_symbol, rid, k_left.short(), k_right.short())
         )
 
     print(
-        "[planner] DONE profile=%s gid=%s base_symbol=%s rows=%d planned_keys=%d unique=%d dedup=%d"
-        % (profile_id, gid, base_symbol, dbg_rows, dbg_keys, len(unique_keys), dbg_dedup)
+        "[planner] DONE profile=%s gid=%s base_symbol=%s rows=%d skipped=%d planned_keys=%d unique=%d dedup=%d mode=%s as_of=%s"
+        % (profile_id, gid, base_symbol, dbg_rows, dbg_skipped, dbg_keys, len(unique_keys), dbg_dedup, mode2, as_of2)
     )
 
     return PlanResult(
@@ -127,6 +153,7 @@ def plan_requests_for_symbol(
         row_map=row_map,
         debug={
             "rows": dbg_rows,
+            "skipped": dbg_skipped,
             "keys_total": dbg_keys,
             "unique": len(unique_keys),
             "dedup": dbg_dedup,
