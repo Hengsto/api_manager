@@ -14,7 +14,13 @@ import pandas as pd
 # Konfig
 # ---------------------------------------------------------------------
 DEBUG = True
-PRICE_API_BASE = os.getenv("PRICE_API_BASE", "http://127.0.0.1:8000").rstrip("/")
+
+from config import PRICE_API_ENDPOINT
+PRICE_API_BASE = str(PRICE_API_ENDPOINT).rstrip("/")
+
+if DEBUG:
+    print(f"[BOOT][change] PRICE_API_BASE(from config.PRICE_API_ENDPOINT)={PRICE_API_BASE!r}")
+
 
 SPEC: Dict[str, Any] = {
     "name": "change",
@@ -195,7 +201,8 @@ def _http_fetch_base(
         }
         if DEBUG:
             print(f"[change/http] GET {PRICE_API_BASE}/indicator name={base_name} sym={symbol} chart={c_int} ind={i_int} params={qs['params']}")
-        r = requests.get(f"{PRICE_API_BASE}/indicator", params=qs, timeout=20)
+            r = requests.get(f"{PRICE_API_BASE}/indicator", params=qs, timeout=20)
+
         if not r.ok:
             raise RuntimeError(f"[change/http] upstream status={r.status_code} body={r.text[:220]}")
         payload = r.json()
@@ -296,7 +303,9 @@ def change(
     else:
         is_pct = True  # Default
 
-    out_series = pd.Series(np.nan, index=series.index, dtype="float64")
+    den = np.nan if (ts_anchor_val == 0 or pd.isna(ts_anchor_val)) else ts_anchor_val
+    out_series = ((series - ts_anchor_val) / den) * float(pct_scale)
+
 
     # Modus A: timestamp-basierter Vergleich
     ts_anchor_val = None

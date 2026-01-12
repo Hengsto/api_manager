@@ -1,29 +1,28 @@
 version: "3.9"
 
 services:
-  registry:
-    container_name: registry_service
+  notifier_api:
+    container_name: notifier_api
     build:
       context: .
       dockerfile: Dockerfile
-    # ENV-Variablen: .env optional + direkt in compose
     env_file:
       - .env
     environment:
-      # Falls in .env nicht gesetzt, werden diese hier genutzt
       MAIN_IP: "0.0.0.0"
-      REGISTRY_PORT: "8098"
-      # Erlaubte Origins für dein Dashboard / andere Clients
-      # Passe diese Liste an deine echten Hosts an
-      REGISTRY_CORS_ORIGINS: "http://localhost:8050,http://127.0.0.1:8050"
-      # Optional: falls du irgendwo mit REGISTRY_ENDPOINT arbeitest
-      # REGISTRY_ENDPOINT: "http://registry:8098"
+      PORT: "8098"
+
+      # CORS: main.py nimmt NOTIFIER_CORS_ORIGINS zuerst, dann REGISTRY..., dann IND_PROXY...
+      NOTIFIER_CORS_ORIGINS: "http://localhost:8050,http://127.0.0.1:8050"
+
+      # Optional: falls du registry_api.py per Datei nachladen willst
+      # REGISTRY_API_FILE: "/app/api/registry_api.py"
+
+      # Optional, aber sinnvoll: Lock dir fix setzen
+      NOTIFIER_LOCK_DIR: "/app/data/locks"
     volumes:
-      # Persistente Datenbank / Files des Registry-Managers
-      # Passt zum üblichen config-Setup mit BASE_DIR / "data" / "registry_manager"
-      - ./data/registry_manager:/app/data/registry_manager
+      # Persist result JSONs / whatever config.py benutzt
+      - ./data:/app/data
     ports:
-      # HostPort:ContainerPort
-      # außen 8098, innen 8098 (wie REGISTRY_PORT)
       - "8098:8098"
     restart: unless-stopped

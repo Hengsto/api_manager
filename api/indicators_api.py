@@ -10,6 +10,8 @@ import requests
 import pandas as pd
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from config import PRICE_API_ENDPOINT
+
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,9 +24,13 @@ from indicators._utils import normalize_chart_df
 # ──────────────────────────────────────────────────────────────────────────────
 # Konfiguration
 # ──────────────────────────────────────────────────────────────────────────────
-PRICE_API_BASE = os.getenv("PRICE_API_BASE", "http://127.0.0.1:8000").rstrip("/")
 DEBUG = os.getenv("DEBUG", "1") not in ("0", "false", "False")
 DEFAULT_TIMEOUT = float(os.getenv("IND_PROXY_TIMEOUT", "20"))
+
+PRICE_API_BASE = str(PRICE_API_ENDPOINT).rstrip("/")
+if DEBUG:
+    print(f"[BOOT][INDPROXY] PRICE_API_BASE(from config.PRICE_API_ENDPOINT)={PRICE_API_BASE!r}")
+
 
 # Kleine TTLs für häufige, kleine Endpoints
 SMALL_TTL = float(os.getenv("IND_PROXY_SMALL_TTL", "2.0"))  # /symbols, /intervals, /indicators

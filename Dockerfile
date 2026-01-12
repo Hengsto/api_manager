@@ -1,39 +1,26 @@
 # Dockerfile
-# Minimaler, aber sauberer Python-Build für deinen Registry-Host
-
 FROM python:3.12-slim
 
-# Keine .pyc und ungepuffertes Logging
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Sicherstellen, dass /app existiert und Arbeitsverzeichnis setzen
 WORKDIR /app
 
-# Systempakete nur bei Bedarf (hier sehr schlank)
-# Wenn du später z.B. libpq, gcc etc. brauchst, hier ergänzen.
+# Minimal runtime packages (curl optional für healthchecks)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    && rm -rf /var/lib/apt/lists/*
+    curl \
+  && rm -rf /var/lib/apt/lists/*
 
-# Dependencies installieren
-# -> requirements.txt MUSS im Projektroot liegen
-COPY requirements.txt /app/
+# Dependencies zuerst für besseres Layer-Caching
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Restlichen Code ins Image kopieren
+# App-Code
 COPY . /app
 
-# Standard-ENV für Container:
-# - MAIN_IP = 0.0.0.0, damit FastAPI im Container erreichbar ist
-ENV MAIN_IP=0.0.0.0
+# Defaults (können via compose überschrieben werden)
+ENV MAIN_IP=0.0.0.0 \
+    PORT=8098
 
-# Optional: default Port im Container (kann per ENV überschrieben werden)
-ENV REGISTRY_PORT=8098
-
-# Debug-Ausgaben im Container sinnvoller
-ENV PYTHONUNBUFFERED=1
-
-# Startkommando:
-# Wir starten dein main_registry.py, das intern uvicorn.run(...) macht.
-CMD ["python", "main_registry.py"]
+# Sauberer als "python main.py": direkt uvicorn starten
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8098", "--log-level", "info"]

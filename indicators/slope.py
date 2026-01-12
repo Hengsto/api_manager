@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
 import json
 import importlib
 from typing import Dict, Any, Optional, List, Tuple
@@ -14,7 +13,14 @@ import pandas as pd
 # Konfig
 # ---------------------------------------------------------------------
 DEBUG = True
-PRICE_API_BASE = os.getenv("PRICE_API_BASE", "http://127.0.0.1:8000").rstrip("/")
+
+# Single source of truth: config baut aus PRICE_API_HOST + PRICE_API_PORT die echte URL
+from config import PRICE_API_ENDPOINT  # noqa: E402
+
+PRICE_API_BASE = str(PRICE_API_ENDPOINT).rstrip("/")
+
+if DEBUG:
+    print(f"[BOOT][slope] PRICE_API_BASE(from config.PRICE_API_ENDPOINT)={PRICE_API_BASE!r}")
 
 SPEC: Dict[str, Any] = {
     "name": "slope",
@@ -55,7 +61,7 @@ def _pick_output_column(df: pd.DataFrame, value_cols: List[str], want: Optional[
         raise ValueError(f"[slope] input='{want}' nicht gefunden. value_cols={value_cols} cols={cols}")
     if isinstance(value_cols, list) and len(value_cols) == 1 and value_cols[0] in df.columns:
         return value_cols[0]
-    for cand in ("rsi","ema","signal","value","close","macd","price"):
+    for cand in ("rsi", "ema", "signal", "value", "close", "macd", "price"):
         if cand in lower_map: return lower_map[cand]
     numeric = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
     return numeric[0] if numeric else cols[0]
@@ -115,7 +121,7 @@ def _local_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 
         "signal": sig.astype("float32"),
         "hist": hist.astype("float32"),
     })
-    return out, {"fast": fast, "slow": slow, "signal": signal, **used}, ["macd","signal","hist"]
+    return out, {"fast": fast, "slow": slow, "signal": signal, **used}, ["macd", "signal", "hist"]
 
 def _sanitize_params_for_http(d: Dict[str, Any]) -> Dict[str, Any]:
     """Entfernt interne Inject-Keys (beginnt mit '_')."""
@@ -290,8 +296,10 @@ def slope(
         raise ValueError("window muss >= 1 sein")
 
     if DEBUG:
-        print(f"[slope] incoming: base={base!r} window={window} input={input!r} "
-              f"base_params.keys={list((base_params or {}).keys())} unspecified.keys={list(u.keys())}")
+        print(
+            f"[slope] incoming: base={base!r} window={window} input={input!r} "
+            f"base_params.keys={list((base_params or {}).keys())} unspecified.keys={list(u.keys())}"
+        )
         print(f"[slope] merged_base_keys={list(bp.keys())}")
 
     base_df, base_used, base_value_cols, base_kind = _compute_base_series(df, base, bp)
@@ -309,8 +317,12 @@ def slope(
 
     out = pd.DataFrame({"Timestamp": base_df["Timestamp"].values, "slope": slope_vals.astype("float32").values})
     used = {
-        "base": base, "base_kind": base_kind, "input": pick, "window": int(window),
-        "base_params": dict(base_used or {}), "merged_base_params": dict(bp),
+        "base": base,
+        "base_kind": base_kind,
+        "input": pick,
+        "window": int(window),
+        "base_params": dict(base_used or {}),
+        "merged_base_params": dict(bp),
     }
 
     if DEBUG:
