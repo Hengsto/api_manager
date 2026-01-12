@@ -14,9 +14,21 @@ WICHTIG: Keine Imports der Indicator-Module hier (keine harte Kopplung / kein St
 """
 
 CUSTOMS: Dict[str, Dict[str, Any]] = {
+    "value": {
+        "name": "value",
+        "display_name": "📡 Value",
+        "summary": "Gibt einen konstanten numerischen Wert für alle Zeilen zurück (z. B. 25).",
+        "required": ["value"],
+        "optional": ["unspecified"],
+        "outputs": ["value"],
+        "visibility": ["notifier", "screener"],
+        "sort_order": 1,
+        "module": "indicators.value",
+        "fn": "value",  # Signatur: value(df, *, value, **kwargs)
+    },
     "price": {
         "name": "price",
-        "display_name": "Price (Rohwert)",
+        "display_name": "📡 Price",
         "summary": "Gibt den Rohpreis (z. B. Close) des Basis-Datasets unverändert zurück.",
         "required": ["source"],
         "optional": ["unspecified"],
@@ -28,7 +40,7 @@ CUSTOMS: Dict[str, Dict[str, Any]] = {
     },
     "volume": {
         "name": "volume",
-        "display_name": "Volume (Rohwert)",
+        "display_name": "📡 Volume",
         "summary": "Gibt das Volumen (z. B. 'volume') des Basis-Datasets unverändert zurück.",
         "required": ["source"],
         "optional": ["unspecified"],
@@ -40,7 +52,7 @@ CUSTOMS: Dict[str, Dict[str, Any]] = {
     },
     "slope": {
         "name": "slope",
-        "display_name": "Slope (auf Basis)",
+        "display_name": "📡 Slope",
         "summary": "Steigung einer Basisreihe (z. B. RSI/MACD) über N Schritte.",
         "required": ["base", "window"],
         "optional": ["input", "base_params", "unspecified"],
@@ -52,7 +64,7 @@ CUSTOMS: Dict[str, Dict[str, Any]] = {
     },
     "change": {
         "name": "change",
-        "display_name": "Change (vs. Timestamp)",
+        "display_name": "📡 Change",
         "summary": "Änderung einer Basisreihe seit fixem Zeitpunkt (absolut oder prozentual).",
         "required": ["base", "type", "timestamp"],
         "optional": ["input", "pct_scale", "base_params", "unspecified"],
@@ -63,6 +75,7 @@ CUSTOMS: Dict[str, Dict[str, Any]] = {
         "fn": "change",  # Signatur: change(df, *, base, input=None, type='percentage', pct_scale=100.0, timestamp=..., base_params=None, unspecified=None)
     },
 }
+
 
 
 def _merge_unspecified(dest: Dict[str, Any], extras: Dict[str, Any]) -> Dict[str, Any]:

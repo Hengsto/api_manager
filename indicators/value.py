@@ -73,3 +73,14 @@ def compute(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dic
             print(f"[value] rows={len(out)} value={val}")
 
     return out, used, ["value"]
+
+def value(df: pd.DataFrame, **params: Any) -> Tuple[pd.DataFrame, Dict[str, Any], List[str]]:
+    """
+    LOCAL dispatcher entrypoint.
+    indicators_api erwartet: out_df, used, out_cols = value(df, **params)
+    """
+    if DEBUG:
+        print(f"[value.entry] params={params}")
+
+    # compute liefert bereits exakt (out_df, used, out_cols)
+    return compute(df, params)

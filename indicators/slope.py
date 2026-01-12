@@ -1,13 +1,20 @@
 # indicators/slope.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import Dict, Any, Optional, List, Tuple
-import numpy as np
-import pandas as pd
+
+import os
 import json
 import importlib
+from typing import Dict, Any, Optional, List, Tuple
 
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------------
+# Konfig
+# ---------------------------------------------------------------------
 DEBUG = True
+PRICE_API_BASE = os.getenv("PRICE_API_BASE", "http://127.0.0.1:8000").rstrip("/")
 
 SPEC: Dict[str, Any] = {
     "name": "slope",
@@ -18,6 +25,9 @@ SPEC: Dict[str, Any] = {
     "sort_order": 30,
 }
 
+# ---------------------------------------------------------------------
+# Utils
+# ---------------------------------------------------------------------
 def _ensure_dict(x: Any) -> Dict[str, Any]:
     if isinstance(x, dict):
         return dict(x)
@@ -57,8 +67,6 @@ def _try_import(mod: str):
         if DEBUG:
             print(f"[slope] import miss: {mod} ({type(e).__name__}: {e})")
         return None
-
-# ---- lokale Minimal-Indikatoren (Fallback) ---------------------------------
 
 def _ensure_price_cols(df: pd.DataFrame) -> pd.DataFrame:
     lower = {c.lower(): c for c in df.columns}
@@ -109,6 +117,108 @@ def _local_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 
     })
     return out, {"fast": fast, "slow": slow, "signal": signal, **used}, ["macd","signal","hist"]
 
+def _sanitize_params_for_http(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Entfernt interne Inject-Keys (beginnt mit '_')."""
+    out: Dict[str, Any] = {}
+    for k, v in (d or {}).items():
+        if str(k).startswith("_"):
+            continue
+        out[k] = v
+    return out
+
+def _rows_to_df(payload: Dict[str, Any], orig_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    rows = payload.get("rows")
+    cols = payload.get("columns")
+    data = payload.get("data")
+
+    df = pd.DataFrame()
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        df = pd.DataFrame(rows)
+    elif isinstance(rows, list) and isinstance(cols, list) and rows and isinstance(rows[0], (list, tuple)):
+        try:
+            df = pd.DataFrame(rows, columns=cols)
+        except Exception as e:
+            if DEBUG: print(f"[slope/_rows_to_df] matrix build failed: {type(e).__name__}: {e}")
+    elif isinstance(data, list) and data and isinstance(data[0], dict):
+        df = pd.DataFrame(data)
+    elif isinstance(data, list) and isinstance(cols, list) and data and isinstance(data[0], (list, tuple)):
+        try:
+            df = pd.DataFrame(data, columns=cols)
+        except Exception as e:
+            if DEBUG: print(f"[slope/_rows_to_df] matrix(data) build failed: {type(e).__name__}: {e}")
+
+    if df.empty:
+        if DEBUG: print("[slope/_rows_to_df] empty payload → empty DataFrame")
+        return df
+
+    cand_names = ["Timestamp", "timestamp", "Timestamp_ISO", "time", "t", "date", "Date", "index"]
+    ts_col = None
+    for c in cand_names:
+        if c in df.columns:
+            ts_col = c
+            break
+
+    if ts_col is None and "index" in payload and isinstance(payload["index"], list) and len(payload["index"]) == len(df):
+        df["Timestamp"] = payload["index"]
+        ts_col = "Timestamp"
+
+    if ts_col is not None:
+        s = df[ts_col]
+        if pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s):
+            s = pd.to_datetime(s.where(s < 10**12, s/1000.0), unit="s", utc=True, errors="coerce")
+        else:
+            s = pd.to_datetime(s, utc=True, errors="coerce")
+        df["Timestamp"] = s
+    elif orig_df is not None and "Timestamp" in orig_df.columns and len(orig_df) == len(df):
+        if DEBUG: print("[slope/_rows_to_df] fallback Timestamp from orig_df (len match)")
+        df["Timestamp"] = pd.to_datetime(orig_df["Timestamp"], utc=True, errors="coerce")
+    else:
+        if DEBUG:
+            print(f"[slope/_rows_to_df] no timestamp column detected; cols={list(df.columns)}")
+
+    return df
+
+# ---------------------------------------------------------------------
+# Base-Resolver
+# ---------------------------------------------------------------------
+def _http_fetch_base(
+    base_name: str,
+    base_params: Dict[str, Any],
+    orig_df: Optional[pd.DataFrame] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any], List[str], str]:
+    symbol = base_params.get("_symbol")
+    c_int  = base_params.get("_chart_interval")
+    i_int  = base_params.get("_indicator_interval") or c_int
+    if not symbol or not c_int:
+        raise ValueError("[slope/http] fehlende _symbol/_chart_interval in base_params (Injection aus Proxy)")
+
+    http_params = _sanitize_params_for_http(base_params)
+    try:
+        import requests
+        qs = {
+            "name": base_name,
+            "symbol": symbol,
+            "chart_interval": c_int,
+            "indicator_interval": i_int,
+            "params": json.dumps(http_params, separators=(",", ":"), sort_keys=True),
+        }
+        if DEBUG:
+            print(f"[slope/http] GET {PRICE_API_BASE}/indicator name={base_name} sym={symbol} chart={c_int} ind={i_int} params={qs['params']}")
+        r = requests.get(f"{PRICE_API_BASE}/indicator", params=qs, timeout=20)
+        if not r.ok:
+            raise RuntimeError(f"[slope/http] upstream status={r.status_code} body={r.text[:220]}")
+        payload = r.json()
+        df = _rows_to_df(payload, orig_df=orig_df)
+        if "Timestamp" not in df.columns or df["Timestamp"].isna().all():
+            raise RuntimeError("[slope/http] Upstream lieferte keine brauchbare Zeitachse")
+        value_cols = [c for c in df.columns if c != "Timestamp" and pd.api.types.is_numeric_dtype(df[c])]
+        if not value_cols:
+            value_cols = [c for c in df.columns if c != "Timestamp"]
+        used = {"_http": True, "_endpoint": "/indicator", "_base": base_name, "_symbol": symbol, "_chart": c_int, "_ind": i_int}
+        return df, used, value_cols, "http"
+    except Exception as e:
+        raise RuntimeError(f"[slope/http] fetch failed for base={base_name}: {type(e).__name__}: {e}")
+
 def _compute_base_series(df: pd.DataFrame, base_name: str, base_params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], List[str], str]:
     name = str(base_name).strip().lower()
 
@@ -156,8 +266,12 @@ def _compute_base_series(df: pd.DataFrame, base_name: str, base_params: Dict[str
         out_df, used, cols = _local_macd(df, fast=fast, slow=slow, signal=signal, source=source)
         return out_df, used, cols, "local"
 
-    raise ValueError(f"[slope] unbekannter Basis-Indikator: {base_name} (keine Registry und kein lokaler Fallback)")
+    # 3) HTTP-Fallback
+    return _http_fetch_base(name, base_params, orig_df=df)
 
+# ---------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------
 def slope(
     df: pd.DataFrame,
     *,

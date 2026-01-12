@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Literal, Tuple
-from enum import Enum
 import math
 import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
 
 class TriState(str, Enum):
@@ -15,16 +15,20 @@ class TriState(str, Enum):
     UNKNOWN = "unknown"
 
 
-Side = Literal["left", "right"]
+class RowSide(str, Enum):
+    LEFT = "left"
+    RIGHT = "right"
 
 
 @dataclass(frozen=True)
 class ResolvedContext:
     """
     Runtime-only resolved context.
+
     clock_interval ist die Engine-Tick-Clock (meist group.interval),
     NICHT zwingend left/right interval.
     """
+
     symbol: str
     interval: str
     exchange: str
@@ -38,46 +42,36 @@ class ResolvedPair:
 
 
 @dataclass(frozen=True)
-class RequestKey:
-    """
-    Dedupe Key für Fetch.
-    mode:
-      - latest: immer latest candle/value
-      - as_of: bis zu einem timestamp
-    """
-    kind: Literal["indicator", "price"]  # value braucht keinen fetch
-    name: str  # indicator name oder "price"
+class StatusKey:
+    """Key für Status/Cooldown/Tick State."""
+
+    profile_id: str
+    gid: str
     symbol: str
-    interval: str
     exchange: str
-
-    params: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
-    output: Optional[str] = None
-    count: int = 1
-
-    mode: Literal["latest", "as_of"] = "latest"
-    as_of: Optional[float] = None  # unix ts wenn mode=as_of
+    clock_interval: str
 
 
 @dataclass
 class FetchResult:
     """
-    Normalisierte Antwort aus price_api.
-    - value: letzter Wert (oder None)
-    - ts_last: timestamp des letzten Werts (unix float oder None)
-    - series: optional Liste von (ts, value) für count>1
-    - ok: ob fetch erfolgreich war
+    Normalisierte Antwort aus price_api / indicator client.
+
+    latest_value / latest_ts: letzter Punkt der Serie.
+    series: optionale Rohserie, falls count>1 geplant wurde.
+    meta: Debug/Tracing (z. B. RequestKey short, output)
     """
+
     ok: bool
-    value: Optional[float]
-    ts_last: Optional[float]
-    series: Optional[List[Tuple[float, Optional[float]]]] = None
-    raw: Optional[Dict[str, Any]] = None
+    latest_value: Optional[float]
+    latest_ts: Optional[str]
+    series: Optional[List[Dict[str, Any]]] = None
     error: Optional[str] = None
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
-class ConditionEvalResult:
+class ConditionResult:
     rid: str
     state: TriState
     op: str
@@ -90,23 +84,19 @@ class ConditionEvalResult:
 
 
 @dataclass
-class ChainEvalResult:
+class ChainResult:
     partial_true: bool
     final_state: TriState
-    meta: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ThresholdEvalResult:
-    passed: bool
-    meta: Dict[str, Any] = field(default_factory=dict)
+    debug: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class StatusState:
     """
-    Status pro (profile_id, gid, symbol, exchange) — NICHT im Profil-JSON.
+    Status pro (profile_id, gid, symbol, exchange).
+    Wird NICHT im Profil-JSON gespeichert.
     """
+
     active: bool = True
 
     # threshold state
@@ -116,11 +106,15 @@ class StatusState:
     # timestamps
     last_true_ts: Optional[float] = None
     last_push_ts: Optional[float] = None
-    last_tick_ts: Optional[float] = None
+    last_tick_ts: Optional[str] = None
 
     # for edge gating / pre-notification change detection
     last_final_state: TriState = TriState.UNKNOWN
     last_partial_true: bool = False
+
+    # debug bookkeeping
+    last_reason: str = ""
+    last_debug: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -136,11 +130,12 @@ class HistoryEvent:
     final_state: Optional[str] = None
     threshold_passed: Optional[bool] = None
 
+    rid: Optional[str] = None
     left_value: Optional[float] = None
     right_value: Optional[float] = None
     op: Optional[str] = None
 
-    threshold_state: Dict[str, Any] = field(default_factory=dict)
+    threshold_snapshot: Dict[str, Any] = field(default_factory=dict)
     debug: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -153,3 +148,13 @@ def is_nan(x: Any) -> bool:
         return isinstance(x, float) and math.isnan(x)
     except Exception:
         return False
+
+
+def safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        fx = float(x)
+        return fx if not math.isnan(fx) else None
+    except Exception:
+        return None
