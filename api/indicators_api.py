@@ -33,7 +33,7 @@ if DEBUG:
 
 
 # Kleine TTLs für häufige, kleine Endpoints
-SMALL_TTL = float(os.getenv("IND_PROXY_SMALL_TTL", "2.0"))  # /symbols, /intervals, /indicators
+SMALL_TTL = float(os.getenv("IND_PROXY_SMALL_TTL", "5.0"))  # /symbols, /intervals, /indicators
 
 # Maximal erlaubtes count (DoS-Schutz)
 MAX_COUNT = int(os.getenv("IND_PROXY_MAX_COUNT", "5000"))
@@ -363,15 +363,29 @@ def intervals(request: Request):
     return out
 
 @router.get("/chart")
-def chart(request: Request, symbol: str, interval: str):
+def chart(
+    request: Request,
+    symbol: str,
+    interval: str,
+    count: Optional[int] = Query(None, ge=1),
+):
     req_id = _new_req_id(request.headers.get("X-Request-ID"))
-    params = {"symbol": symbol, "interval": interval}
+    capped_count = _cap_count(count)
+
+    params: Dict[str, Any] = {"symbol": symbol, "interval": interval}
+    if capped_count is not None:
+        params["count"] = capped_count
+
     if DEBUG:
-        print(f"[PROXY][IND][{req_id}] /chart IN  params={params}")
+        print(f"[PROXY][IND][{req_id}] /chart IN params={params}")
+
     out = _get_upstream("/chart", params=params, req_id=req_id, timeout=TO_CHART)
+
     if DEBUG:
         _dbg_out_preview("/chart", out, req_id=req_id)
+
     return out
+
 
 @router.get("/indicators")
 def indicators(request: Request):
@@ -468,6 +482,53 @@ def signals(request: Request):
 # ──────────────────────────────────────────────────────────────────────────────
 # Local fallback for /custom (value, price, slope, change)
 # ──────────────────────────────────────────────────────────────────────────────
+from cachetools import TTLCache
+from threading import RLock
+
+_local_chart_cache = TTLCache(maxsize=64, ttl=SMALL_TTL)
+
+_local_chart_lock = threading.RLock()
+
+
+def _get_chart_cached_local(symbol: str, interval: str, req_id: str, count: Optional[int] = None):
+    capped_count = _cap_count(count)
+
+    # Cache-Key MUSS count enthalten, sonst kriegst du falsche Treffer (full vs small)
+    key = (PRICE_API_BASE, symbol, interval, capped_count)
+
+    with _local_chart_lock:
+        if key in _local_chart_cache:
+            if DEBUG:
+                print(f"[PROXY][IND][{req_id}] chart LOCAL cache-hit {key}")
+            return _local_chart_cache[key]
+
+    params: Dict[str, Any] = {"symbol": symbol, "interval": interval}
+    if capped_count is not None:
+        params["count"] = capped_count
+
+    data = _get_upstream(
+        "/chart",
+        params=params,
+        timeout=TO_CHART,
+        req_id=req_id,
+    )
+
+    if DEBUG:
+        try:
+            rows = (data or {}).get("data") or (data or {}).get("rows") or []
+            cnt = int((data or {}).get("count") or (len(rows) if isinstance(rows, list) else -1))
+        except Exception as e:
+            cnt = -1
+            print(f"[PROXY][IND][{req_id}] chart LOCAL store cnt parse failed: {type(e).__name__}: {e}")
+        print(f"[PROXY][IND][{req_id}] chart LOCAL store {key} cnt={cnt}")
+
+    with _local_chart_lock:
+        _local_chart_cache[key] = data
+
+    return data
+
+
+
 def _local_compute_custom(
     name: str,
     symbol: str,
@@ -488,12 +549,11 @@ def _local_compute_custom(
         print(f"[PROXY][IND][{req_id}] /custom LOCAL DISPATCH name={lname} shaped={shaped_params}")
 
     # 1) Chart holen (für alle, inkl. value; bei value gibt es optionalen Synthetic-Fallback)
-    chart = _get_upstream(
-        "/chart",
-        params={"symbol": symbol, "interval": chart_interval},
-        timeout=TO_CHART,
-        req_id=req_id,
-    )
+    # Heuristik: wenn der Client nur 5 will, brauchst du für price/value nicht mehr.
+    # Für echte Indikatoren ggf. später Lookback hochziehen (z.B. 200).
+    chart = _get_chart_cached_local(symbol, chart_interval, req_id, count=count)
+
+
 
     # 2) Einheitlich via Utils normalisieren
     try:
@@ -621,7 +681,25 @@ def custom(
     if DEBUG:
         print(f"[PROXY][IND][{req_id}] /custom -> upstream GET {PRICE_API_BASE}/custom")
 
-    # 1) Versuch: /custom (Upstream)
+    # --- Short-circuit: lokale Customs IMMER lokal berechnen ---
+    # Diese Namen sind bei dir bewusst "custom" und NICHT Upstream-Indikatoren.
+    LOCAL_ONLY = {"price", "value", "slope", "change"}
+
+    lname = (name or "").strip().lower()
+    if lname in LOCAL_ONLY:
+        if DEBUG:
+            print(f"[PROXY][IND][{req_id}] /custom local-only hit -> computing locally (skip upstream)")
+        return _local_compute_custom(
+            name=lname,
+            symbol=symbol,
+            chart_interval=chart_interval,
+            indicator_interval=indicator_interval,
+            shaped_params=shaped,
+            count=capped_count,
+            req_id=req_id,
+        )
+
+    # --- Für alles andere: Upstream /custom versuchen (falls du später echten Upstream hast) ---
     try:
         out = _get_upstream("/custom", params=query, req_id=req_id, timeout=TO_CUSTOM)
         if DEBUG:
@@ -629,29 +707,11 @@ def custom(
             print(f"[PROXY][OUT][{req_id}] /custom ok rows={rows} custom={out.get('custom')}")
         return out
     except HTTPException as e:
+        # Wenn Upstream /custom nicht existiert, ist das ein Setup-Fehler.
+        # Du kannst hier entscheiden: 404 -> direkt 501 statt Chaos-Fallback.
         status = int(getattr(e, "status_code", 0) or 0)
-        # 404 → 2) Fallback /indicator (manche Customs sind upstream noch Indikatoren)
         if status == 404:
-            if DEBUG:
-                print(f"[PROXY][IND][{req_id}] /custom 404 -> fallback to /indicator (name={name})")
-            try:
-                coerced = _coerce_params_types(shaped)
-                ind_query = dict(query)
-                ind_query["params"] = _sj(coerced)
-                if DEBUG:
-                    print(f"[PROXY][SHP2][{req_id}] coerced={ind_query['params']}")
-                out2 = _get_upstream("/indicator", params=ind_query, req_id=req_id, timeout=TO_INDICATOR)
-                if DEBUG:
-                    _dbg_out_preview("/indicator<fallback>", out2, req_id=req_id)
-                return out2
-            except HTTPException as e2:
-                # 404/422 o.ä. → 3) Lokaler Fallback (value/price/slope/change)
-                if int(getattr(e2, "status_code", 0) or 0) in (404, 422):
-                    if DEBUG:
-                        print(f"[PROXY][IND][{req_id}] /indicator fallback failed ({getattr(e2, 'status_code', '?')}) -> LOCAL fallback")
-                    return _local_compute_custom(name, symbol, chart_interval, indicator_interval, shaped, capped_count, req_id=req_id)
-                raise
-        # Andere Fehler direkt hochreichen
+            raise HTTPException(status_code=501, detail={"error": "upstream_custom_missing", "upstream": PRICE_API_BASE})
         raise
 
 # ──────────────────────────────────────────────────────────────────────────────
