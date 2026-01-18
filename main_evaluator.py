@@ -16,6 +16,7 @@ from notifier_evaluator.eval.engine import EngineConfig, EvaluatorEngine
 from notifier_evaluator.eval.validate import validate_profiles
 from notifier_evaluator.fetch.client import ClientConfig, IndicatorClient
 from notifier_evaluator.models.schema import EngineDefaults, Profile
+from notifier_evaluator.models.normalize import normalize_profile_dict
 from notifier_evaluator.state.json_store import JsonStore
 
 
@@ -32,7 +33,8 @@ def _prime_sys_path() -> None:
 
 
 def _default_profiles_path() -> Path:
-    return Path(os.getenv("EVALUATOR_PROFILES_FILE", "") or (Path(cfg.EVALUATOR_DATA_DIR) / "evaluator_profiles.json"))
+    # evaluator reads notifier profiles as source of truth
+    return Path(os.getenv("EVALUATOR_PROFILES_FILE", "") or str(getattr(cfg, "PROFILES_NOTIFIER")))
 
 
 def _default_status_path() -> Path:
@@ -44,9 +46,12 @@ def _default_history_path() -> Path:
 
 
 def _load_profiles(path: Path) -> list[Profile]:
+    print(f"[evaluator] profiles_file={path} exists={path.exists()} size={(path.stat().st_size if path.exists() else 0)}")
+
     if not path.exists():
         print(f"[evaluator] profiles file missing: {path}")
         return []
+
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
@@ -63,8 +68,32 @@ def _load_profiles(path: Path) -> list[Profile]:
         print(f"[evaluator] profiles payload invalid: expected list or {{profiles: []}} in {path}")
         return []
 
-    profiles = [Profile.from_dict(item) for item in raw_profiles]
-    print(f"[evaluator] loaded profiles={len(profiles)} from {path}")
+    default_ex = str(getattr(cfg, "DEFAULT_EXCHANGE", "")).strip() or "binance"
+    default_it = str(getattr(cfg, "DEFAULT_INTERVAL", "")).strip() or "1h"
+
+    profiles: list[Profile] = []
+    bad = 0
+
+    print(f"[evaluator] raw profiles list_len={len(raw_profiles)} default_ex={default_ex!r} default_it={default_it!r}")
+
+    for i, item in enumerate(raw_profiles):
+        if not isinstance(item, dict):
+            bad += 1
+            print(f"[evaluator] profile idx={i} not dict -> skip type={type(item)}")
+            continue
+        try:
+            norm = normalize_profile_dict(
+                item,
+                default_exchange=default_ex,
+                default_interval=default_it,
+                debug=True,
+            )
+            profiles.append(Profile.from_dict(norm))
+        except Exception as e:
+            bad += 1
+            print(f"[evaluator] profile idx={i} invalid: {e} keys={list(item.keys())[:50]}")
+
+    print(f"[evaluator] loaded profiles={len(profiles)} bad={bad} from {path}")
     return profiles
 
 
@@ -98,8 +127,8 @@ def _build_engine(
     mapping_path: Path | None,
 ) -> EvaluatorEngine:
     defaults = EngineDefaults(
-        exchange=os.getenv("EVALUATOR_DEFAULT_EXCHANGE", ""),
-        interval=os.getenv("EVALUATOR_DEFAULT_INTERVAL", ""),
+        exchange=os.getenv("EVALUATOR_DEFAULT_EXCHANGE", str(getattr(cfg, "DEFAULT_EXCHANGE", ""))),
+        interval=os.getenv("EVALUATOR_DEFAULT_INTERVAL", str(getattr(cfg, "DEFAULT_INTERVAL", ""))),
         clock_interval=os.getenv("EVALUATOR_DEFAULT_CLOCK_INTERVAL", ""),
         source=os.getenv("EVALUATOR_DEFAULT_SOURCE", "Close"),
     )
@@ -112,6 +141,8 @@ def _build_engine(
         request_as_of=os.getenv("EVALUATOR_REQUEST_AS_OF", "") or None,
     )
 
+    print(f"[DEBUG] Evaluator JsonStore status_path={status_path}")
+    print(f"[DEBUG] Evaluator JsonStore history_path={history_path}")
     store = JsonStore(status_path=str(status_path), history_path=str(history_path))
 
     mapping = _load_group_mapping(mapping_path)
@@ -142,6 +173,8 @@ def _run_once(profiles_path: Path, engine: EvaluatorEngine, allow_invalid: bool)
         return
 
     validation = validate_profiles(profiles)
+    print(f"[evaluator] validate ok={validation.ok} errors={len(validation.errors or []) if hasattr(validation, 'errors') else 'n/a'}")
+
     if not validation.ok and not allow_invalid:
         print("[evaluator] validation failed; set EVALUATOR_ALLOW_INVALID=1 to force run")
         return
@@ -178,6 +211,7 @@ def main() -> None:
         "INDICATOR_BASE_URL",
         f"http://{cfg.MAIN_IP}:{cfg.NOTIFIER_PORT}",
     )
+    print(f"[DEBUG] indicator_base_url={indicator_base_url!r}")
 
     profiles_path = Path(args.profiles)
     status_path = Path(args.status)
