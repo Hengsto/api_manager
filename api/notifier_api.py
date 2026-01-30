@@ -7,10 +7,11 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Body
 
+from api.notifier.validate import validate_profiles_payload
+
 from api.notifier.profiles import (
-    ProfileRead,
-    ProfileCreate,
-    load_profiles_normalized,
+    list_profiles as profiles_list_profiles,
+    get_profile_by_id as profiles_get_profile_by_id,
     add_or_update_profile_by_name,
     delete_profile_by_id,
 )
@@ -49,91 +50,109 @@ router = APIRouter(tags=["notifier"])
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Profiles (NEW SCHEMA ONLY)
 # ---------------------------------------------------------------------------
 
-def _find_profile_by_id(pid: str) -> Optional[Dict[str, Any]]:
-    """Sucht ein Profil in den normalisierten Profilen per ID."""
-    profiles = load_profiles_normalized()
-    pid_clean = str(pid).strip()
-
-    # Debug (prints bleiben absichtlich; zusätzlich log.debug)
-    try:
-        print(f"[API] _find_profile_by_id pid='{pid_clean}' profiles={len(profiles)}")
-    except Exception:
-        pass
-    log.debug("[API] _find_profile_by_id pid='%s' profiles=%s", pid_clean, len(profiles))
-
-    for p in profiles:
-        cur = str(p.get("id") or "").strip()
-        if cur == pid_clean:
-            try:
-                print(f"[API] _find_profile_by_id hit id='{cur}' name='{p.get('name')}'")
-            except Exception:
-                pass
-            log.debug("[API] _find_profile_by_id HIT id='%s' name='%s'", cur, p.get("name"))
-            return p
-
-    try:
-        print(f"[API] _find_profile_by_id MISS pid='{pid_clean}'")
-    except Exception:
-        pass
-    log.debug("[API] _find_profile_by_id MISS pid='%s'", pid_clean)
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Profiles
-# ---------------------------------------------------------------------------
-
-@router.get("/profiles", response_model=List[ProfileRead])
-def list_profiles() -> List[ProfileRead]:
+@router.get("/profiles", response_model=List[Dict[str, Any]])
+def list_profiles() -> List[Dict[str, Any]]:
     """
-    Gibt alle Profile (sanitisiert) zurück.
+    Gibt alle Profile (STRICT, NEW SCHEMA) zurück.
+    Keine Migration, kein Normalizer, null bleibt null.
     """
-    profiles = load_profiles_normalized()
+    try:
+        profiles = profiles_list_profiles()
+    except Exception as e:
+        try:
+            print(f"[API] GET /profiles ERROR: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        log.exception("[API] GET /profiles ERROR")
+        raise HTTPException(status_code=500, detail=str(e))
+
     try:
         print(f"[API] GET /profiles → count={len(profiles)}")
     except Exception:
         pass
     log.debug("[API] GET /profiles -> count=%s", len(profiles))
 
-    # Explizit casten in ProfileRead (sanitisiert)
-    return [ProfileRead(**p) for p in profiles]
+    return profiles
 
 
 @router.post("/profiles", response_model=Dict[str, Any])
-def upsert_profile(profile: ProfileCreate) -> Dict[str, Any]:
+def upsert_profile(
+    payload: Dict[str, Any] = Body(...),
+    validate_only: bool = Query(False),
+) -> Dict[str, Any]:
     """
-    Upsert nach Profil-Name (case-insensitive).
+    Upsert nach Profil-Name (case-insensitive) – NEW SCHEMA ONLY.
     - Wenn Name existiert → aktualisieren (ID bleibt).
-    - Sonst neues Profil mit neuer ID.
+    - Sonst neues Profil (ID kommt aus Payload oder wird intern erzeugt).
+
+    validate_only=true:
+    - Validiert NUR (strict, NEW schema) und speichert NICHTS.
 
     Gibt direkt das Outcome von add_or_update_profile_by_name zurück,
     damit das Frontend wie früher mit `status`/`id` arbeiten kann.
     """
-    # Pydantic v1/v2 kompatibel in dict umwandeln
-    payload = profile.model_dump() if hasattr(profile, "model_dump") else profile.dict()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Payload muss ein JSON-Objekt sein.")
 
-    # Debug: Eingehende Daten
+    # Debug: Eingehende Daten (NEW schema keys)
     try:
-        cg_count = len(payload.get("condition_groups") or [])
+        groups_count = len(payload.get("groups") or [])
         print(
-            f"[API] POST /profiles name='{payload.get('name')}' "
-            f"condition_groups={cg_count}"
+            f"[API] POST /profiles validate_only={validate_only} "
+            f"name='{payload.get('name')}' groups={groups_count} keys={list(payload.keys())[:20]}"
         )
     except Exception:
         pass
     log.debug(
-        "[API] POST /profiles name='%s' condition_groups=%s",
+        "[API] POST /profiles validate_only=%s name='%s' groups=%s",
+        validate_only,
         payload.get("name"),
-        len(payload.get("condition_groups") or []),
+        len(payload.get("groups") or []),
     )
 
-    # Speichern per Name (Upsert)
-    outcome = add_or_update_profile_by_name(payload)
+    try:
+        # IMPORTANT: validate_only darf NICHT speichern. Erst validieren, dann return.
+        if validate_only:
+            res = validate_profiles_payload(payload)
 
-    # Debug: Speicherausgang
+            # res["results"][0] enthält ok/errors für das eine Profil
+            one = (res.get("results") or [{}])[0]
+            ok = bool(one.get("ok"))
+            errs = one.get("errors", [])
+
+            try:
+                print(f"[API] POST /profiles validate_only result ok={ok} errors={len(errs) if isinstance(errs, list) else '??'}")
+            except Exception:
+                pass
+
+            if not ok:
+                # UI-friendly structured errors
+                raise HTTPException(
+                    status_code=422,
+                    detail={"ok": False, "errors": errs if isinstance(errs, list) else [str(errs)]},
+                )
+
+
+            return {"status": "validated", "ok": True}
+
+        # Normal path: Save/Upsert (strict parsing happens inside profiles module)
+        outcome = add_or_update_profile_by_name(payload)
+
+    except HTTPException:
+        # Do NOT destroy structured errors from above
+        raise
+    except Exception as e:
+        # Wenn schema kaputt ist, soll das hart sichtbar sein
+        try:
+            print(f"[API] POST /profiles VALIDATION/WRITE ERROR: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        log.exception("[API] POST /profiles ERROR")
+        raise HTTPException(status_code=400, detail=str(e))
+
     try:
         print(f"[API] POST /profiles outcome={outcome}")
     except Exception:
@@ -146,25 +165,38 @@ def upsert_profile(profile: ProfileCreate) -> Dict[str, Any]:
             detail="Profil konnte nicht gespeichert werden (Outcome ohne ID).",
         )
 
-    # WICHTIG: direkt das Outcome zurückgeben, NICHT noch mal wrappen
     return outcome
 
 
-@router.get("/profiles/{profile_id}", response_model=ProfileRead)
-def get_profile(profile_id: str) -> ProfileRead:
+@router.get("/profiles/{profile_id}", response_model=Dict[str, Any])
+def get_profile(profile_id: str) -> Dict[str, Any]:
     """
-    Einzelnes Profil nach ID.
+    Einzelnes Profil nach ID (STRICT, NEW SCHEMA).
     """
     pid = str(profile_id or "").strip()
-    p = _find_profile_by_id(pid)
+    if not pid:
+        raise HTTPException(status_code=400, detail="profile_id darf nicht leer sein.")
+
+    try:
+        p = profiles_get_profile_by_id(pid)
+    except Exception as e:
+        try:
+            print(f"[API] GET /profiles/{pid} ERROR: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        log.exception("[API] GET /profiles/%s ERROR", pid)
+        raise HTTPException(status_code=500, detail=str(e))
+
     if not p:
         raise HTTPException(status_code=404, detail="Profil nicht gefunden.")
+
     try:
-        print(f"[API] GET /profiles/{pid}")
+        print(f"[API] GET /profiles/{pid} HIT name='{p.get('name')}'")
     except Exception:
         pass
     log.debug("[API] GET /profiles/%s", pid)
-    return ProfileRead(**p)
+
+    return p
 
 
 @router.delete("/profiles/{profile_id}", response_model=Dict[str, Any])
@@ -199,12 +231,84 @@ def api_delete_profile(profile_id: str) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
-        # prints bleiben, aber jetzt auch stacktrace im logger
         try:
             print(f"[API] DELETE /profiles/{pid} ERROR: {e}")
         except Exception:
             pass
         log.exception("[API] DELETE /profiles/%s ERROR", pid)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.put("/profiles/{profile_id}", response_model=Dict[str, Any])
+def api_update_profile(
+    profile_id: str,
+    payload: Dict[str, Any] = Body(...),
+    validate_only: bool = Query(False),
+) -> Dict[str, Any]:
+    """
+    Update nach ID – NEW SCHEMA ONLY.
+    validate_only=true: nur validieren, nicht speichern.
+    """
+    pid = str(profile_id or "").strip()
+    if not pid:
+        raise HTTPException(status_code=400, detail="profile_id darf nicht leer sein.")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Payload muss ein JSON-Objekt sein.")
+
+    # ID hart erzwingen (UI darf da nicht rumeiern)
+    payload = dict(payload)
+    payload["id"] = pid
+
+    try:
+        groups_count = len(payload.get("groups") or [])
+        print(
+            f"[API] PUT /profiles/{pid} validate_only={validate_only} "
+            f"name='{payload.get('name')}' groups={groups_count}"
+        )
+    except Exception:
+        pass
+
+    if validate_only:
+        res = validate_profiles_payload(payload)
+        one = (res.get("results") or [{}])[0]
+        ok = bool(one.get("ok"))
+        errs = one.get("errors", [])
+        if not ok:
+            # 422 statt 400 (sauberer für Client)
+            raise HTTPException(status_code=422, detail={"ok": False, "errors": errs})
+        return {"status": "validated", "ok": True}
+
+    try:
+        # dein profiles-layer soll strict sein
+        outcome = add_or_update_profile_by_name(payload)
+        return outcome
+    except Exception as e:
+        try:
+            print(f"[API] PUT /profiles/{pid} ERROR: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/profiles/validate", response_model=Dict[str, Any])
+def api_validate_profiles(payload: Any = Body(...)) -> Dict[str, Any]:
+    """
+    Validiert Profile gegen NEW Schema (STRICT), speichert NICHTS.
+    Payload kann sein:
+      - ein Profile-Objekt
+      - eine Liste von Profile-Objekten
+    """
+    try:
+        res = validate_profiles_payload(payload)
+        try:
+            print(f"[API] POST /profiles/validate ok={res.get('ok')} count={res.get('count')}")
+        except Exception:
+            pass
+        return res
+    except Exception as e:
+        try:
+            print(f"[API] POST /profiles/validate ERROR: {type(e).__name__}: {e}")
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -239,6 +343,8 @@ def api_sync_status(
     Synchronisiert Status mit Profilen.
     - Wenn profiles=None → lokale Profile verwenden.
     - Wenn profiles übergeben → diese explizit als Basis für den Sync verwenden.
+
+    WICHTIG: Diese profiles müssen NEW SCHEMA sein.
     """
     try:
         print(f"[API] POST /status/sync body_profiles={0 if profiles is None else len(profiles)}")
@@ -252,7 +358,6 @@ def api_sync_status(
     if profiles is not None:
         if not isinstance(profiles, list):
             raise HTTPException(status_code=400, detail="profiles muss eine Liste sein oder null.")
-        # Drop-in, aber schützt dich vor kaputten Payloads
         for i, item in enumerate(profiles):
             if not isinstance(item, dict):
                 raise HTTPException(status_code=400, detail=f"profiles[{i}] muss ein Objekt (dict) sein.")
@@ -385,7 +490,6 @@ def api_add_alarm(alarm: AlarmIn) -> AlarmOut:
     payload = alarm.model_dump() if hasattr(alarm, "model_dump") else alarm.dict()
     aid = add_alarm_entry(payload)
 
-    # Drop-in Verhalten: wir laden wie vorher erneut und suchen den Eintrag
     items = load_alarms()
     created = None
     for a in items:

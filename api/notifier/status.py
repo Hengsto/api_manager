@@ -9,11 +9,12 @@ from typing import Any, Dict, List, Optional
 
 from config import STATUS_NOTIFIER
 from storage import load_json_any, save_json_any
+import json
+
+
 from api.notifier.profiles import (
-    load_profiles_normalized,
+    list_profiles as profiles_list_profiles,
     profiles_fingerprint,
-    _sanitize_profiles,
-    _normalize_deactivate_value,
 )
 
 log = logging.getLogger("notifier.status")
@@ -41,44 +42,75 @@ def _safe_strip(v: Any) -> str:
         return ""
 
 
+def _fmt_indicator(ind: Any) -> str:
+    """
+    Formatiert ein Indicator-Objekt aus dem NEUEN Schema:
+      {name, output, symbol|null, interval|null, params}
+    Null bleibt Null-semantisch; hier wird nur gelabelt, NICHT aufgelöst.
+    """
+    if not isinstance(ind, dict):
+        return "—"
+
+    name = _safe_strip(ind.get("name")) or "—"
+    out = _safe_strip(ind.get("output")) or ""
+    sym = ind.get("symbol", None)  # kann None sein -> bewusst
+    inv = ind.get("interval", None)
+
+    parts: List[str] = [name]
+    if out:
+        parts.append(f":{out}")
+
+    # Override sichtbar machen, aber null NICHT ersetzen
+    if sym is not None:
+        sym_s = _safe_strip(sym)
+        if sym_s:
+            parts.append(f" [{sym_s}]")
+
+    if inv is not None:
+        inv_s = _safe_strip(inv)
+        if inv_s:
+            parts.append(f" @{inv_s}")
+
+    # value-indikator knapp anzeigen
+    if name == "value":
+        params = ind.get("params") if isinstance(ind.get("params"), dict) else {}
+        if isinstance(params, dict) and "value" in params:
+            parts.append(f"={params.get('value')}")
+
+    return "".join(parts) if parts else "—"
+
+
 def _label_only_conditions(group: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Erzeugt eine einfache, UI-taugliche Cond-Liste (ohne Werte) für den Status-Snapshot.
+    NEW SCHEMA ONLY.
     """
     out: List[Dict[str, Any]] = []
+
     for c in (group.get("conditions") or []):
         if not isinstance(c, dict):
             continue
 
-        left = _safe_strip(c.get("left")) or "—"
-        right = _safe_strip(c.get("right"))
-
-        if not right:
-            rsym = _safe_strip(c.get("right_symbol"))
-            rinv = _safe_strip(c.get("right_interval"))
-            rout = _safe_strip(c.get("right_output"))
-            if rsym:
-                parts = [rsym]
-                if rinv:
-                    parts.append(f"@{rinv}")
-                if rout:
-                    parts.append(f":{rout}")
-                right = "".join(parts)
-
-        right = right or "—"
+        left = _fmt_indicator(c.get("left"))
+        right = _fmt_indicator(c.get("right"))
         op = (_safe_strip(c.get("op")) or "gt").lower()
+
+        thr = c.get("threshold", None)
+        thr_label = None
+        if isinstance(thr, dict):
+            ttype = _safe_strip(thr.get("type"))
+            tparams = thr.get("params") if isinstance(thr.get("params"), dict) else {}
+            if ttype:
+                thr_label = {"type": ttype, "params": tparams}
 
         out.append(
             {
+                "rid": _safe_strip(c.get("rid")) or None,
+                "logic": (_safe_strip(c.get("logic")) or "and").lower(),
                 "left": left,
                 "right": right,
-                "left_spec": None,
-                "right_spec": None,
-                "left_output": None,
-                "right_output": None,
-                "left_col": None,
-                "right_col": None,
                 "op": op,
+                "threshold": thr_label,  # optional, rein declarativ
                 "passed": False,
                 "left_value": None,
                 "right_value": None,
@@ -88,6 +120,7 @@ def _label_only_conditions(group: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "error": None,
             }
         )
+
     return out
 
 
@@ -138,65 +171,98 @@ def save_status_any(data: Dict[str, Any]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
-# Skeleton aus Profilen
+# Skeleton aus Profilen (NEW SCHEMA)
 # ─────────────────────────────────────────────────────────────
 
 def build_status_skeleton_from_profiles(profiles: list[dict], debug_print: bool = True) -> Dict[str, Any]:
     """
-    Baut aus einer Profil-Liste ein "leeres" Status-Skeleton:
+    Baut aus einer Profil-Liste ein "leeres" Status-Skeleton (NEW SCHEMA):
     - Struktur/IDs/Groups/Conditions sind drin
     - Runtime-Felder sind frisch (True/False/None/0)
+    - KEINE Migration / KEIN Sanitizer / KEINE Symbol-Expansion
     """
-    sanitized = _sanitize_profiles(profiles or [])
     profiles_map: dict[str, dict] = {}
 
-    for p in sanitized:
-        pid = str(p.get("id") or "")
-        if not pid:
+    if debug_print:
+        try:
+            print(f"[STATUS] skeleton: profiles_in={len(profiles or [])}")
+        except Exception:
+            pass
+
+    for p in (profiles or []):
+        if not isinstance(p, dict):
             continue
 
+        pid = _safe_strip(p.get("id"))
+        if not pid:
+            # Profile ohne ID sind kaputt -> ignorieren (oder hart fail, wenn du willst)
+            if debug_print:
+                try:
+                    print(f"[STATUS] skeleton: skip profile without id keys={list(p.keys())[:20]}")
+                except Exception:
+                    pass
+            continue
+
+        groups_in = p.get("groups") or []
+        if not isinstance(groups_in, list):
+            groups_in = []
+
         gmap: dict[str, dict] = {}
-        for g in (p.get("condition_groups") or []):
-            gid = str(g.get("gid") or "")
+
+        for g in groups_in:
+            if not isinstance(g, dict):
+                continue
+
+            gid = _safe_strip(g.get("gid"))
             if not gid:
                 continue
 
-            # deactivate_on-Logik an Sanitizer anpassen:
-            # - erst normalize
-            # - nur wenn auto_deactivate explizit gesetzt ist, davon ableiten
-            raw_deact = _normalize_deactivate_value(g.get("deactivate_on"))
-            if raw_deact is None and g.get("auto_deactivate") is not None:
-                raw_deact = "true" if bool(g.get("auto_deactivate")) else "always"
+            # NEW schema group fields (keep as-is)
+            group_active = bool(g.get("active", True))
 
             g_entry = {
                 "name": g.get("name") or gid,
-                "group_active": bool(g.get("active", True)),
-                "effective_active": bool(g.get("active", True)),
+                "group_active": group_active,
+                "effective_active": group_active,
                 "blockers": [],
                 "auto_disabled": False,
                 "cooldown_until": None,
                 "fresh": True,
-                "aggregate": {
-                    "min_true_ticks": g.get("min_true_ticks"),
-                    "deactivate_on": raw_deact,
-                },
                 "runtime": {
-                    "true_ticks": None,
+                    "threshold_state": {},  # evaluator füllt das später
                     "met": 0,
                     "total": len(g.get("conditions") or []),
                     "details": [],
                 },
                 "last_eval_ts": None,
                 "last_bar_ts": None,
+
+                # Declarative labels for UI
                 "conditions": _label_only_conditions(g),
                 "conditions_status": [],
-                # Für UI sichtbar
-                "symbols": list(g.get("symbols") or []),
-                "profiles": list(g.get("profiles") or []),
-                # zusätzliche Felder, die auch im Profil existieren
-                "single_mode": g.get("single_mode", "symbol"),
-                "min_tick": g.get("min_tick"),
+
+                # Sichtbar für UI (NEU): symbol sources bleiben getrennt
+                "symbol_group": g.get("symbol_group", None),
+                "symbols": g.get("symbols", None),
+
+                # Group settings
+                "exchange": g.get("exchange", ""),
+                "interval": g.get("interval", ""),
+                "telegram_id": g.get("telegram_id", None),
+                "single_mode": g.get("single_mode", None),
+                "deactivate_on": g.get("deactivate_on", None),
             }
+
+            if debug_print:
+                try:
+                    print(
+                        f"[STATUS] skeleton: pid={pid} gid={gid} "
+                        f"active={group_active} interval={g_entry.get('interval')!r} "
+                        f"symbol_group={g_entry.get('symbol_group')!r} symbols={g_entry.get('symbols')!r} "
+                        f"conds={len(g.get('conditions') or [])}"
+                    )
+                except Exception:
+                    pass
 
             gmap[gid] = g_entry
 
@@ -240,12 +306,11 @@ def merge_status_keep_runtime(old: Dict[str, Any], skel: Dict[str, Any]) -> Dict
     """
     Merged ein neues Skeleton in einen alten Status:
     - neue/gelöschte Profile/Groups werden berücksichtigt
-    - Runtime-Daten (true_ticks, conditions_status, etc.) werden bestmöglich behalten
+    - Runtime-Daten (threshold_state, conditions_status, etc.) werden bestmöglich behalten
     """
     old_profiles = old.get("profiles") if isinstance(old.get("profiles"), dict) else {}
     skel_profiles = skel.get("profiles") if isinstance(skel.get("profiles"), dict) else {}
 
-    # version robust (kann int oder str sein)
     try:
         version_int = int(old.get("version", 1))
     except Exception:
@@ -271,60 +336,32 @@ def merge_status_keep_runtime(old: Dict[str, Any], skel: Dict[str, Any]) -> Dict
 
         for gid, g_s in (skel_groups or {}).items():
             old_g = old_groups.get(gid) or {}
-            agg_old = old_g.get("aggregate") if isinstance(old_g.get("aggregate"), dict) else {}
+
             rt_old = old_g.get("runtime") if isinstance(old_g.get("runtime"), dict) else {}
-            agg_s = g_s.get("aggregate") if isinstance(g_s.get("aggregate"), dict) else {}
+            cond_status_old = old_g.get("conditions_status", [])
+            if not isinstance(cond_status_old, list):
+                cond_status_old = []
 
-            # Legacy-Fallback: notify_mode (alt) -> deactivate_on (neu)
-            old_deactivate_on = (
-                agg_old.get("deactivate_on")
-                if "deactivate_on" in (agg_old or {})
-                else (agg_old.get("notify_mode") if isinstance(agg_old, dict) else None)
-            )
-            new_deactivate_on = (
-                agg_s.get("deactivate_on")
-                if "deactivate_on" in (agg_s or {})
-                else old_deactivate_on
-            ) or "always"
+            new_g = dict(g_s)
+            # runtime behalten
+            new_g["runtime"] = rt_old
+            new_g["conditions_status"] = cond_status_old
 
-            new_g = {
-                "name": g_s.get("name") or old_g.get("name") or gid,
-                "group_active": bool(g_s.get("group_active", old_g.get("group_active", True))),
-                "effective_active": bool(
-                    g_s.get("effective_active", old_g.get("effective_active", True))
-                ),
-                "blockers": old_g.get("blockers", []) if isinstance(old_g.get("blockers"), list) else [],
-                "auto_disabled": bool(old_g.get("auto_disabled", False)),
-                "cooldown_until": old_g.get("cooldown_until", None),
-                "fresh": bool(old_g.get("fresh", True)),
-                "aggregate": {
-                    "min_true_ticks": agg_s.get("min_true_ticks", agg_old.get("min_true_ticks")),
-                    "deactivate_on": new_deactivate_on,
-                },
-                "runtime": rt_old,
-                "conditions": g_s.get("conditions", []),
-                "conditions_status": old_g.get("conditions_status", [])
-                if isinstance(old_g.get("conditions_status"), list)
-                else [],
-                "last_eval_ts": old_g.get("last_eval_ts", None),
-                "last_bar_ts": old_g.get("last_bar_ts", None),
-            }
+            # timestamps behalten
+            new_g["last_eval_ts"] = old_g.get("last_eval_ts", None)
+            new_g["last_bar_ts"] = old_g.get("last_bar_ts", None)
 
-            # Sichtbare Felder aus Skeleton übernehmen
-            for _k in ("symbols", "profiles"):
-                if _k in g_s:
-                    new_g[_k] = list(g_s.get(_k) or [])
-
-            if "min_tick" in g_s:
-                new_g["min_tick"] = g_s.get("min_tick")
-            if "single_mode" in g_s:
-                new_g["single_mode"] = g_s.get("single_mode")
+            # blockers/cooldown/fresh behalten
+            new_g["blockers"] = old_g.get("blockers", []) if isinstance(old_g.get("blockers"), list) else []
+            new_g["auto_disabled"] = bool(old_g.get("auto_disabled", False))
+            new_g["cooldown_until"] = old_g.get("cooldown_until", None)
+            new_g["fresh"] = bool(old_g.get("fresh", True))
 
             new_p["groups"][gid] = new_g
 
         new_out["profiles"][pid] = new_p
 
-    # Diagnostics: was wurde gepruned?
+    # Diagnostics
     old_pids = set(old_profiles.keys())
     new_pids = set(new_out["profiles"].keys())
     pruned_pids = sorted(list(old_pids - new_pids))
@@ -358,6 +395,7 @@ def merge_status_keep_runtime(old: Dict[str, Any], skel: Dict[str, Any]) -> Dict
         print(f"[STATUS] merged pruned profiles={len(new_out['profiles'])}")
     except Exception:
         pass
+
     if pruned_pids:
         try:
             print(
@@ -393,7 +431,7 @@ def status_autofix_merge() -> None:
     Lädt Profile → baut Skeleton → merged in aktuellen Status → speichert.
     Nutzt profiles_fingerprint, damit /status sehen kann, ob was veraltet ist.
     """
-    profiles = load_profiles_normalized()
+    profiles = profiles_list_profiles()
     skeleton = build_status_skeleton_from_profiles(profiles)
     current = load_status_any()
     merged = merge_status_keep_runtime(current, skeleton)
@@ -418,14 +456,18 @@ def sync_status(profiles: Optional[list] = None) -> Dict[str, Any]:
     Entspricht grob dem alten POST /status/sync:
     - optional Profile von außen (Body) → sonst local load
     - Skeleton + Merge + Save
+
+    WICHTIG: profiles müssen NEW SCHEMA sein (profiles[].groups[]...)
     """
     if not isinstance(profiles, list):
-        profiles = load_profiles_normalized()
+        profiles = profiles_list_profiles()
+
     skeleton = build_status_skeleton_from_profiles(profiles)
     current = load_status_any()
     merged = merge_status_keep_runtime(current, skeleton)
     merged["profiles_fp"] = profiles_fingerprint(profiles)
     save_status_any(merged)
+
     log.info("status sync profiles=%d", len(merged.get("profiles", {})))
     try:
         print(f"[STATUS] sync profiles={len(merged.get('profiles', {}))}")
@@ -445,7 +487,7 @@ def get_status_snapshot(force_fix: bool = False) -> Dict[str, Any]:
         need_fix = bool(force_fix)
         reason = "force_fix" if force_fix else ""
 
-        profiles = load_profiles_normalized()
+        profiles = profiles_list_profiles()
         skeleton = build_status_skeleton_from_profiles(profiles)
         fp = profiles_fingerprint(profiles)
 
@@ -496,5 +538,5 @@ def get_status_snapshot(force_fix: bool = False) -> Dict[str, Any]:
         return snap
     except Exception as e:
         log.exception("get_status_snapshot failed: %s", e)
-        # Upstream (API-Layer) macht daraus HTTP 500.
         raise
+

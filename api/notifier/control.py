@@ -7,10 +7,9 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Dict
 import uuid  # für eindeutige Command-IDs
-from pathlib import Path
 
 from config import OVERRIDES_NOTIFIER, COMMANDS_NOTIFIER
-from storage import load_json_any, save_json_any, atomic_update_json_list
+from storage import load_json_any, save_json_any
 
 log = logging.getLogger("notifier.control")
 
@@ -25,6 +24,48 @@ _CMD_TEMPLATE: Dict[str, Any] = {"queue": []}
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
+
+
+def _atomic_update_json_dict(path: str, transform, default: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Atomic-ish update for JSON dict files.
+
+    Reads dict (or uses default), applies transform(d) -> (new_dict, outcome),
+    then writes via save_json_any.
+
+    NOTE:
+    - This keeps the on-disk format stable: always a DICT (not a list-wrapper).
+    - True atomicity depends on save_json_any implementation.
+    """
+    cur = load_json_any(path, deepcopy(default))
+    if not isinstance(cur, dict):
+        log.warning(
+            "[CTRL] atomic_update_json_dict: file is not dict (%s) -> reset default",
+            type(cur).__name__,
+        )
+        cur = deepcopy(default)
+
+    try:
+        new_doc, outcome = transform(deepcopy(cur))
+    except Exception as e:
+        log.exception("[CTRL] atomic_update_json_dict transform failed: %s", e)
+        try:
+            print(f"[CTRL] atomic_update_json_dict transform ERROR: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        raise
+
+    if not isinstance(new_doc, dict):
+        raise ValueError("atomic_update_json_dict: transform must return a dict as new_doc")
+
+    save_json_any(path, new_doc)
+
+    try:
+        print(f"[CTRL] atomic_update_json_dict saved path={path} keys={list(new_doc.keys())[:10]}")
+    except Exception:
+        pass
+
+    return outcome
 
 
 # ─────────────────────────────────────────────────────────────
@@ -186,7 +227,7 @@ def enqueue_command(
       - profile_id
       - group_id
       - rearm      → Gruppe neu scharf stellen
-      - rebaseline → History/true_ticks neu setzen
+      - rebaseline → History/threshold_state neu setzen
     """
     item = {
         "id": str(uuid.uuid4()),
@@ -197,20 +238,19 @@ def enqueue_command(
         "ts": _now_iso(),
     }
 
-    # ATOMIC: verhindert Lost-Updates bei parallelen enqueue-Requests
-    def _transform(current: list):
-        # current ist bei atomic_update_json_list immer "list-like" gedacht.
-        # Wir modellieren commands.json als "list" mit genau einem dict-Element oder leer:
-        #   [] oder [{"queue": [...]}]
-        items = [x for x in (current or []) if isinstance(x, dict)]
-        if not items:
-            doc = deepcopy(_CMD_TEMPLATE)
-            items = [doc]
-        else:
-            doc = items[0]
-            doc.setdefault("queue", [])
-            if not isinstance(doc.get("queue"), list):
-                doc["queue"] = []
+    try:
+        print(
+            f"[CMD] enqueue request pid={profile_id} gid={group_id} "
+            f"rearm={rearm} rebaseline={rebaseline}"
+        )
+    except Exception:
+        pass
+
+    def _transform(doc: Dict[str, Any]):
+        doc = deepcopy(doc)
+        doc.setdefault("queue", [])
+        if not isinstance(doc.get("queue"), list):
+            doc["queue"] = []
 
         doc["queue"].append(item)
 
@@ -219,47 +259,26 @@ def enqueue_command(
             "id": item["id"],
             "queue_len": len(doc["queue"]),
         }
-        return items, result
+        return doc, result
 
-    # NOTE: COMMANDS_NOTIFIER ist vermutlich eine JSON-Datei die bisher ein dict war.
-    # atomic_update_json_list erwartet eine LIST im File. Damit das drop-in bleibt,
-    # unterstützen wir BEIDES:
-    # - wenn Datei dict enthält → fallback auf load+save (wie vorher) + warning
-    # - wenn Datei list enthält → atomic path
-
-    try:
-        _, outcome = atomic_update_json_list(Path(COMMANDS_NOTIFIER), _transform)
-        try:
-            print(f"[CMD] enqueue atomic outcome={outcome}")
-        except Exception:
-            pass
-    except Exception as e:
-        # Fallback: altes Verhalten (nicht atomic), aber wenigstens nicht kaputt.
-        log.warning("enqueue_command atomic_update failed (%s) -> fallback load/save", e)
-        cmds = load_commands()
-        cmds.setdefault("queue", [])
-        if not isinstance(cmds.get("queue"), list):
-            cmds["queue"] = []
-        cmds["queue"].append(item)
-        save_commands(cmds)
-        try:
-            print(f"[CMD] enqueue FALLBACK load/save because atomic failed: {e}")
-        except Exception:
-            pass
+    # Dict-only update. If COMMANDS_NOTIFIER is not dict on disk, we reset to template and continue.
+    outcome = _atomic_update_json_dict(
+        COMMANDS_NOTIFIER,
+        _transform,
+        default=deepcopy(_CMD_TEMPLATE),
+    )
 
     log.info(
-        "Command enqueued id=%s pid=%s gid=%s rearm=%s rebaseline=%s",
+        "Command enqueued id=%s pid=%s gid=%s rearm=%s rebaseline=%s queue_len=%s",
         item["id"],
         profile_id,
         group_id,
         rearm,
         rebaseline,
+        outcome.get("queue_len"),
     )
     try:
-        print(
-            f"[CMD] enqueue id={item['id']} pid={profile_id} gid={group_id} "
-            f"rearm={rearm} rebaseline={rebaseline}"
-        )
+        print(f"[CMD] enqueue outcome={outcome}")
     except Exception:
         pass
 
@@ -267,7 +286,7 @@ def enqueue_command(
 
 
 # ─────────────────────────────────────────────────────────────
-# Activation-Routine (nach Profil-Aktivierung)
+# Activation-Routine (nach Profil-Aktivierung) – NEW SCHEMA
 # ─────────────────────────────────────────────────────────────
 
 def run_activation_routine(
@@ -279,7 +298,7 @@ def run_activation_routine(
     Entspricht grob dem alten _run_activation_routine:
 
     - Wenn activate_flag False → NO-OP (nur Logging/Debug)
-    - Nimmt ein *bereits saniertes* Profilobjekt (mit condition_groups)
+    - Nimmt ein Profilobjekt im NEW SCHEMA (mit groups)
     - Für jede aktive Gruppe:
         - forced_off=False, snooze_until=None im Overrides-JSON
         - Command-Queue-Eintrag (rearm + optional rebaseline)
@@ -301,14 +320,12 @@ def run_activation_routine(
             pass
         return
 
-    groups = profile_obj.get("condition_groups") or []
+    # NEW SCHEMA: groups
+    groups = profile_obj.get("groups") or []
     if not isinstance(groups, list):
-        log.warning(
-            "run_activation_routine: condition_groups is not a list for pid=%s",
-            pid,
-        )
+        log.warning("run_activation_routine: groups is not a list for pid=%s", pid)
         try:
-            print(f"[ACTIVATE] skip: bad groups type pid={pid}")
+            print(f"[ACTIVATE] skip: bad groups type pid={pid} type={type(groups).__name__}")
         except Exception:
             pass
         return
@@ -316,6 +333,11 @@ def run_activation_routine(
     ovr = load_overrides()
     changed = 0
     enq = 0
+
+    try:
+        print(f"[ACTIVATE] start pid={pid} groups_in={len(groups)} rebaseline={rebaseline}")
+    except Exception:
+        pass
 
     for g in groups:
         if not isinstance(g, dict):
@@ -352,10 +374,7 @@ def run_activation_routine(
         rebaseline,
     )
     try:
-        print(
-            f"[ACTIVATE] pid={pid} changed={changed} "
-            f"enq={enq} rebaseline={rebaseline}"
-        )
+        print(f"[ACTIVATE] done pid={pid} changed={changed} enq={enq} rebaseline={rebaseline}")
     except Exception:
         pass
 
