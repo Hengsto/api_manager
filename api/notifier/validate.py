@@ -43,12 +43,52 @@ def _format_validation_error(e: ValidationError) -> List[Dict[str, Any]]:
 def validate_profile_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Validate a single profile payload (NEW schema only).
+
+    NOTE:
+    - UI may send id=None / missing for new profiles.
+    - Profile schema currently requires id.
+    - We inject a temporary id ONLY for validation.
     """
     try:
-        Profile(**(payload or {}))
+        data = dict(payload or {})
+
+        # Debug prints
+        try:
+            print(f"[VALIDATE] incoming id type={type(data.get('id')).__name__} value={data.get('id')!r}")
+        except Exception:
+            pass
+
+        # If id missing/empty -> inject a temporary id for validation only
+        if data.get("id") in (None, "", "null", "None"):
+            tmp_id = "tmp-" + __import__("uuid").uuid4().hex
+            data["id"] = tmp_id
+            try:
+                print(f"[VALIDATE] injected temporary id={tmp_id!r} for validation only")
+            except Exception:
+                pass
+        else:
+            # ensure id is str if present
+            try:
+                data["id"] = str(data["id"])
+            except Exception:
+                pass
+
+        Profile(**data)
         return {"ok": True, "errors": []}
+
     except ValidationError as e:
         return {"ok": False, "errors": _format_validation_error(e)}
+    except Exception as e:
+        try:
+            print(f"[VALIDATE] ❌ crashed: {e!r}")
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "errors": [{"path": "", "message": f"Validation crashed: {e}", "type": "internal_error"}],
+        }
+
+
 
 
 def validate_profiles_payload(payload: Union[List[Dict[str, Any]], Dict[str, Any]]) -> Dict[str, Any]:
