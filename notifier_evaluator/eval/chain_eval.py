@@ -2,33 +2,42 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+import logging
+from typing import Dict, List, Literal, Optional
 
 from notifier_evaluator.models.runtime import ChainResult, ConditionResult, TriState
 
+logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Chain Eval
-# - Input: ConditionResults in order + logic_to_prev list (and/or per row)
-# - Output:
-#     partial_true: bool         (mindestens eine ganze Zeile TRUE)
-#     final_state: TriState      (TRUE/FALSE/UNKNOWN)
-#
-# TriState Regeln:
-# - AND:
-#     if any FALSE -> FALSE
-#     else if any UNKNOWN -> UNKNOWN
-#     else TRUE
-# - OR:
-#     if any TRUE -> TRUE
-#     else if any UNKNOWN -> UNKNOWN
-#     else FALSE
-#
-# Ketten-Interpretation:
-#   row[0] startet mit row[0].state
-#   ab row[1]: combine(prev, row[i].state) with logic_to_prev[i]
-#   (logic_to_prev[0] wird ignoriert)
-# ──────────────────────────────────────────────────────────────────────────────
+LogicOp = Literal["and", "or"]
+
+
+class ChainEvalError(Exception):
+    """Raised when chain evaluation fails due to invalid inputs."""
+    pass
+
+
+def _dbg(debug: bool, msg: str) -> None:
+    if debug:
+        try:
+            print(msg)
+        except Exception:
+            pass
+
+
+def _normalize_logic(op: Any, *, position: int) -> LogicOp:
+    """
+    Normalize logic operator.
+    Allowed: "and", "or", blank/None (treated as "and")
+    """
+    if op is None:
+        return "and"
+    s = str(op).strip().lower()
+    if s == "":
+        return "and"
+    if s in ("and", "or"):
+        return s  # type: ignore[return-value]
+    raise ChainEvalError(f"Invalid logic operator at position {position}: {op!r}")
 
 
 def _combine_and(a: TriState, b: TriState) -> TriState:
@@ -51,17 +60,20 @@ def eval_chain(
     results: List[ConditionResult],
     *,
     logic_to_prev: Optional[List[str]] = None,
+    debug: bool = False,
+    debug_print: bool = False,
 ) -> ChainResult:
     """
     results must be in row order.
 
     logic_to_prev:
-      list of same length as results (optional).
+      list (optional).
       logic_to_prev[i] applies between results[i-1] and results[i] for i>=1.
       values: "and" or "or"
+      missing/blank entries default to "and"
+      (logic_to_prev[0] is ignored)
     """
     if not results:
-        # No rows -> we treat as UNKNOWN (can't be true)
         return ChainResult(
             partial_true=False,
             final_state=TriState.UNKNOWN,
@@ -72,24 +84,27 @@ def eval_chain(
     partial_true = any(r.state == TriState.TRUE for r in results)
 
     # Start with first row state
-    final_state = results[0].state
+    final_state: TriState = results[0].state
 
     debug_steps: List[Dict[str, str]] = []
-    debug_steps.append({"i": "0", "rid": results[0].rid, "state": results[0].state.value, "logic": "<start>"})
+    debug_steps.append(
+        {"i": "0", "rid": results[0].rid, "state": results[0].state.value, "logic": "<start>"}
+    )
 
     for i in range(1, len(results)):
-        logic = "and"
-        if logic_to_prev and i < len(logic_to_prev) and (logic_to_prev[i] or "").strip():
-            logic = (logic_to_prev[i] or "and").strip().lower()
+        # Default to AND if missing/short list/blank
+        logic_raw = None
+        if logic_to_prev is not None and i < len(logic_to_prev):
+            logic_raw = logic_to_prev[i]
+        logic = _normalize_logic(logic_raw, position=i)
 
         before = final_state
         cur = results[i].state
 
         if logic == "or":
-            final_state = _combine_or(final_state, cur)
+            final_state = _combine_or(before, cur)
         else:
-            # default to AND (hard)
-            final_state = _combine_and(final_state, cur)
+            final_state = _combine_and(before, cur)
 
         debug_steps.append(
             {
@@ -102,14 +117,33 @@ def eval_chain(
             }
         )
 
-    # Debug print (noisy)
-    print(
-        "[chain_eval] rows=%d partial_true=%s final_state=%s"
-        % (len(results), partial_true, final_state.value)
-    )
-    # print detailed chain steps
-    for st in debug_steps:
-        print("[chain_eval] step=%s" % st)
+        if debug:
+            logger.debug(
+                "[chain_eval] step=%d rid=%s before=%s logic=%s cur=%s after=%s",
+                i,
+                results[i].rid,
+                before.value,
+                logic,
+                cur.value,
+                final_state.value,
+            )
+        if debug_print:
+            _dbg(
+                True,
+                f"[chain_eval] step={i} rid={results[i].rid} before={before.value} logic={logic} cur={cur.value} after={final_state.value}",
+            )
+
+    if debug:
+        logger.debug(
+            "[chain_eval] done rows=%d partial_true=%s final_state=%s",
+            len(results),
+            partial_true,
+            final_state.value,
+        )
+    if debug_print:
+        _dbg(True, f"[chain_eval] done rows={len(results)} partial_true={partial_true} final_state={final_state.value}")
+        for st in debug_steps:
+            _dbg(True, f"[chain_eval] step={st}")
 
     return ChainResult(
         partial_true=partial_true,

@@ -17,7 +17,7 @@ from notifier_evaluator.fetch.cache import FetchCache
 from notifier_evaluator.fetch.client import IndicatorClient
 from notifier_evaluator.fetch.planner import plan_requests_for_symbol
 from notifier_evaluator.fetch.types import RequestKey
-from notifier_evaluator.models.schema import EngineDefaults, Group, Profile
+from notifier_evaluator.models.schema import AlarmConfig, EngineDefaults, Group, Profile, ThresholdConfig
 from notifier_evaluator.models.runtime import (
     FetchResult,
     HistoryEvent,
@@ -95,6 +95,86 @@ def _normalize_logic(x: Optional[str]) -> str:
     if s:
         print(f"[engine] WARN invalid logic_to_prev='{s}' -> default AND")
     return "and"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Schema drift adapters (NEW Notifier JSON vs Legacy Evaluator expectations)
+# - profile: enabled vs active
+# - group: enabled vs active
+# - group rows: rows vs conditions
+# - group threshold/alarm: legacy expects group.threshold/group.alarm but NEW stores:
+#     - threshold per condition (row) (so group threshold defaults to "none")
+#     - group.deactivate_on describes alarm mode ("auto_off", "always_on", ...)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _profile_is_enabled(p: Profile) -> bool:
+    v = getattr(p, "enabled", None)
+    if v is None:
+        v = getattr(p, "active", True)
+    try:
+        return bool(v)
+    except Exception:
+        return True
+
+
+def _group_is_enabled(g: Group) -> bool:
+    v = getattr(g, "enabled", None)
+    if v is None:
+        v = getattr(g, "active", True)
+    try:
+        return bool(v)
+    except Exception:
+        return True
+
+
+def _group_rows(g: Group) -> List:
+    rows = getattr(g, "rows", None)
+    if rows is None:
+        rows = getattr(g, "conditions", None)
+    return list(rows or [])
+
+
+def _group_threshold_cfg(g: Group) -> ThresholdConfig:
+    """
+    Legacy engine expects group.threshold.
+    NEW schema has threshold per condition -> group-level threshold defaults to NONE.
+    """
+    t = getattr(g, "threshold", None)
+    if t is None:
+        # default = no threshold gating
+        try:
+            return ThresholdConfig(mode="none")  # type: ignore[call-arg]
+        except Exception:
+            # in case model uses different field names, fallback to empty constructor
+            return ThresholdConfig()  # type: ignore[call-arg]
+    return t
+
+
+def _group_alarm_cfg(g: Group) -> AlarmConfig:
+    """
+    Legacy engine expects group.alarm.
+    NEW schema stores alarm intent as group.deactivate_on (e.g. "auto_off") + other fields.
+    """
+    a = getattr(g, "alarm", None)
+    if a is not None:
+        return a
+
+    mode = getattr(g, "deactivate_on", None) or "always_on"
+    # normalize common variants
+    mode_s = str(mode).strip().lower()
+    if mode_s in ("autooff", "auto-off"):
+        mode_s = "auto_off"
+    if mode_s in ("alwayson", "always-on"):
+        mode_s = "always_on"
+    if mode_s in ("pre", "pre_notification", "pre-notification"):
+        mode_s = "pre_notification"
+
+    try:
+        # sensible defaults; you can wire telegram_id later in apply_alarm_policy
+        return AlarmConfig(mode=mode_s, cooldown_sec=0, edge_only=True)  # type: ignore[call-arg]
+    except Exception:
+        return AlarmConfig()  # type: ignore[call-arg]
 
 
 def _build_logic_to_prev_from_conditions(conds_in_eval_order: List, n_results: int) -> List[str]:
@@ -247,15 +327,34 @@ class EvaluatorEngine:
 
         # --- PLAN PHASE ---
         for profile in profiles or []:
-            if not profile.enabled:
-                print("[engine] skip disabled profile=%s" % profile.profile_id)
+            if not _profile_is_enabled(profile):
+                print("[engine] skip disabled profile=%s" % getattr(profile, "profile_id", "<no-profile-id>"))
                 continue
 
             for group in profile.groups or []:
                 summary.groups += 1
-                if not group.enabled:
-                    print("[engine] skip disabled group=%s profile=%s" % (group.gid, profile.profile_id))
+
+                if not _group_is_enabled(group):
+                    print(
+                        "[engine] skip disabled group=%s profile=%s"
+                        % (getattr(group, "gid", "<no-gid>"), getattr(profile, "profile_id", "<no-profile-id>"))
+                    )
                     continue
+
+                # DEBUG: schema drift visibility
+                print(
+                    "[engine][DBG] group gid=%s has_enabled=%s has_active=%s has_rows=%s has_conditions=%s has_alarm=%s has_deactivate_on=%s has_threshold=%s"
+                    % (
+                        getattr(group, "gid", "<no-gid>"),
+                        hasattr(group, "enabled"),
+                        hasattr(group, "active"),
+                        hasattr(group, "rows"),
+                        hasattr(group, "conditions"),
+                        hasattr(group, "alarm"),
+                        hasattr(group, "deactivate_on"),
+                        hasattr(group, "threshold"),
+                    )
+                )
 
                 # expand symbols
                 exp = self.group_expander.expand_group(group)
@@ -275,8 +374,8 @@ class EvaluatorEngine:
                     # Resolve per row contexts
                     resolved_pairs: Dict[str, ResolvedPair] = {}
                     resolved_n = 0
-                    for cond in group.rows or []:
-                        if not cond.enabled:
+                    for cond in _group_rows(group):
+                        if not getattr(cond, "enabled", True):
                             continue
                         pair, dbg = resolve_contexts(
                             profile=profile,
@@ -285,7 +384,7 @@ class EvaluatorEngine:
                             defaults=self.cfg.defaults,
                             base_symbol=base_symbol,
                         )
-                        resolved_pairs[cond.rid] = pair
+                        resolved_pairs[getattr(cond, "rid", "<no-rid>")] = pair
                         resolved_n += 1
 
                     print(
@@ -294,11 +393,12 @@ class EvaluatorEngine:
                     )
 
                     # Plan requests for this evaluation unit
+                    _rows = _group_rows(group)
                     plan = plan_requests_for_symbol(
                         profile_id=profile.profile_id,
                         gid=group.gid,
                         base_symbol=base_symbol,
-                        rows=group.rows or [],
+                        rows=_rows,
                         resolved_pairs=resolved_pairs,
                         mode=self.cfg.request_mode,
                         as_of=self.cfg.request_as_of,
@@ -368,6 +468,7 @@ class EvaluatorEngine:
             profile = up.profile
             resolved_pairs = up.resolved_pairs
             row_map = up.row_map
+            rows_for_group = _group_rows(group)
 
             # status key uses clock_interval (take from any pair; fallback to group.interval/defaults)
             clock_interval = ""
@@ -375,9 +476,15 @@ class EvaluatorEngine:
                 any_pair = next(iter(resolved_pairs.values()))
                 clock_interval = any_pair.left.clock_interval
             else:
-                clock_interval = group.interval or profile.default_interval or self.cfg.defaults.clock_interval or self.cfg.defaults.interval or ""
+                clock_interval = (
+                    getattr(group, "interval", None)
+                    or getattr(profile, "default_interval", None)
+                    or self.cfg.defaults.clock_interval
+                    or self.cfg.defaults.interval
+                    or ""
+                )
 
-            exchange = group.exchange or profile.default_exchange or self.cfg.defaults.exchange or ""
+            exchange = getattr(group, "exchange", None) or getattr(profile, "default_exchange", None) or self.cfg.defaults.exchange or ""
 
             skey = StatusKey(
                 profile_id=profile_id,
@@ -389,7 +496,7 @@ class EvaluatorEngine:
 
             print(
                 "[engine] EVAL unit profile=%s gid=%s sym=%s ex=%s clock=%s rows_total=%d"
-                % (profile_id, gid, base_symbol, exchange, clock_interval, len(group.rows or []))
+                % (profile_id, gid, base_symbol, exchange, clock_interval, len(rows_for_group))
             )
 
             # load status
@@ -407,14 +514,19 @@ class EvaluatorEngine:
             last_row_right = None
             last_row_op = None
 
-            for cond in group.rows or []:
-                if not cond.enabled:
+            for cond in rows_for_group:
+                if not getattr(cond, "enabled", True):
                     continue
-                pair = resolved_pairs.get(cond.rid)
+                rid = getattr(cond, "rid", None)
+                if not rid:
+                    print("[engine] WARN condition without rid profile=%s gid=%s sym=%s" % (profile_id, gid, base_symbol))
+                    continue
+
+                pair = resolved_pairs.get(rid)
                 if pair is None:
                     print(
                         "[engine] WARN missing resolved_pair profile=%s gid=%s sym=%s rid=%s"
-                        % (profile_id, gid, base_symbol, cond.rid)
+                        % (profile_id, gid, base_symbol, rid)
                     )
                     continue
 
@@ -451,7 +563,7 @@ class EvaluatorEngine:
                 profile_id=profile_id,
                 gid=gid,
                 base_symbol=base_symbol,
-                group_rows=group.rows or [],
+                group_rows=rows_for_group,
                 row_map=row_map,
                 fetch_results=fetch_results,
                 clock_interval=clock_interval,
@@ -472,19 +584,24 @@ class EvaluatorEngine:
 
             tick_res = detect_new_tick(skey=skey, state=st, current_tick_ts=tick_ts)
 
+            # NEW schema: group threshold is not a thing -> default ThresholdConfig(mode="none")
+            g_thr = _group_threshold_cfg(group)
             thr = apply_threshold(
                 final_state=chain.final_state,
                 new_tick=tick_res.new_tick,
-                cfg=group.threshold,
+                cfg=g_thr,
                 state=st,
                 now_ts=now_ts,
             )
+
+            # NEW schema: group alarm config can come from deactivate_on
+            g_alarm = _group_alarm_cfg(group)
 
             # Decide push based on threshold passed
             pol = apply_alarm_policy(
                 skey=skey,
                 state=st,
-                cfg=group.alarm,
+                cfg=g_alarm,
                 now_ts=now_ts,
                 now_unix=now_unix,
                 partial_true=chain.partial_true,
@@ -525,7 +642,7 @@ class EvaluatorEngine:
                     right_value=last_row_right,
                     op=last_row_op,
                     threshold_snapshot={
-                        "mode": group.threshold.mode,
+                        "mode": getattr(g_thr, "mode", None),
                         "passed": thr.passed,
                         "streak_current": st.streak_current,
                         "count_window": list(st.count_window),
@@ -540,6 +657,7 @@ class EvaluatorEngine:
                         "policy": pol.debug,
                         "chain": chain.debug,
                         "logic_to_prev": logic_to_prev,
+                        "alarm_mode": getattr(g_alarm, "mode", None),
                     },
                 )
             )

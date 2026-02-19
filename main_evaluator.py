@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import config as cfg
@@ -45,6 +46,145 @@ def _default_history_path() -> Path:
     return Path(os.getenv("EVALUATOR_HISTORY_FILE", "") or (Path(cfg.EVALUATOR_DATA_DIR) / "evaluator_history.json"))
 
 
+def _dbg(msg: str) -> None:
+    try:
+        print(msg)
+    except Exception:
+        pass
+
+
+def _profile_from_dict(d: dict) -> Profile:
+    """
+    Pydantic v2/v1 compatible loader.
+    - v2: Profile.model_validate(d)
+    - v1: Profile.parse_obj(d)
+    """
+    _dbg(
+        f"[evaluator][DBG] Profile type={Profile} "
+        f"has model_validate={hasattr(Profile, 'model_validate')} "
+        f"parse_obj={hasattr(Profile, 'parse_obj')}"
+    )
+
+    if hasattr(Profile, "model_validate"):
+        return Profile.model_validate(d)  # type: ignore[attr-defined]
+    if hasattr(Profile, "parse_obj"):
+        return Profile.parse_obj(d)  # type: ignore[attr-defined]
+
+    raise TypeError(f"Profile is missing model_validate/parse_obj. type={type(Profile)}")
+
+
+def _to_boolish(v: object) -> bool | None:
+    """
+    Convert common truthy/falsey string/int into bool.
+    Returns None if unknown.
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        if v in (0, 1):
+            return bool(v)
+        return None
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("1", "true", "yes", "y", "on", "enabled", "enable"):
+            return True
+        if s in ("0", "false", "no", "n", "off", "disabled", "disable"):
+            return False
+        return None
+    return None
+
+
+def _patch_group_mode_fields(raw_profile: dict) -> dict:
+    """
+    Drop-in adapter for schema mismatch:
+    UI uses strings for:
+      - group.single_mode: "symbol" | "all" | ...
+      - group.deactivate_on: "auto_off" | "always_on" | ...
+    Current evaluator pydantic schema expects bool for those fields.
+
+    Strategy (minimal, to get evaluator running):
+      - single_mode: str -> True if "symbol"/truthy else False
+      - deactivate_on: str -> True if "auto_off"/truthy else False
+
+    Does NOT mutate input dict.
+    """
+    if not isinstance(raw_profile, dict):
+        return raw_profile
+
+    d = dict(raw_profile)
+    groups = d.get("groups")
+
+    if not isinstance(groups, list):
+        return d
+
+    new_groups: list = []
+    for gi, g in enumerate(groups):
+        if not isinstance(g, dict):
+            new_groups.append(g)
+            continue
+
+        gg = dict(g)
+
+        # DEBUG originals
+        sm = gg.get("single_mode")
+        do = gg.get("deactivate_on")
+        _dbg(f"[evaluator][DBG] group[{gi}] single_mode={sm!r} ({type(sm).__name__}) deactivate_on={do!r} ({type(do).__name__})")
+
+        # single_mode
+        if isinstance(sm, str):
+            # treat "symbol" as True (single-symbol mode)
+            sm_bool = True if sm.strip().lower() in ("symbol", "single", "one") else (_to_boolish(sm) if _to_boolish(sm) is not None else False)
+            gg["single_mode"] = sm_bool
+            _dbg(f"[evaluator][DBG] group[{gi}] patched single_mode: {sm!r} -> {sm_bool!r}")
+
+        # deactivate_on
+        if isinstance(do, str):
+            # treat "auto_off" as True (deactivate on trigger)
+            do_bool = True if do.strip().lower() in ("auto_off", "autooff", "deactivate", "off") else (_to_boolish(do) if _to_boolish(do) is not None else False)
+            gg["deactivate_on"] = do_bool
+            _dbg(f"[evaluator][DBG] group[{gi}] patched deactivate_on: {do!r} -> {do_bool!r}")
+
+        new_groups.append(gg)
+
+    d["groups"] = new_groups
+    return d
+
+
+def _normalize_profile_top_keys(raw: dict) -> dict:
+    """
+    Drop-in adapter:
+    UI/Notifier schema -> Evaluator schema (tolerant)
+      - id -> profile_id (fallback)
+      - enabled -> active (fallback)
+    Does NOT mutate input dict.
+    """
+    if not isinstance(raw, dict):
+        return raw
+
+    d = dict(raw)  # shallow copy
+
+    # DEBUG: show incoming schema
+    _dbg(f"[evaluator][DBG] raw_profile_keys={sorted(list(d.keys()))}")
+    _dbg(f"[evaluator][DBG] raw id/profile_id/pid={d.get('id')}|{d.get('profile_id')}|{d.get('pid')}")
+    _dbg(f"[evaluator][DBG] raw enabled/active/is_enabled={d.get('enabled')}|{d.get('active')}|{d.get('is_enabled')}")
+
+    # map id -> profile_id if needed
+    if "profile_id" not in d and "pid" not in d and "id" in d:
+        d["profile_id"] = d.get("id")
+        _dbg(f"[evaluator][DBG] patched profile_id <- id ({d.get('profile_id')})")
+
+    # map enabled -> active if needed
+    if "active" not in d and "is_enabled" not in d and "enabled" in d:
+        d["active"] = bool(d.get("enabled"))
+        _dbg(f"[evaluator][DBG] patched active <- enabled ({d.get('active')})")
+
+    # patch group fields that mismatch the evaluator schema
+    d = _patch_group_mode_fields(d)
+    _dbg(f"[evaluator][DBG] patched_profile_keys={sorted(list(d.keys()))}")
+
+    return d
+
+
 def _load_profiles(path: Path) -> list[Profile]:
     print(f"[evaluator] profiles_file={path} exists={path.exists()} size={(path.stat().st_size if path.exists() else 0)}")
 
@@ -81,17 +221,49 @@ def _load_profiles(path: Path) -> list[Profile]:
             bad += 1
             print(f"[evaluator] profile idx={i} not dict -> skip type={type(item)}")
             continue
+
+        norm = None
+        patched_item = None
+
         try:
+            patched_item = _normalize_profile_top_keys(item)
+
             norm = normalize_profile_dict(
-                item,
+                patched_item,
                 default_exchange=default_ex,
                 default_interval=default_it,
                 debug=True,
             )
-            profiles.append(Profile.from_dict(norm))
+
+            _dbg(f"[evaluator][DBG] norm_profile_keys={sorted(list(norm.keys()))}")
+
+            profiles.append(_profile_from_dict(norm))
+
         except Exception as e:
             bad += 1
-            print(f"[evaluator] profile idx={i} invalid: {e} keys={list(item.keys())[:50]}")
+            print(f"[evaluator] profile idx={i} invalid: {repr(e)} keys={list(item.keys())[:50]}")
+            try:
+                print("[evaluator] --- TRACEBACK START ---")
+                traceback.print_exc()
+                print("[evaluator] --- TRACEBACK END ---")
+            except Exception:
+                pass
+
+            try:
+                if patched_item is not None:
+                    print(f"[evaluator][DUMP] patched_item keys={sorted(list(patched_item.keys()))}")
+                    print("[evaluator][DUMP] patched_item json:")
+                    print(json.dumps(patched_item, ensure_ascii=False, indent=2)[:8000])
+            except Exception as dump_err:
+                print(f"[evaluator][DUMP] patched_item failed: {dump_err}")
+
+            try:
+                if norm is not None:
+                    print(f"[evaluator][DUMP] norm keys={sorted(list(norm.keys()))}")
+                    print("[evaluator][DUMP] norm json:")
+                    print(json.dumps(norm, ensure_ascii=False, indent=2)[:8000])
+            except Exception as dump_err:
+                print(f"[evaluator][DUMP] norm failed: {dump_err}")
 
     print(f"[evaluator] loaded profiles={len(profiles)} bad={bad} from {path}")
     return profiles
@@ -172,12 +344,30 @@ def _run_once(profiles_path: Path, engine: EvaluatorEngine, allow_invalid: bool)
         print("[evaluator] no profiles loaded; skipping run")
         return
 
-    validation = validate_profiles(profiles)
-    print(f"[evaluator] validate ok={validation.ok} errors={len(validation.errors or []) if hasattr(validation, 'errors') else 'n/a'}")
+    validation = None
+    try:
+        validation = validate_profiles(profiles)
+        print(
+            f"[evaluator] validate ok={validation.ok} "
+            f"errors={len(validation.errors or []) if hasattr(validation, 'errors') else 'n/a'}"
+        )
 
-    if not validation.ok and not allow_invalid:
-        print("[evaluator] validation failed; set EVALUATOR_ALLOW_INVALID=1 to force run")
-        return
+        if not validation.ok and not allow_invalid:
+            print("[evaluator] validation failed; set EVALUATOR_ALLOW_INVALID=1 to force run")
+            return
+
+    except Exception as e:
+        print(f"[evaluator] validate crashed: {repr(e)}")
+        try:
+            traceback.print_exc()
+        except Exception:
+            pass
+
+        if not allow_invalid:
+            print("[evaluator] validation crashed; set EVALUATOR_ALLOW_INVALID=1 to force run anyway")
+            return
+        print("[evaluator] allow_invalid=1 -> continuing despite validation crash")
+
 
     summary = engine.run(profiles)
     print(
@@ -238,6 +428,10 @@ def main() -> None:
             _run_once(profiles_path, engine, allow_invalid)
         except Exception as e:
             print(f"[evaluator] run failed: {e}")
+            try:
+                traceback.print_exc()
+            except Exception:
+                pass
         time.sleep(interval)
 
 

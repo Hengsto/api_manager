@@ -2,11 +2,25 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import logging
+import uuid
 from typing import Any, Dict, List, Union
 
 from pydantic import ValidationError
 
 from api.notifier.profiles import Profile  # nutzt dein strict NEW schema
+
+logger = logging.getLogger(__name__)
+
+DEBUG_PRINT = True
+
+
+def _dbg(msg: str) -> None:
+    if DEBUG_PRINT:
+        try:
+            print(msg)
+        except Exception:
+            pass
 
 
 def _format_validation_error(e: ValidationError) -> List[Dict[str, Any]]:
@@ -49,46 +63,57 @@ def validate_profile_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     - Profile schema currently requires id.
     - We inject a temporary id ONLY for validation.
     """
+    data = dict(payload or {})
+
+    injected_id: str = ""
     try:
-        data = dict(payload or {})
+        _dbg(f"[VALIDATE] incoming id type={type(data.get('id')).__name__} value={data.get('id')!r}")
+        logger.debug("[VALIDATE] incoming id type=%s value=%r", type(data.get("id")).__name__, data.get("id"))
+    except Exception:
+        pass
 
-        # Debug prints
+    # If id missing/empty -> inject a temporary id for validation only
+    if data.get("id") in (None, "", "null", "None"):
+        injected_id = "tmp-" + uuid.uuid4().hex
+        data["id"] = injected_id
+        _dbg(f"[VALIDATE] injected temporary id={injected_id!r} for validation only")
+        logger.debug("[VALIDATE] injected temporary id=%r for validation only", injected_id)
+    else:
+        # ensure id is str if present
         try:
-            print(f"[VALIDATE] incoming id type={type(data.get('id')).__name__} value={data.get('id')!r}")
-        except Exception:
-            pass
+            data["id"] = str(data["id"])
+        except Exception as e:
+            _dbg(f"[VALIDATE] ❌ id not convertible to str: {e!r}")
+            logger.warning("[VALIDATE] id not convertible to str: %r", e)
+            return {
+                "ok": False,
+                "errors": [{"path": "id", "message": "ID must be convertible to string", "type": "type_error"}],
+            }
 
-        # If id missing/empty -> inject a temporary id for validation only
-        if data.get("id") in (None, "", "null", "None"):
-            tmp_id = "tmp-" + __import__("uuid").uuid4().hex
-            data["id"] = tmp_id
-            try:
-                print(f"[VALIDATE] injected temporary id={tmp_id!r} for validation only")
-            except Exception:
-                pass
-        else:
-            # ensure id is str if present
-            try:
-                data["id"] = str(data["id"])
-            except Exception:
-                pass
-
+    try:
         Profile(**data)
-        return {"ok": True, "errors": []}
+        # Return injected_id (if any) as debug-only info; UI can ignore it.
+        res = {"ok": True, "errors": []}
+        if injected_id:
+            res["injected_id"] = injected_id
+        return res
 
     except ValidationError as e:
-        return {"ok": False, "errors": _format_validation_error(e)}
+        res = {"ok": False, "errors": _format_validation_error(e)}
+        if injected_id:
+            res["injected_id"] = injected_id
+        return res
+
     except Exception as e:
-        try:
-            print(f"[VALIDATE] ❌ crashed: {e!r}")
-        except Exception:
-            pass
-        return {
+        _dbg(f"[VALIDATE] ❌ crashed: {e!r}")
+        logger.error("[VALIDATE] Validation crashed: %r", e)
+        res = {
             "ok": False,
             "errors": [{"path": "", "message": f"Validation crashed: {e}", "type": "internal_error"}],
         }
-
-
+        if injected_id:
+            res["injected_id"] = injected_id
+        return res
 
 
 def validate_profiles_payload(payload: Union[List[Dict[str, Any]], Dict[str, Any]]) -> Dict[str, Any]:
@@ -105,18 +130,23 @@ def validate_profiles_payload(payload: Union[List[Dict[str, Any]], Dict[str, Any
             "name": payload.get("name"),
         }
         return {
-            "ok": res["ok"],
+            "ok": res.get("ok", False),
             "count": 1,
             "results": [{**meta, **res}],
         }
-
 
     if not isinstance(payload, list):
         return {
             "ok": False,
             "count": 0,
             "results": [],
-            "errors": [{"path": "", "message": "Payload must be a profile object or a list of profiles", "type": "type_error"}],
+            "errors": [
+                {
+                    "path": "",
+                    "message": "Payload must be a profile object or a list of profiles",
+                    "type": "type_error",
+                }
+            ],
         }
 
     results: List[Dict[str, Any]] = []
@@ -125,17 +155,22 @@ def validate_profiles_payload(payload: Union[List[Dict[str, Any]], Dict[str, Any
     for i, item in enumerate(payload):
         if not isinstance(item, dict):
             ok_all = False
-            results.append({
-                "ok": False,
-                "errors": [{"path": f"[{i}]", "message": "Profile entry must be an object", "type": "type_error"}],
-            })
+            results.append(
+                {
+                    "index": i,
+                    "id": None,
+                    "name": None,
+                    "ok": False,
+                    "errors": [{"path": f"[{i}]", "message": "Profile entry must be an object", "type": "type_error"}],
+                }
+            )
             continue
 
         r = validate_profile_payload(item)
         meta = {"index": i, "id": item.get("id"), "name": item.get("name")}
         results.append({**meta, **r})
 
-        if not r["ok"]:
+        if not r.get("ok"):
             ok_all = False
 
     return {"ok": ok_all, "count": len(payload), "results": results}

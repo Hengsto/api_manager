@@ -2,67 +2,46 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-from notifier_evaluator.models.schema import Condition, Group, Profile, EngineDefaults
+from notifier_evaluator.models.schema import Condition, EngineDefaults, Group, Profile
 from notifier_evaluator.models.runtime import ResolvedContext, ResolvedPair
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Kontextauflösung: row > group > profile > global(defaults)
-#
-# Ergebnis:
-#   ResolvedPair(left_ctx, right_ctx)
-#
-# WICHTIG:
-# - left/right haben eigene symbol/interval/exchange overrides
-# - clock_interval ist die EVAL-CLOCK (Tick/Threshold) und MUSS eindeutig sein
-#   -> standard: group.interval
-# ──────────────────────────────────────────────────────────────────────────────
+DEBUG_PRINT = True
 
 
-@dataclass
-class ResolverDebug:
-    profile_id: str
-    gid: str
-    rid: str
-    base_symbol: str
-    # raw values used (for debugging)
-    left_symbol_src: str = ""
-    right_symbol_src: str = ""
-    left_interval_src: str = ""
-    right_interval_src: str = ""
-    exchange_src: str = ""
-    clock_interval_src: str = ""
+def _dbg(msg: str) -> None:
+    if DEBUG_PRINT:
+        try:
+            print(msg)
+        except Exception:
+            pass
 
 
-class ResolverError(RuntimeError):
-    pass
+def _safe_strip(x: Any) -> str:
+    try:
+        return (str(x).strip() if x is not None else "").strip()
+    except Exception:
+        return ""
 
 
-def _strip(s: Optional[str]) -> Optional[str]:
-    if s is None:
-        return None
-    s2 = str(s).strip()
-    return s2 or None
-
-
-def _pick_first(*vals: Optional[str]) -> Optional[str]:
+def _first_non_empty(*vals: Any) -> Optional[str]:
     for v in vals:
-        vv = _strip(v)
-        if vv:
-            return vv
+        s = _safe_strip(v)
+        if s:
+            return s
     return None
 
 
-def _require(name: str, value: Optional[str], dbg: ResolverDebug) -> str:
-    if value is None or str(value).strip() == "":
-        raise ResolverError(
-            f"[resolver] missing required '{name}' "
-            f"(profile_id={dbg.profile_id} gid={dbg.gid} rid={dbg.rid} base_symbol={dbg.base_symbol})"
-        )
-    return value
+def _build_model(cls: Any, data: Dict[str, Any]) -> Any:
+    """
+    Build either Pydantic v2 model (model_validate) or classic ctor.
+    """
+    mv = getattr(cls, "model_validate", None)
+    if callable(mv):
+        return mv(data)
+    return cls(**data)
 
 
 def resolve_contexts(
@@ -72,163 +51,168 @@ def resolve_contexts(
     cond: Condition,
     defaults: EngineDefaults,
     base_symbol: str,
-) -> Tuple[ResolvedPair, ResolverDebug]:
+) -> Tuple[ResolvedPair, Dict[str, Any]]:
     """
-    Resolves contexts for LEFT and RIGHT separately.
-
-    Priority (hard):
-      row overrides > group defaults > profile defaults > global defaults
-
-    base_symbol:
-      symbol currently being evaluated after group expansion.
-      If row does not override symbol, LEFT/RIGHT default to base_symbol.
+    Resolve runtime context for a condition row.
+    NEW-schema tolerant:
+      - NO profile.default_interval / profile.default_exchange required
+      - exchange is typically group-level only
+      - per-side interval/symbol may be set on cond.left/cond.right (indicator objects)
+      - legacy helper fields (left_interval/right_interval/left_exchange/...) tolerated if present
 
     Returns:
-      (ResolvedPair, ResolverDebug)
-
-    Raises:
-      ResolverError if required symbol/interval/exchange/clock_interval cannot be resolved.
+      (ResolvedPair(left=ResolvedContext, right=ResolvedContext), debug_dict)
     """
-    dbg = ResolverDebug(
-        profile_id=profile.profile_id,
-        gid=group.gid,
-        rid=cond.rid,
-        base_symbol=base_symbol,
-    )
 
-    # -------------------------
-    # SYMBOL (per side)
-    # -------------------------
-    left_symbol = _pick_first(cond.left.symbol, base_symbol)
-    right_symbol = _pick_first(cond.right.symbol, base_symbol)
+    pid = _safe_strip(getattr(profile, "profile_id", None)) or _safe_strip(getattr(profile, "id", None)) or "<pid?>"
+    gid = _safe_strip(getattr(group, "gid", None)) or "<gid?>"
+    rid = _safe_strip(getattr(cond, "rid", None)) or "<rid?>"
+    base_symbol = _safe_strip(base_symbol)
 
-    dbg.left_symbol_src = "row" if _strip(cond.left.symbol) else "base_symbol"
-    dbg.right_symbol_src = "row" if _strip(cond.right.symbol) else "base_symbol"
+    # ---- pull indicator objects (NEW schema) ----
+    left_ind = getattr(cond, "left", None)
+    right_ind = getattr(cond, "right", None)
 
-    # -------------------------
-    # INTERVAL (per side)
-    # -------------------------
-    # data interval for fetch (can differ between left and right)
-    left_interval = _pick_first(
-        cond.left.interval,
-        group.interval,
-        profile.default_interval,
-        defaults.interval,
-    )
-    right_interval = _pick_first(
-        cond.right.interval,
-        group.interval,
-        profile.default_interval,
-        defaults.interval,
-    )
+    # These are "nice to have"; engine can survive missing ones but your eval will be junk.
+    left_name = _safe_strip(getattr(left_ind, "name", None) if left_ind is not None else None)
+    right_name = _safe_strip(getattr(right_ind, "name", None) if right_ind is not None else None)
+    left_output = _safe_strip(getattr(left_ind, "output", None) if left_ind is not None else None)
+    right_output = _safe_strip(getattr(right_ind, "output", None) if right_ind is not None else None)
+    left_params = getattr(left_ind, "params", None) if left_ind is not None else None
+    right_params = getattr(right_ind, "params", None) if right_ind is not None else None
 
-    dbg.left_interval_src = (
-        "row" if _strip(cond.left.interval) else
-        "group" if _strip(group.interval) else
-        "profile" if _strip(profile.default_interval) else
-        "global"
-    )
-    dbg.right_interval_src = (
-        "row" if _strip(cond.right.interval) else
-        "group" if _strip(group.interval) else
-        "profile" if _strip(profile.default_interval) else
-        "global"
-    )
+    # ---- schema drift tolerant legacy fields (may exist after your normalizer) ----
+    left_it_legacy = getattr(cond, "left_interval", None)
+    right_it_legacy = getattr(cond, "right_interval", None)
+    it_legacy = getattr(cond, "interval", None)
 
-    # -------------------------
-    # EXCHANGE (shared default, but row may override per side)
-    # -------------------------
-    # NOTE: if you want exchange to be *strictly per side*, we support it here.
-    left_exchange = _pick_first(
-        cond.left.exchange,
-        group.exchange,
-        profile.default_exchange,
-        defaults.exchange,
-    )
-    right_exchange = _pick_first(
-        cond.right.exchange,
-        group.exchange,
-        profile.default_exchange,
-        defaults.exchange,
-    )
+    left_ex_legacy = getattr(cond, "left_exchange", None)
+    right_ex_legacy = getattr(cond, "right_exchange", None)
+    ex_legacy = getattr(cond, "exchange", None)
 
-    # For debug: prefer most relevant source label (left/right could differ)
-    if _strip(cond.left.exchange) or _strip(cond.right.exchange):
-        dbg.exchange_src = "row"
-    elif _strip(group.exchange):
-        dbg.exchange_src = "group"
-    elif _strip(profile.default_exchange):
-        dbg.exchange_src = "profile"
-    else:
-        dbg.exchange_src = "global"
+    # ---- per-side overrides (NEW schema indicator objects) ----
+    left_symbol_override = getattr(left_ind, "symbol", None) if left_ind is not None else None
+    right_symbol_override = getattr(right_ind, "symbol", None) if right_ind is not None else None
+    left_interval_override = getattr(left_ind, "interval", None) if left_ind is not None else None
+    right_interval_override = getattr(right_ind, "interval", None) if right_ind is not None else None
 
-    # -------------------------
-    # CLOCK INTERVAL (single, for tick/threshold)
-    # -------------------------
-    # Critical rule:
-    # - clock interval is NOT left/right interval
-    # - default: group.interval
-    # - if group.interval missing, fall back profile.default_interval or defaults.clock_interval or defaults.interval
-    clock_interval = _pick_first(
-        group.interval,
-        profile.default_interval,
-        defaults.clock_interval,
-        defaults.interval,
-    )
+    # ---- profile defaults are OPTIONAL (new schema doesn’t have them) ----
+    prof_default_interval = getattr(profile, "default_interval", None)
+    prof_default_exchange = getattr(profile, "default_exchange", None)
 
-    dbg.clock_interval_src = (
-        "group" if _strip(group.interval) else
-        "profile" if _strip(profile.default_interval) else
-        "global_clock" if _strip(defaults.clock_interval) else
-        "global_interval"
-    )
+    # ---- group baseline ----
+    group_interval = getattr(group, "interval", None)
+    group_exchange = getattr(group, "exchange", None)
 
-    # -------------------------
-    # REQUIRED checks (hard fail)
-    # -------------------------
-    left_symbol = _require("left_symbol", left_symbol, dbg)
-    right_symbol = _require("right_symbol", right_symbol, dbg)
+    # ---- engine defaults ----
+    def_interval = getattr(defaults, "interval", None)
+    def_clock = getattr(defaults, "clock_interval", None)
+    def_exchange = getattr(defaults, "exchange", None)
 
-    left_interval = _require("left_interval", left_interval, dbg)
-    right_interval = _require("right_interval", right_interval, dbg)
+    # Clock interval: group interval wins; else profile default (if legacy); else defaults
+    clock_interval = _first_non_empty(group_interval, prof_default_interval, def_clock, def_interval) or ""
 
-    left_exchange = _require("left_exchange", left_exchange, dbg)
-    right_exchange = _require("right_exchange", right_exchange, dbg)
+    # Base exchange: group wins; else profile default (if legacy); else defaults
+    base_exchange = _first_non_empty(group_exchange, prof_default_exchange, def_exchange) or ""
 
-    clock_interval = _require("clock_interval", clock_interval, dbg)
+    # Left/right interval resolution:
+    left_interval = _first_non_empty(left_interval_override, left_it_legacy, it_legacy, group_interval, prof_default_interval, def_interval) or ""
+    right_interval = _first_non_empty(right_interval_override, right_it_legacy, it_legacy, group_interval, prof_default_interval, def_interval) or ""
 
-    # -------------------------
-    # Build contexts
-    # -------------------------
-    left_ctx = ResolvedContext(
-        symbol=left_symbol,
-        interval=left_interval,
-        exchange=left_exchange,
-        clock_interval=clock_interval,
-    )
-    right_ctx = ResolvedContext(
-        symbol=right_symbol,
-        interval=right_interval,
-        exchange=right_exchange,
-        clock_interval=clock_interval,
-    )
+    # Left/right symbol resolution:
+    left_symbol = _first_non_empty(left_symbol_override, base_symbol) or ""
+    right_symbol = _first_non_empty(right_symbol_override, base_symbol) or ""
 
-    # Debug prints (extra noisy on purpose; you can gate later behind logger)
-    print(
-        "[resolver] profile=%s gid=%s rid=%s base_symbol=%s | "
-        "LEFT(sym=%s[%s] int=%s[%s] ex=%s) | "
-        "RIGHT(sym=%s[%s] int=%s[%s] ex=%s) | "
-        "CLOCK=%s[%s]"
+    # Left/right exchange resolution:
+    left_exchange = _first_non_empty(left_ex_legacy, ex_legacy, base_exchange) or ""
+    right_exchange = _first_non_empty(right_ex_legacy, ex_legacy, base_exchange) or ""
+
+    # counts (optional; planner may also handle)
+    left_count = getattr(left_ind, "count", None) if left_ind is not None else getattr(cond, "left_count", None)
+    right_count = getattr(right_ind, "count", None) if right_ind is not None else getattr(cond, "right_count", None)
+
+    try:
+        left_count_i = int(left_count) if left_count is not None else 1
+    except Exception:
+        left_count_i = 1
+    try:
+        right_count_i = int(right_count) if right_count is not None else 1
+    except Exception:
+        right_count_i = 1
+
+    dbg: Dict[str, Any] = {
+        "pid": pid,
+        "gid": gid,
+        "rid": rid,
+        "base_symbol": base_symbol,
+        "clock_interval": clock_interval,
+        "base_exchange": base_exchange,
+        "left": {
+            "name": left_name,
+            "output": left_output,
+            "symbol": left_symbol,
+            "interval": left_interval,
+            "exchange": left_exchange,
+            "count": left_count_i,
+            "interval_src": _safe_strip(left_interval_override) or _safe_strip(left_it_legacy) or _safe_strip(it_legacy) or _safe_strip(group_interval) or _safe_strip(prof_default_interval) or _safe_strip(def_interval),
+            "exchange_src": _safe_strip(left_ex_legacy) or _safe_strip(ex_legacy) or _safe_strip(group_exchange) or _safe_strip(prof_default_exchange) or _safe_strip(def_exchange),
+        },
+        "right": {
+            "name": right_name,
+            "output": right_output,
+            "symbol": right_symbol,
+            "interval": right_interval,
+            "exchange": right_exchange,
+            "count": right_count_i,
+            "interval_src": _safe_strip(right_interval_override) or _safe_strip(right_it_legacy) or _safe_strip(it_legacy) or _safe_strip(group_interval) or _safe_strip(prof_default_interval) or _safe_strip(def_interval),
+            "exchange_src": _safe_strip(right_ex_legacy) or _safe_strip(ex_legacy) or _safe_strip(group_exchange) or _safe_strip(prof_default_exchange) or _safe_strip(def_exchange),
+        },
+    }
+
+    _dbg(
+        "[resolver] pid=%s gid=%s rid=%s base=%s clock=%s ex=%s | L(%s,%s,%s) R(%s,%s,%s)"
         % (
-            profile.profile_id, group.gid, cond.rid, base_symbol,
-            left_ctx.symbol, dbg.left_symbol_src,
-            left_ctx.interval, dbg.left_interval_src,
-            left_ctx.exchange,
-            right_ctx.symbol, dbg.right_symbol_src,
-            right_ctx.interval, dbg.right_interval_src,
-            right_ctx.exchange,
-            clock_interval, dbg.clock_interval_src,
+            pid,
+            gid,
+            rid,
+            base_symbol,
+            clock_interval,
+            base_exchange,
+            left_symbol,
+            left_interval,
+            left_exchange,
+            right_symbol,
+            right_interval,
+            right_exchange,
         )
     )
 
-    return ResolvedPair(left=left_ctx, right=right_ctx), dbg
+    left_ctx = _build_model(
+        ResolvedContext,
+        {
+            "indicator": left_name,
+            "output": left_output,
+            "symbol": left_symbol,
+            "interval": left_interval,
+            "exchange": left_exchange,
+            "params": left_params or {},
+            "count": left_count_i,
+            "clock_interval": clock_interval,
+        },
+    )
+    right_ctx = _build_model(
+        ResolvedContext,
+        {
+            "indicator": right_name,
+            "output": right_output,
+            "symbol": right_symbol,
+            "interval": right_interval,
+            "exchange": right_exchange,
+            "params": right_params or {},
+            "count": right_count_i,
+            "clock_interval": clock_interval,
+        },
+    )
+
+    pair = _build_model(ResolvedPair, {"left": left_ctx, "right": right_ctx})
+    return pair, dbg

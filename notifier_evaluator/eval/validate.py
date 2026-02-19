@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from notifier_evaluator.models.schema import Profile, Group, Condition, ThresholdConfig, AlarmConfig
 
@@ -18,6 +18,18 @@ from notifier_evaluator.models.schema import Profile, Group, Condition, Threshol
 # - warnings are collected but do NOT flip ok=False
 # - disabled profiles/groups/rows are skipped (they shouldn't block loading)
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+DEBUG_PRINT = True
+
+
+def _dbg(msg: str) -> None:
+    if not DEBUG_PRINT:
+        return
+    try:
+        print(msg)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -46,160 +58,355 @@ class ValidationResult:
     warns_n: int = 0
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Tolerant helpers (schema drift between legacy vs NEW UI schema)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _get_bool(obj: Any, *names: str, default: bool = True) -> bool:
+    """
+    Best-effort boolean getter:
+      - tries attribute names in order
+      - accepts bool/int
+      - accepts common strings
+    """
+    for n in names:
+        try:
+            if hasattr(obj, n):
+                v = getattr(obj, n)
+                if v is None:
+                    continue
+                if isinstance(v, bool):
+                    return v
+                if isinstance(v, int):
+                    return bool(v)
+                if isinstance(v, str):
+                    s = v.strip().lower()
+                    if s in ("1", "true", "yes", "y", "on", "enabled", "active"):
+                        return True
+                    if s in ("0", "false", "no", "n", "off", "disabled", "inactive"):
+                        return False
+                    # unknown string -> keep default
+                    return default
+                # unknown type -> default
+                return default
+        except Exception:
+            continue
+    return default
+
+
+def _get_str(obj: Any, *names: str, default: str = "") -> str:
+    for n in names:
+        try:
+            if hasattr(obj, n):
+                v = getattr(obj, n)
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s:
+                    return s
+        except Exception:
+            continue
+    return default
+
+
+def _get_rows(g: Any) -> List[Any]:
+    """
+    NEW schema uses `conditions`, legacy used `rows`.
+    Return list (possibly empty).
+    """
+    rows = None
+    try:
+        rows = getattr(g, "rows", None)
+    except Exception:
+        rows = None
+    if rows is None:
+        try:
+            rows = getattr(g, "conditions", None)
+        except Exception:
+            rows = None
+    if isinstance(rows, list):
+        return rows
+    return []
+
+
+def _get_logic_to_prev(r: Any) -> str:
+    """
+    NEW schema uses `logic` ("and"/"or") to chain to previous.
+    Legacy schema uses `logic_to_prev`.
+    """
+    s = _get_str(r, "logic_to_prev", "logic", default="and").lower().strip()
+    return s or "and"
+
+
+def _get_count(side: Any) -> int:
+    """
+    Side in NEW schema often has no 'count'. Treat missing as 1.
+    """
+    try:
+        if hasattr(side, "count"):
+            v = getattr(side, "count")
+            if v is None:
+                return 1
+            return int(v)
+    except Exception:
+        return -1
+    return 1
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main validation
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 def validate_profiles(profiles: List[Profile]) -> ValidationResult:
     res = ValidationResult(ok=True, profiles=len(profiles or []))
 
     for p in profiles or []:
-        pid = (p.profile_id or "").strip() or "<missing>"
+        pid = _get_str(p, "profile_id", "id", "pid", default="<missing>") or "<missing>"
 
-        if not p.enabled:
-            print(f"[validate] skip disabled profile={pid}")
+        # tolerate schema drift: profile can use enabled|active|is_enabled
+        p_enabled = _get_bool(p, "enabled", "active", "is_enabled", default=True)
+        if not p_enabled:
+            _dbg(f"[validate] skip disabled profile={pid}")
             continue
 
-        if not (p.profile_id or "").strip():
+        if not _get_str(p, "profile_id", "id", "pid", default=""):
             _add(res, severity="error", level="profile", pid="<missing>", gid=None, rid=None, field="profile_id", msg="missing profile_id")
-        if not (p.name or "").strip():
+        if not _get_str(p, "name", default=""):
             _add(res, severity="error", level="profile", pid=pid, gid=None, rid=None, field="name", msg="missing name")
 
-        for g in p.groups or []:
+        groups = []
+        try:
+            groups = list(getattr(p, "groups") or [])
+        except Exception:
+            groups = []
+
+        for g in groups:
             res.groups += 1
             _validate_group(p, g, res)
 
     # Debug prints
-    print(
+    _dbg(
         "[validate] profiles=%d groups=%d rows=%d ok=%s errors=%d warns=%d"
         % (res.profiles, res.groups, res.rows, res.ok, res.errors_n, res.warns_n)
     )
     for e in res.errors[:50]:
-        print("[validate] %s %s" % (e.severity.upper(), e))
+        _dbg("[validate] %s %s" % (e.severity.upper(), e))
     if len(res.errors) > 50:
-        print("[validate] ... (%d more issues)" % (len(res.errors) - 50))
+        _dbg("[validate] ... (%d more issues)" % (len(res.errors) - 50))
 
     return res
 
 
 def _validate_group(p: Profile, g: Group, res: ValidationResult) -> None:
-    pid = (p.profile_id or "").strip() or "<missing>"
-    gid = (g.gid or "").strip() or "<missing>"
+    pid = _get_str(p, "profile_id", "id", "pid", default="<missing>") or "<missing>"
+    gid = _get_str(g, "gid", default="<missing>") or "<missing>"
 
-    if not g.enabled:
-        print(f"[validate] skip disabled group profile={pid} gid={gid}")
+    # tolerate schema drift: group can use enabled|active
+    g_enabled = _get_bool(g, "enabled", "active", default=True)
+    if not g_enabled:
         return
 
-    if not (g.gid or "").strip():
+    if not _get_str(g, "gid", default=""):
         _add(res, severity="error", level="group", pid=pid, gid="<missing>", rid=None, field="gid", msg="missing gid")
 
     # group config sanity
-    if g.threshold:
-        _validate_threshold(pid, gid, g.threshold, res)
-    if g.alarm:
-        _validate_alarm(pid, gid, g.alarm, res)
+    # NEW schema: threshold is per-condition (row), not per-group.
+    # alarm may exist on some schemas; also NEW schema may use deactivate_on (string),
+    # which is NOT the same thing as AlarmConfig. We only validate AlarmConfig if present.
+    g_alarm = getattr(g, "alarm", None) if hasattr(g, "alarm") else None
+    if g_alarm:
+        _validate_alarm(pid, gid, g_alarm, res)
+
+    rows = _get_rows(g)
 
     # rows
-    if not g.rows:
+    if not rows:
         # not fatal, but likely unintended
-        _add(res, severity="warn", level="group", pid=pid, gid=gid, rid=None, field="rows", msg="group has no rows (will evaluate UNKNOWN)")
+        _add(
+            res,
+            severity="warn",
+            level="group",
+            pid=pid,
+            gid=gid,
+            rid=None,
+            field="rows",
+            msg="group has no rows/conditions (will evaluate UNKNOWN)",
+        )
 
-    for r in g.rows or []:
+    for r in rows:
         res.rows += 1
         _validate_row(pid, gid, r, res)
 
 
 def _validate_row(pid: str, gid: str, r: Condition, res: ValidationResult) -> None:
-    rid = (r.rid or "").strip() or "<missing>"
+    rid = _get_str(r, "rid", default="<missing>") or "<missing>"
 
-    if not r.enabled:
-        print(f"[validate] skip disabled row profile={pid} gid={gid} rid={rid}")
+    # tolerate schema drift: row can use enabled|active|is_enabled; NEW schema often has none -> default True
+    r_enabled = _get_bool(r, "enabled", "active", "is_enabled", default=True)
+    if not r_enabled:
+        _dbg(f"[validate] skip disabled row profile={pid} gid={gid} rid={rid}")
         return
 
-    if not (r.rid or "").strip():
+    if not _get_str(r, "rid", default=""):
         _add(res, severity="error", level="row", pid=pid, gid=gid, rid="<missing>", field="rid", msg="missing rid")
 
     # left/right basic
-    if not (r.left.name or "").strip():
-        _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="left.name", msg="missing left indicator name")
-    if not (r.right.name or "").strip():
-        _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="right.name", msg="missing right indicator name")
+    left = getattr(r, "left", None)
+    right = getattr(r, "right", None)
+
+    if left is None:
+        _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="left", msg="missing left indicator object")
+    if right is None:
+        _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="right", msg="missing right indicator object")
+
+    if left is not None:
+        ln = _get_str(left, "name", default="")
+        if not ln:
+            _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="left.name", msg="missing left indicator name")
+
+    if right is not None:
+        rn = _get_str(right, "name", default="")
+        if not rn:
+            _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="right.name", msg="missing right indicator name")
 
     # operator
-    op = (r.op or "").strip().lower()
+    op = _get_str(r, "op", default="").strip().lower()
     if op not in ("gt", "gte", "lt", "lte", "eq", "ne"):
-        _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="op", msg=f"invalid op '{r.op}'")
+        _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="op", msg=f"invalid op '{getattr(r, 'op', None)}'")
 
-    # counts
-    try:
-        if int(r.left.count or 1) < 1:
+    # counts (NEW schema may not provide counts -> treated as 1)
+    if left is not None:
+        lc = _get_count(left)
+        if lc == -1:
+            _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="left.count", msg="left.count not int")
+        elif lc < 1:
             _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="left.count", msg="left.count must be >= 1")
-    except Exception:
-        _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="left.count", msg="left.count not int")
 
-    try:
-        if int(r.right.count or 1) < 1:
+    if right is not None:
+        rc = _get_count(right)
+        if rc == -1:
+            _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="right.count", msg="right.count not int")
+        elif rc < 1:
             _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="right.count", msg="right.count must be >= 1")
-    except Exception:
-        _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="right.count", msg="right.count not int")
 
-    # logic_to_prev
-    ltp = (r.logic_to_prev or "and").strip().lower()
+    # logic_to_prev (NEW schema uses `logic`)
+    ltp = _get_logic_to_prev(r)
     if ltp not in ("and", "or"):
-        _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="logic_to_prev", msg=f"invalid '{r.logic_to_prev}'")
+        _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="logic_to_prev", msg=f"invalid '{getattr(r, 'logic_to_prev', None) or getattr(r, 'logic', None)}'")
+
+    # threshold per row (NEW schema)
+    t = getattr(r, "threshold", None) if hasattr(r, "threshold") else None
+    if t:
+        _validate_threshold(pid, gid, rid, t, res)
 
     # NOTE: symbol/interval/exchange overrides are NOT validated here
     # because resolver provides fallbacks and engine may provide base symbols.
     # If you want strict: you can enforce allowed formats here.
 
 
-def _validate_threshold(pid: str, gid: str, t: ThresholdConfig, res: ValidationResult) -> None:
-    mode = (t.mode or "none").strip().lower()
+def _validate_threshold(pid: str, gid: str, rid: str, t: ThresholdConfig, res: ValidationResult) -> None:
+    """
+    Supports both:
+      - legacy ThresholdConfig fields (mode/streak_n/window_ticks/count_required)
+      - NEW schema row.threshold: null or {type: streak|min_count | count|window+min_count}
+    """
+    # NEW schema: {type: "...", window: int, min_count: int}
+    t_type = _get_str(t, "type", default="").lower().strip()
+    if t_type:
+        if t_type not in ("streak", "count"):
+            _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.type", msg=f"invalid '{t_type}'")
+            return
+
+        if t_type == "streak":
+            mn = None
+            try:
+                mn = int(getattr(t, "min_count"))
+            except Exception:
+                mn = None
+            if mn is None:
+                _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.min_count", msg="missing min_count for type=streak")
+            else:
+                if mn < 1:
+                    _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.min_count", msg="min_count must be >= 1")
+        if t_type == "count":
+            w = None
+            c = None
+            try:
+                w = int(getattr(t, "window"))
+            except Exception:
+                w = None
+            try:
+                c = int(getattr(t, "min_count"))
+            except Exception:
+                c = None
+
+            if w is None:
+                _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.window", msg="missing window for type=count")
+            if c is None:
+                _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.min_count", msg="missing min_count for type=count")
+
+            if w is not None and c is not None:
+                if w < 1:
+                    _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.window", msg="window must be >= 1")
+                if c < 1:
+                    _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.min_count", msg="min_count must be >= 1")
+                if c > w:
+                    _add(res, severity="warn", level="row", pid=pid, gid=gid, rid=rid, field="threshold", msg=f"min_count ({c}) > window ({w}) => impossible")
+        return
+
+    # Legacy schema: ThresholdConfig(mode=none|streak|count, ...)
+    mode = _get_str(t, "mode", default="none").strip().lower()
     if mode not in ("none", "streak", "count"):
-        _add(res, severity="error", level="group", pid=pid, gid=gid, rid=None, field="threshold.mode", msg=f"invalid '{t.mode}'")
+        _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.mode", msg=f"invalid '{getattr(t, 'mode', None)}'")
         return
 
     if mode == "streak":
-        if t.streak_n is None:
-            _add(res, severity="error", level="group", pid=pid, gid=gid, rid=None, field="threshold.streak_n", msg="missing streak_n for mode=streak")
+        if getattr(t, "streak_n", None) is None:
+            _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.streak_n", msg="missing streak_n for mode=streak")
         else:
             try:
-                if int(t.streak_n) < 1:
-                    _add(res, severity="error", level="group", pid=pid, gid=gid, rid=None, field="threshold.streak_n", msg="streak_n must be >= 1")
+                if int(getattr(t, "streak_n")) < 1:
+                    _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.streak_n", msg="streak_n must be >= 1")
             except Exception:
-                _add(res, severity="error", level="group", pid=pid, gid=gid, rid=None, field="threshold.streak_n", msg="streak_n not int")
+                _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.streak_n", msg="streak_n not int")
 
     if mode == "count":
-        if t.window_ticks is None:
-            _add(res, severity="error", level="group", pid=pid, gid=gid, rid=None, field="threshold.window_ticks", msg="missing window_ticks for mode=count")
-        if t.count_required is None:
-            _add(res, severity="error", level="group", pid=pid, gid=gid, rid=None, field="threshold.count_required", msg="missing count_required for mode=count")
+        if getattr(t, "window_ticks", None) is None:
+            _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.window_ticks", msg="missing window_ticks for mode=count")
+        if getattr(t, "count_required", None) is None:
+            _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.count_required", msg="missing count_required for mode=count")
 
-        if t.window_ticks is not None and t.count_required is not None:
+        if getattr(t, "window_ticks", None) is not None and getattr(t, "count_required", None) is not None:
             try:
-                w = int(t.window_ticks)
-                c = int(t.count_required)
+                w = int(getattr(t, "window_ticks"))
+                c = int(getattr(t, "count_required"))
                 if w < 1:
-                    _add(res, severity="error", level="group", pid=pid, gid=gid, rid=None, field="threshold.window_ticks", msg="window_ticks must be >= 1")
+                    _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.window_ticks", msg="window_ticks must be >= 1")
                 if c < 1:
-                    _add(res, severity="error", level="group", pid=pid, gid=gid, rid=None, field="threshold.count_required", msg="count_required must be >= 1")
+                    _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold.count_required", msg="count_required must be >= 1")
                 if c > w:
-                    # not fatal but usually wrong
-                    _add(res, severity="warn", level="group", pid=pid, gid=gid, rid=None, field="threshold", msg=f"count_required ({c}) > window_ticks ({w}) => impossible")
+                    _add(res, severity="warn", level="row", pid=pid, gid=gid, rid=rid, field="threshold", msg=f"count_required ({c}) > window_ticks ({w}) => impossible")
             except Exception:
-                _add(res, severity="error", level="group", pid=pid, gid=gid, rid=None, field="threshold", msg="window_ticks/count_required not int")
+                _add(res, severity="error", level="row", pid=pid, gid=gid, rid=rid, field="threshold", msg="window_ticks/count_required not int")
 
 
 def _validate_alarm(pid: str, gid: str, a: AlarmConfig, res: ValidationResult) -> None:
-    mode = (a.mode or "always_on").strip().lower()
+    mode = _get_str(a, "mode", default="always_on").strip().lower()
     if mode not in ("always_on", "auto_off", "pre_notification"):
-        _add(res, severity="error", level="group", pid=pid, gid=gid, rid=None, field="alarm.mode", msg=f"invalid '{a.mode}'")
+        _add(res, severity="error", level="group", pid=pid, gid=gid, rid=None, field="alarm.mode", msg=f"invalid '{getattr(a, 'mode', None)}'")
 
     try:
-        cd = int(a.cooldown_sec or 0)
+        cd = int(getattr(a, "cooldown_sec", 0) or 0)
         if cd < 0:
             _add(res, severity="error", level="group", pid=pid, gid=gid, rid=None, field="alarm.cooldown_sec", msg="cooldown_sec must be >= 0")
     except Exception:
         _add(res, severity="error", level="group", pid=pid, gid=gid, rid=None, field="alarm.cooldown_sec", msg="cooldown_sec not int")
 
     # edge_only is bool; pydantic usually coerces, but keep it safe
-    if a.edge_only not in (True, False):
+    edge = getattr(a, "edge_only", None)
+    if edge not in (True, False, None):
         _add(res, severity="warn", level="group", pid=pid, gid=gid, rid=None, field="alarm.edge_only", msg="edge_only is not a bool (coercion failed?)")
 
 

@@ -2,387 +2,354 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import os
+import re
+import logging
 from typing import Any, Dict, List, Optional, Literal
 
-# NOTE:
-# - Diese Models sind NUR die Profil-Struktur (wie im JSON).
-# - Keine Runtime-Keys, kein resolved context hier.
+from pydantic import BaseModel, Field, ValidationError
+
+try:
+    # pydantic v2
+    from pydantic import ConfigDict, field_validator, model_validator
+    _IS_PYD_V2 = True
+except Exception:  # pragma: no cover
+    ConfigDict = None  # type: ignore[assignment]
+    field_validator = None  # type: ignore[assignment]
+    model_validator = None  # type: ignore[assignment]
+    _IS_PYD_V2 = False
+
+logger = logging.getLogger(__name__)
+
+# Enable noisy debug by setting env var:
+#   set NOTIFIER_SCHEMA_DEBUG=1   (Windows)
+_SCHEMA_DEBUG = os.getenv("NOTIFIER_SCHEMA_DEBUG", "").strip() in ("1", "true", "yes", "y", "on")
 
 
-Op = Literal["gt", "gte", "lt", "lte", "eq", "ne"]
-Logic = Literal["and", "or"]
-AlarmMode = Literal["always_on", "auto_off", "pre_notification"]
-ThresholdMode = Literal["none", "streak", "count"]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Engine Defaults (global fallback)
-# ──────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class EngineDefaults:
-    """
-    Globale Defaults, falls row/group nicht setzen.
-    """
-    exchange: str = ""
-    interval: str = ""
-    clock_interval: str = ""
-    source: str = "Close"
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Threshold / Alarm Configs
-# ──────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class ThresholdConfig:
-    """
-    Threshold-Konfiguration pro Group.
-    mode:
-      - none: keine Schwelle (sofort)
-      - streak: N aufeinanderfolgende TRUE-Ticks
-      - count: in window_ticks mindestens count_required TRUE-Ticks (Unterbrechungen ok)
-    """
-    mode: ThresholdMode = "none"
-
-    # streak
-    streak_n: int = 1
-
-    # count
-    window_ticks: int = 1
-    count_required: int = 1
-
-    # Backward-compatible alias names (wenn du das früher so hattest)
-    @property
-    def streak_needed(self) -> int:
-        return self.streak_n
-
-    @property
-    def count_true(self) -> int:
-        return self.count_required
-
-    @staticmethod
-    def from_dict(d: Any) -> "ThresholdConfig":
-        if not isinstance(d, dict):
-            return ThresholdConfig()
-        mode = str(d.get("mode", "none")).strip().lower()
-        mode = mode if mode in ("none", "streak", "count") else "none"
-
-        # accept both naming styles:
-        streak_n = d.get("streak_n", d.get("streak_needed", 1))
-        window_ticks = d.get("window_ticks", 1)
-        count_required = d.get("count_required", d.get("count_true", 1))
-
+def _dbg(msg: str) -> None:
+    if _SCHEMA_DEBUG:
         try:
-            streak_n = int(streak_n)
+            print(msg)
         except Exception:
-            streak_n = 1
-        try:
-            window_ticks = int(window_ticks)
-        except Exception:
-            window_ticks = 1
-        try:
-            count_required = int(count_required)
-        except Exception:
-            count_required = 1
-
-        # clamp
-        if streak_n < 1:
-            streak_n = 1
-        if window_ticks < 1:
-            window_ticks = 1
-        if count_required < 1:
-            count_required = 1
-
-        return ThresholdConfig(
-            mode=mode, streak_n=streak_n, window_ticks=window_ticks, count_required=count_required
-        )
+            pass
 
 
-@dataclass
-class AlarmConfig:
-    """
-    Alarm policy config:
-      - always_on: push wenn final_true (+threshold passed) erfüllt
-      - auto_off: push und dann deactivate (active=false)
-      - pre_notification: push bei partial-change + push bei final_true, dann deactivate
-    """
-    mode: AlarmMode = "always_on"
-    cooldown_sec: int = 0
-    edge_only: bool = True
+# Keep these exported because other modules import them.
+VALID_INTERVALS = {
+    # common crypto intervals
+    "1m", "3m", "5m", "15m", "30m",
+    "1h", "2h", "4h", "6h", "8h", "12h",
+    "1d", "3d", "1w", "1mo",
+}
 
-    @staticmethod
-    def from_group_legacy(g: Dict[str, Any]) -> "AlarmConfig":
-        """
-        Mappt deine alten Group-Felder:
-          deactivate_on -> mode
-          cooldown_s    -> cooldown_sec
-          edge_only     -> edge_only
-        """
-        if not isinstance(g, dict):
-            return AlarmConfig()
-        mode = str(g.get("mode", g.get("deactivate_on", "always_on"))).strip().lower()
-        if mode not in ("always_on", "auto_off", "pre_notification"):
-            mode = "always_on"
-        cd = g.get("cooldown_sec", g.get("cooldown_s", 0))
-        try:
-            cd = int(cd)
-        except Exception:
-            cd = 0
-        if cd < 0:
-            cd = 0
-        edge = g.get("edge_only", True)
-        edge = bool(edge) if isinstance(edge, (bool, int)) else True
-        return AlarmConfig(mode=mode, cooldown_sec=cd, edge_only=edge)
+VALID_EXCHANGES = {
+    # keep this permissive; you can tighten later
+    "binance",
+    "binance_futures",
+    "bybit",
+    "kraken",
+    "coinbase",
+    "okx",
+}
 
-    @staticmethod
-    def from_dict(d: Any) -> "AlarmConfig":
-        if not isinstance(d, dict):
-            return AlarmConfig()
-        mode = str(d.get("mode", "always_on")).strip().lower()
-        if mode not in ("always_on", "auto_off", "pre_notification"):
-            mode = "always_on"
-        cd = d.get("cooldown_sec", 0)
-        try:
-            cd = int(cd)
-        except Exception:
-            cd = 0
-        if cd < 0:
-            cd = 0
-        edge = d.get("edge_only", True)
-        edge = bool(edge) if isinstance(edge, (bool, int)) else True
-        return AlarmConfig(mode=mode, cooldown_sec=cd, edge_only=edge)
+_INTERVAL_RE = re.compile(r"^\d+(m|h|d|w|mo)$", re.IGNORECASE)
+
+
+def _norm_str(x: Any) -> str:
+    try:
+        return str(x).strip()
+    except Exception:
+        return ""
+
+
+def _norm_lower(x: Any) -> str:
+    return _norm_str(x).lower()
+
+
+def _validate_interval_value(v: Optional[str], ctx: str = "") -> Optional[str]:
+    if v is None:
+        return None
+    s = _norm_lower(v)
+    if not s:
+        return None
+    # accept known set OR simple pattern
+    if s in VALID_INTERVALS or _INTERVAL_RE.match(s):
+        return s
+    raise ValueError(f"{ctx}Invalid interval: {v!r}")
+
+
+def _validate_exchange_value(v: Optional[str], ctx: str = "") -> Optional[str]:
+    if v is None:
+        return None
+    s = _norm_lower(v)
+    if not s:
+        return None
+    # exchange names are “contract-ish” -> validate against allowlist
+    if s in VALID_EXCHANGES:
+        return s
+    raise ValueError(f"{ctx}Invalid exchange: {v!r}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Conditions
+# Models
+# Keep them tolerant: extra fields allowed, because UI / migration / future changes.
 # ──────────────────────────────────────────────────────────────────────────────
 
-@dataclass
-class ConditionSide:
+class _Base(BaseModel):
+    if _IS_PYD_V2:
+        model_config = ConfigDict(extra="allow")  # type: ignore[misc]
+    else:
+        class Config:
+            extra = "allow"
+
+
+class Threshold(_Base):
     """
-    Eine Seite (LEFT oder RIGHT) in einer Condition.
+    UI/Evaluator threshold object.
+    Your authoritative schema: null OR {type: streak|min_count} OR {type: count|window+min_count}
+    We'll store in normalized flat form.
     """
-    kind: Literal["indicator", "price", "value"] = "indicator"
+    type: Literal["streak", "count"]
+    window: Optional[int] = None
+    min_count: Optional[int] = None
 
-    # indicator:
-    name: Optional[str] = None
-    params: Dict[str, Any] = field(default_factory=dict)
-    output: Optional[str] = None
-    count: int = 1  # meist 1 oder 5
 
-    # price:
-    source: Optional[str] = None  # Close/Open/High/Low (falls kind=price)
-
-    # value:
-    value: Optional[float] = None  # falls kind=value
-
-    # row overrides (optional):
+class Indicator(_Base):
+    """
+    Indicator object used by conditions.
+    Always present fields in NEW schema: {name, output, symbol|null, interval|null, params}
+    """
+    name: str
+    output: str
     symbol: Optional[str] = None
     interval: Optional[str] = None
-    exchange: Optional[str] = None
+    params: Dict[str, Any] = Field(default_factory=dict)
 
-    @staticmethod
-    def from_dict(d: Any) -> "ConditionSide":
-        if not isinstance(d, dict):
-            return ConditionSide()
-        kind = str(d.get("kind", "indicator")).strip().lower()
-        if kind not in ("indicator", "price", "value"):
-            kind = "indicator"
-        params = d.get("params") if isinstance(d.get("params"), dict) else {}
-        try:
-            cnt = int(d.get("count", 1))
-        except Exception:
-            cnt = 1
-        if cnt < 1:
-            cnt = 1
+    if _IS_PYD_V2:
+        @field_validator("symbol", "interval", mode="before")
+        def _empty_to_none(cls, v: Any) -> Any:
+            s = _norm_str(v)
+            return None if s in ("", "None", "null") else v
 
-        # best-effort numeric value
-        val = d.get("value", None)
-        try:
-            if val is not None:
-                val = float(val)
-        except Exception:
-            val = None
+        @field_validator("interval")
+        def _validate_interval(cls, v: Optional[str]) -> Optional[str]:
+            return _validate_interval_value(v, ctx="Indicator.interval: ")
+    else:
+        # pydantic v1
+        @classmethod
+        def _empty_to_none(cls, v: Any) -> Any:
+            s = _norm_str(v)
+            return None if s in ("", "None", "null") else v
 
-        return ConditionSide(
-            kind=kind,
-            name=d.get("name"),
-            params=params,
-            output=d.get("output"),
-            count=cnt,
-            source=d.get("source"),
-            value=val,
-            symbol=d.get("symbol"),
-            interval=d.get("interval"),
-            exchange=d.get("exchange"),
-        )
+        def __init__(self, **data: Any) -> None:
+            if "symbol" in data:
+                data["symbol"] = self._empty_to_none(data["symbol"])
+            if "interval" in data:
+                data["interval"] = self._empty_to_none(data["interval"])
+            super().__init__(**data)
+            self.interval = _validate_interval_value(self.interval, ctx="Indicator.interval: ")
 
 
-@dataclass
-class Condition:
-    """
-    Eine Zeile:
-      LEFT op RIGHT
-    plus row_logic (AND/OR) als Verbindung zur VORHERIGEN Zeile.
-    """
+class Condition(_Base):
     rid: str
-    left: ConditionSide
-    op: Op
-    right: ConditionSide
-
-    # Verknüpfung zur vorherigen Zeile (erste Zeile kann "and" defaulten)
-    logic_to_prev: Logic = "and"
-
-    enabled: bool = True
-    important: bool = False
-
-    @staticmethod
-    def from_dict(d: Any) -> "Condition":
-        if not isinstance(d, dict):
-            # harte Default-Zeile ist Quatsch → rid muss existieren
-            return Condition(
-                rid="<missing>",
-                left=ConditionSide(),
-                op="eq",
-                right=ConditionSide(kind="value", value=0.0),
-                logic_to_prev="and",
-                enabled=False,
-            )
-        rid = str(d.get("rid") or d.get("id") or "").strip() or "<missing>"
-        op = str(d.get("op", "eq")).strip().lower()
-        if op not in ("gt", "gte", "lt", "lte", "eq", "ne"):
-            op = "eq"
-        ltp = str(d.get("logic_to_prev", d.get("row_logic", "and"))).strip().lower()
-        if ltp not in ("and", "or"):
-            ltp = "and"
-        return Condition(
-            rid=rid,
-            left=ConditionSide.from_dict(d.get("left")),
-            op=op,  # type: ignore
-            right=ConditionSide.from_dict(d.get("right")),
-            logic_to_prev=ltp,  # type: ignore
-            enabled=bool(d.get("enabled", True)),
-            important=bool(d.get("important", False)),
-        )
+    logic: Literal["and", "or"] = "and"   # link to previous row (row[0] ignores it anyway)
+    left: Indicator
+    op: str
+    right: Indicator
+    threshold: Optional[Threshold] = None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Group / Profile
-# ──────────────────────────────────────────────────────────────────────────────
+class AlarmConfig(_Base):
+    """
+    Alarm config imported by notifier_evaluator.alarms.policy.
 
-@dataclass
-class Group:
+    Keep permissive; policy can decide what it uses.
+    """
+    mode: str = "always_on"          # "always_on" | "auto_off" | "pre_notification" etc.
+    cooldown_sec: Optional[int] = None
+    edge_only: bool = False          # if True: push only on FALSE->TRUE
+    deactivate_on: bool = False      # if True: group deactivates after push
+
+class EngineDefaults(_Base):
+    """
+    Engine default settings imported by notifier_evaluator.context.resolver.
+
+    This is NOT the profile/group schema. It's runtime defaults that the resolver
+    can use when profile/group/row values are blank or missing.
+
+    Keep it permissive and stable.
+    """
+    default_exchange: str = "binance"
+    default_interval: str = "1h"
+
+    # Optional future knobs (safe defaults)
+    strict: bool = False
+
+    if _IS_PYD_V2:
+        @field_validator("default_exchange")
+        def _v_ex(cls, v: str) -> str:
+            vv = _validate_exchange_value(v, ctx="EngineDefaults.default_exchange: ")
+            return vv or "binance"
+
+        @field_validator("default_interval")
+        def _v_it(cls, v: str) -> str:
+            vv = _validate_interval_value(v, ctx="EngineDefaults.default_interval: ")
+            return vv or "1h"
+    else:
+        def __init__(self, **data: Any) -> None:
+            super().__init__(**data)
+            self.default_exchange = _validate_exchange_value(self.default_exchange, ctx="EngineDefaults.default_exchange: ") or "binance"
+            self.default_interval = _validate_interval_value(self.default_interval, ctx="EngineDefaults.default_interval: ") or "1h"
+
+
+class ThresholdConfig(_Base):
+    """
+    Threshold configuration for a single condition row.
+
+    Supported:
+      - None (no threshold)
+      - {"type": "streak", "min_count": N}
+      - {"type": "count", "window": W, "min_count": C}
+
+    The evaluator uses this to decide if a row's TRUE state should be considered "passed".
+    """
+    type: str  # "streak" or "count"
+    min_count: int = 1
+    window: Optional[int] = None
+
+    if _IS_PYD_V2:
+        @field_validator("type")
+        def _v_type(cls, v: str) -> str:
+            vv = (v or "").strip().lower()
+            if vv not in ("streak", "count"):
+                raise ValidationError(f"ThresholdConfig.type must be 'streak' or 'count', got {v!r}")
+            return vv
+
+        @field_validator("min_count")
+        def _v_min_count(cls, v: int) -> int:
+            try:
+                iv = int(v)
+            except Exception:
+                raise ValidationError(f"ThresholdConfig.min_count must be int, got {v!r}")
+            if iv < 1:
+                raise ValidationError(f"ThresholdConfig.min_count must be >= 1, got {iv}")
+            return iv
+
+        @field_validator("window")
+        def _v_window(cls, v: Optional[int], info=None) -> Optional[int]:
+            # window only meaningful for type=="count", but allow None otherwise
+            if v is None:
+                return None
+            try:
+                iv = int(v)
+            except Exception:
+                raise ValidationError(f"ThresholdConfig.window must be int, got {v!r}")
+            if iv < 1:
+                raise ValidationError(f"ThresholdConfig.window must be >= 1, got {iv}")
+            return iv
+
+        @model_validator(mode="after")
+        def _v_combo(self):
+            # For count thresholds, window is required
+            if self.type == "count":
+                if self.window is None:
+                    raise ValidationError("ThresholdConfig.window is required when type='count'")
+                if self.min_count > self.window:
+                    raise ValidationError("ThresholdConfig.min_count cannot be > window")
+            return self
+    else:
+        def __init__(self, **data: Any) -> None:
+            super().__init__(**data)
+            self.type = (self.type or "").strip().lower()
+            if self.type not in ("streak", "count"):
+                raise ValidationError(f"ThresholdConfig.type must be 'streak' or 'count', got {self.type!r}")
+
+            try:
+                self.min_count = int(self.min_count)
+            except Exception:
+                raise ValidationError(f"ThresholdConfig.min_count must be int, got {self.min_count!r}")
+            if self.min_count < 1:
+                raise ValidationError(f"ThresholdConfig.min_count must be >= 1, got {self.min_count}")
+
+            if self.window is not None:
+                try:
+                    self.window = int(self.window)
+                except Exception:
+                    raise ValidationError(f"ThresholdConfig.window must be int, got {self.window!r}")
+                if self.window < 1:
+                    raise ValidationError(f"ThresholdConfig.window must be >= 1, got {self.window}")
+
+            if self.type == "count":
+                if self.window is None:
+                    raise ValidationError("ThresholdConfig.window is required when type='count'")
+                if self.min_count > self.window:
+                    raise ValidationError("ThresholdConfig.min_count cannot be > window")
+
+
+
+
+class Group(_Base):
+    """
+    Group model imported by notifier_evaluator.context.group_expander and others.
+    """
     gid: str
-    enabled: bool = True
+    name: Optional[str] = None
+    active: bool = True
 
-    # Konkrete Symbole (direkt)
-    symbols: List[str] = field(default_factory=list)
+    symbol_group: Optional[str] = None
+    symbols: Optional[List[str]] = None
 
-    # Gruppentags (werden vom Expander in echte Symbole aufgelöst)
-    # WICHTIG: TTLGroupExpander erwartet group.group_tags
-    group_tags: List[str] = field(default_factory=list)
-
-    # Gruppen-Defaults (Kontext)
-    interval: Optional[str] = None
     exchange: Optional[str] = None
+    interval: str
 
-    # evaluator config
-    threshold: ThresholdConfig = field(default_factory=ThresholdConfig)
-    alarm: AlarmConfig = field(default_factory=AlarmConfig)
+    telegram_id: Optional[str] = None
+    single_mode: bool = False
+    deactivate_on: bool = False
 
-    # rows
-    rows: List[Condition] = field(default_factory=list)
+    alarm: Optional[AlarmConfig] = None
+    conditions: List[Condition] = Field(default_factory=list)
 
-    # Backward-compatible alias: falls alte JSONs "conditions" benutzen
-    @property
-    def conditions(self) -> List[Condition]:
-        return self.rows
+    if _IS_PYD_V2:
+        @field_validator("interval")
+        def _validate_interval(cls, v: str) -> str:
+            vv = _validate_interval_value(v, ctx="Group.interval: ")
+            # interval is required -> if None after normalization => error
+            if vv is None:
+                raise ValueError("Group.interval cannot be blank")
+            return vv
 
-    @staticmethod
-    def from_dict(d: Any) -> "Group":
-        if not isinstance(d, dict):
-            return Group(gid="<missing>", enabled=False)
-
-        gid = str(d.get("gid") or d.get("id") or "").strip() or "<missing>"
-        enabled = bool(d.get("enabled", True))
-
-        symbols = d.get("symbols") if isinstance(d.get("symbols"), list) else []
-        symbols = [str(x).strip() for x in symbols if str(x).strip()]
-
-        group_tags = d.get("group_tags") if isinstance(d.get("group_tags"), list) else []
-        group_tags = [str(x).strip() for x in group_tags if str(x).strip()]
-
-        interval = d.get("interval", None)
-        exchange = d.get("exchange", None)
-
-        threshold = ThresholdConfig.from_dict(d.get("threshold", {}))
-
-        # Accept either explicit "alarm" dict OR legacy group fields
-        if isinstance(d.get("alarm"), dict):
-            alarm = AlarmConfig.from_dict(d.get("alarm"))
-        else:
-            alarm = AlarmConfig.from_group_legacy(d)
-
-        # Accept either "rows" OR legacy "conditions"
-        raw_rows = d.get("rows", None)
-        if raw_rows is None:
-            raw_rows = d.get("conditions", [])
-
-        rows: List[Condition] = []
-        if isinstance(raw_rows, list):
-            for item in raw_rows:
-                rows.append(Condition.from_dict(item))
-
-        return Group(
-            gid=gid,
-            enabled=enabled,
-            symbols=symbols,
-            group_tags=group_tags,
-            interval=interval,
-            exchange=exchange,
-            threshold=threshold,
-            alarm=alarm,
-            rows=rows,
-        )
+        @field_validator("exchange")
+        def _validate_exchange(cls, v: Optional[str]) -> Optional[str]:
+            return _validate_exchange_value(v, ctx="Group.exchange: ")
+    else:
+        def __init__(self, **data: Any) -> None:
+            super().__init__(**data)
+            self.interval = _validate_interval_value(self.interval, ctx="Group.interval: ") or self.interval
+            self.exchange = _validate_exchange_value(self.exchange, ctx="Group.exchange: ")
 
 
-@dataclass
-class Profile:
-    profile_id: str
+class Profile(_Base):
+    """
+    Profile model (NEW schema).
+    """
+    id: str
     name: str
     enabled: bool = True
+    groups: List[Group] = Field(default_factory=list)
 
-    groups: List[Group] = field(default_factory=list)
-
-    # globale defaults (nur wenn group/row nicht gesetzt)
-    default_interval: Optional[str] = None
-    default_exchange: Optional[str] = None
-
-    @staticmethod
-    def from_dict(d: Any) -> "Profile":
-        if not isinstance(d, dict):
-            return Profile(profile_id="<missing>", name="<missing>", enabled=False)
-
-        pid = str(d.get("profile_id") or d.get("id") or "").strip() or "<missing>"
-        name = str(d.get("name") or "").strip() or pid
-        enabled = bool(d.get("enabled", True))
-
-        default_interval = d.get("default_interval", None)
-        default_exchange = d.get("default_exchange", None)
-
-        raw_groups = d.get("groups", [])
-        groups: List[Group] = []
-        if isinstance(raw_groups, list):
-            for g in raw_groups:
-                groups.append(Group.from_dict(g))
-
-        return Profile(
-            profile_id=pid,
-            name=name,
-            enabled=enabled,
-            groups=groups,
-            default_interval=default_interval,
-            default_exchange=default_exchange,
-        )
+    if _IS_PYD_V2:
+        @model_validator(mode="before")
+        def _legacy_condition_groups(cls, data: Any) -> Any:
+            # accept legacy payloads to keep evaluator alive
+            if isinstance(data, dict):
+                if "groups" not in data and "condition_groups" in data:
+                    _dbg("[schema] mapped condition_groups -> groups (legacy payload)")
+                    data = dict(data)
+                    data["groups"] = data.get("condition_groups") or []
+            return data
+    else:
+        def __init__(self, **data: Any) -> None:
+            if "groups" not in data and "condition_groups" in data:
+                _dbg("[schema] mapped condition_groups -> groups (legacy payload)")
+                data["groups"] = data.get("condition_groups") or []
+            super().__init__(**data)
