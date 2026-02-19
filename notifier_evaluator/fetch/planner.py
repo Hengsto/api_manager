@@ -71,9 +71,6 @@ def plan_requests_for_symbol(
     dbg_skipped = 0
 
     for cond in rows or []:
-        if not cond.enabled:
-            continue
-
         rid = cond.rid
         pair = resolved_pairs.get(rid)
         if pair is None:
@@ -91,8 +88,8 @@ def plan_requests_for_symbol(
             )
             continue
 
-        left_count = _safe_count(cond.left.count)
-        right_count = _safe_count(cond.right.count)
+        left_count = _safe_count(getattr(cond.left, "count", 1))
+        right_count = _safe_count(getattr(cond.right, "count", 1))
 
         # LEFT
         k_left = RequestKey.from_parts(

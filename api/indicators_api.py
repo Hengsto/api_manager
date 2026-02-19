@@ -135,11 +135,26 @@ def _parse_json_or_raise(resp: requests.Response) -> Any:
         data = resp.json()
     except ValueError:
         text_snip = (resp.text or "")[:400]
+        if DEBUG:
+            try:
+                print(f"[PROXY][IND][ERR] upstream_non_json status={resp.status_code} text={text_snip!r}")
+            except Exception:
+                pass
         raise HTTPException(status_code=502, detail={"status": resp.status_code, "text": text_snip})
+
     if not resp.ok:
+        if DEBUG:
+            try:
+                body_snip = (resp.text or "")[:3000]
+                print(f"[PROXY][IND][ERR] upstream_error status={resp.status_code} body={body_snip}")
+            except Exception as e:
+                print(f"[PROXY][IND][ERR] upstream_error body_read_failed: {type(e).__name__}: {e}")
+
         # Upstream-Fehler JSON bleibt erhalten
         raise HTTPException(status_code=resp.status_code, detail=data)
+
     return data
+
 
 def _dbg_out_preview(label: str, payload: Dict[str, Any], req_id: str = "-") -> None:
     if not DEBUG:
@@ -235,6 +250,22 @@ def _coerce_params_types(d: Dict[str, Any]) -> Dict[str, Any]:
                 pass
         out[k] = v
     return out
+
+def _inject_default_source_if_missing(ind_name: str, p: Dict[str, Any], req_id: str = "-") -> Dict[str, Any]:
+    """
+    Upstream-Kompatibilität:
+    Wenn 'source' fehlt, default auf 'Close'.
+    """
+    lname = (ind_name or "").strip().lower()
+    if not isinstance(p, dict):
+        return p
+
+    if "source" not in p or p.get("source") in (None, "", "null"):
+        p["source"] = "Close"
+        if DEBUG:
+            print(f"[PROXY][IND][{req_id}] injected default source='Close' for name={lname}")
+    return p
+
 
 def _cap_count(n: Optional[int]) -> Optional[int]:
     if n is None:
@@ -726,36 +757,110 @@ def indicator(
     indicator_interval: str,
     params: str,
     count: Optional[int] = Query(None, ge=1),
+
+    # NEW: evaluator sends these; upstream may require them
+    exchange: Optional[str] = Query(None),
+    output: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None),
+    as_of: Optional[str] = Query(None),
 ):
+
     req_id = _new_req_id(request.headers.get("X-Request-ID"))
     capped_count = _cap_count(count)
+
+    lname = (name or "").strip().lower()
 
     # Eingangs-Logging inkl. kompaktem Params-Preview
     _params_preview = params if len(str(params)) <= 400 else (str(params)[:400] + "…")
     if DEBUG:
-        print(f"[PROXY][IN ][{req_id}] /indicator name={name} sym={symbol} chart={chart_interval} ind={indicator_interval} count={capped_count} params={_params_preview}")
+        print(
+            f"[PROXY][IN ][{req_id}] /indicator "
+            f"name={name} sym={symbol} chart={chart_interval} ind={indicator_interval} "
+            f"count={capped_count} ex={exchange} mode={mode} as_of={as_of} output={output} "
+            f"params={_params_preview}"
+        )
 
     # Wenn es nach JSON aussieht → parse & coerzen → wieder dumpen
+    p_dict: Dict[str, Any] = {}
     try:
         if params and str(params).strip().startswith(("{", "[")):
-            p_dict = json.loads(params)
-            if isinstance(p_dict, dict):
-                p_dict = _coerce_params_types(p_dict)
+            loaded = json.loads(params)
+
+            if isinstance(loaded, dict):
+                p_dict = _coerce_params_types(loaded)
+
+                # Default source, wenn nicht gesetzt (Upstream erwartet es)
+                try:
+                    p_dict = _inject_default_source_if_missing(name, p_dict, req_id=req_id)
+                except Exception as e:
+                    if DEBUG:
+                        print(f"[PROXY][IND][{req_id}] default-source inject failed: {type(e).__name__}: {e}")
+
                 params = _sj(p_dict)
+
+            else:
+                # keep original for upstream; but log it
+                if DEBUG:
+                    print(f"[PROXY][IN ][{req_id}] /indicator params is not dict type={type(loaded).__name__}")
     except Exception as ex:
         raise HTTPException(status_code=422, detail=f"Invalid JSON in params: {ex}")
 
-    query = {
+    # --- Short-circuit: lokale Customs IMMER lokal berechnen ---
+    # Diese Namen sind bei dir bewusst "custom" und NICHT Upstream-Indikatoren.
+    LOCAL_ONLY = {"price", "value", "slope", "change"}
+
+    if lname in LOCAL_ONLY:
+        if DEBUG:
+            print(f"[PROXY][IND][{req_id}] /indicator local-only hit -> computing locally (skip upstream)")
+
+        shaped = normalize_params_for_proxy(lname, p_dict)
+
+        out_local = _local_compute_custom(
+            name=lname,
+            symbol=symbol,
+            chart_interval=chart_interval,
+            indicator_interval=indicator_interval,
+            shaped_params=shaped,
+            count=capped_count,
+            req_id=req_id,
+        )
+
+        # Make it look like an /indicator response (harmless extra keys)
+        out_local["name"] = lname
+        out_local["indicator"] = lname
+        out_local["output"] = output
+        out_local["exchange"] = exchange
+        out_local["mode"] = mode
+        out_local["as_of"] = as_of
+
+        _dbg_out_preview("/indicator(local)", out_local, req_id=req_id)
+        return out_local
+
+    # --- Upstream call ---
+    query: Dict[str, Any] = {
         "name": name,
         "symbol": symbol,
         "chart_interval": chart_interval,
         "indicator_interval": indicator_interval,
         "params": params,
-        **({} if capped_count is None else {"count": capped_count}),
     }
+    if capped_count is not None:
+        query["count"] = capped_count
+
+    # Forward evaluator/upstream knobs (only if provided)
+    if exchange:
+        query["exchange"] = exchange
+    if output:
+        query["output"] = output
+    if mode:
+        query["mode"] = mode
+    if as_of:
+        query["as_of"] = as_of
+
     out = _get_upstream("/indicator", params=query, req_id=req_id, timeout=TO_INDICATOR)
     _dbg_out_preview("/indicator", out, req_id=req_id)
     return out
+
 
 @router.get("/signal")
 def signal(
